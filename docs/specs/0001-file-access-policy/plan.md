@@ -1,0 +1,134 @@
+# Plan for 0001: File access policy and enforcement
+
+Status: Review
+Spec: ./spec.md
+Tasks: ./tasks.md
+
+## Approach
+
+Two programs share one policy library. The `dakusui` helper holds the
+capabilities, loads a BPF LSM program, and owns its maps. The `dakusui-agent`
+runs the LLM loop and owns the policy. The agent sends the policy to the
+helper, which compiles it into a map and swaps it in at once. Before each
+command runs, the helper flags the command's process. The kernel then checks
+every file operation of flagged processes (ADRs 0002, 0004, 0005, 0006).
+
+## Parts
+
+**1. Enforcer** (`bpf/enforce.bpf.c`, C, grown from `bpfstudy/`)
+
+- Hooks: the file and path hooks of ADR 0006, plus `userns_create` (deny) and
+  `ptrace_access_check` (deny when the tracer is confined and the target is
+  not). `task_alloc` copies the flag.
+- On a flagged task, walk the path into components, then decide per access kind:
+  look up every path prefix and the last component's name in the rule map, and
+  take the match with the highest sequence number. No match means deny.
+- On deny, return `-EACCES` and write a record to the `denials` ring buffer.
+- Over the limits (32 components, 63-byte names, about 190 bytes in all), deny
+  and log. Failing closed is safer than guessing.
+
+**2. Rule map**
+
+An array-of-maps with one slot. Each inner map is a hash:
+
+    key   { u32 tag; char s[256] }   tag 0 = path prefix, 1 = name; zero padded
+    value { u32 seq[2]; u8 effect[2] }   index 0 = read, 1 = write; seq 0 = none
+
+Keys compare as exact bytes, so no hash collision can change a verdict. To
+change the policy, the helper builds a new inner map and swaps it into the
+slot. The swap is atomic, so a command never sees half a policy. For rules with
+the same pattern and kind, the compiler keeps the last one.
+
+**3. Policy library** (Coalton, used by both programs)
+
+Types `Rule`, `Effect`, `Kind`, `Pattern`, `Policy`. It parses the text form
+(`deny read,write name:.env`), builds the default policy from the project
+directory, evaluates a path in plain Lisp (the reference for tests), and
+compiles a policy into map entries.
+
+**4. Helper** (`dakusui`, Coalton with CFFI to libbpf)
+
+At start: check that `bpf` is in the LSM list, load and attach the programs,
+create the socketpair, fork. The child clears its capabilities, sets
+`no_new_privs`, becomes non-dumpable, and execs `dakusui-agent`. If any step
+fails, exit (R9). Then serve the socket.
+
+**5. Agent** (`dakusui-agent`, Coalton)
+
+Owns the ordered policy, exposes it through a `show_policy` tool (R8) and to
+the judge, and runs commands through the launcher.
+
+## Socket protocol
+
+One JSON object per line. The agent sends a request; the helper answers.
+
+| Request | Answer |
+|---------|--------|
+| `{"op":"policy","rules":[{"effect":"allow","kinds":["read"],"pattern":"/usr"}]}` | `{"ok":true}` or `{"ok":false,"error":"..."}` |
+| `{"op":"flag","pid":1234}` | `{"ok":true}` |
+
+The helper also pushes `{"event":"denial","pid":1,"kind":"read","path":"..."}`.
+The agent logs each one (R7).
+
+## Launching a command
+
+Forking a multithreaded SBCL process is unsafe, so the agent spawns a small
+launcher with `posix_spawn`:
+
+    sh -c 'read _ <&3 && exec sh -c "$1"' sh "<command>"
+
+1. The agent spawns the launcher with a pipe on fd 3. The launcher blocks.
+2. The agent sends `flag` with the launcher's pid, and waits for `ok`.
+3. The agent writes to the pipe. The launcher runs the command, already flagged.
+
+The agent passes the launcher a scrubbed environment, with no API keys. The
+default policy also denies `~/.config/dakusui`, where those keys live.
+
+## Requirement coverage
+
+- R1, R2, R10: enforcer, rule map, library compiler.
+- R3: library builds the default policy.
+- R4: policy swap; open descriptors are untouched because there is no read or
+  write hook.
+- R5, R6: hook list; `path_link` always denies.
+- R7: `denials` ring buffer and the pushed event.
+- R8: `show_policy` tool.
+- R9: helper exits on any startup failure; the agent refuses to run commands if
+  the socket closes.
+- R11: ADR 0005 plus the `ptrace_access_check` hook.
+- R12: `userns_create` denial.
+
+## Alternatives rejected
+
+- Hashed path keys: an attacker who picks file names can craft collisions.
+- LPM trie: returns the longest match, but the policy needs the last.
+- Updating the map entry by entry: a command could see a half-applied change.
+
+## Risks
+
+- **Matching cost.** Spike 2 measured it. An `open` costs about 1.9 us
+  unconfined. Confined, it adds 1.2 us on `/etc/hostname`, 1.9 us on a path of
+  seven components, and 4.5 us on a path of 22: roughly 0.2 us per component.
+  Acceptable for v0. If it hurts, skip the double zeroing of the key, use
+  `bpf_d_path` at `file_open`, or cache verdicts.
+- **Verifier limits.** Resolved. Spike 2 passed the verifier with the walk and
+  the lookup in `bpf_loop` callbacks.
+- **A Lisp binary with capabilities.** Build with saved runtime options, and
+  keep the helper small. If hardening proves hard, rewrite the helper in C.
+- **Torn walks.** The kernel's own path builder retries when a rename races
+  with it; ours does not. A rename needs write access to both paths, so a
+  confined process cannot move a denied file, but review and test this.
+- **Known gaps.** Unix sockets (D-Bus, ssh-agent) and other same-user services
+  stay reachable. The spec lists network and process limits as non-goals; a
+  later spec should cover sockets.
+
+## Testing
+
+- **Policy library:** unit tests for parsing, last-match order (A3), name rules,
+  and compilation, against the reference evaluator.
+- **Enforcer:** an integration harness that builds a temp tree and runs shell
+  and Python snippets confined. One test per acceptance case A1 through A10.
+  A random-policy test compares the kernel's verdicts with the reference
+  evaluator.
+- **Environment:** needs the `setcap` binary and a BPF LSM kernel, so these
+  tests run locally, not in generic CI.

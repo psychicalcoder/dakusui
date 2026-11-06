@@ -1,0 +1,6 @@
+# Spike build output
+bpfstudy/probe
+bpfstudy/enforce
+bpfstudy/*.o
+bpfstudy/vmlinux.h
+bpfstudy/*-sandbox/

@@ -1,0 +1,98 @@
+# Tasks for 0001: File access policy and enforcement
+
+Plan: ./plan.md
+
+Small, ordered steps. Write each test first or alongside its code. `[P]` marks
+a task that can run in parallel with the one before it. The spike code in
+`bpfstudy/` is reference, not product.
+
+## Phase 1: Foundations
+
+- [ ] T1 Create the project skeleton: three ASDF systems (`policy`, `helper`,
+  `agent`), a test runner, and `make build` that produces `dakusui` and
+  `dakusui-agent`. Done when `make test` passes on an empty suite and `make
+  build` writes both binaries. Pick the test framework and record it if the
+  choice is not obvious.
+- [ ] T2 [P] Move the enforcer into `bpf/` from `bpfstudy/enforce.bpf.c` and
+  `enforce.h`, with a make target for `enforce.bpf.o`. Done when the object
+  builds and the spike still runs.
+
+## Phase 2: Policy library (no kernel needed)
+
+- [ ] T3 Define the types: `Rule`, `Effect`, `Kind`, `Pattern`, `Policy`.
+  (R10) Done when they compile and the compiler rejects ill-typed rules.
+- [ ] T4 Parse the text form, such as `deny read,write name:.env`. Reject
+  relative paths, globs, and unknown kinds, each with a message that names the
+  problem. (R10) Done when the parser tests cover A15 and every example in the
+  spec.
+- [ ] T5 Write the reference evaluator: last match wins, no match denies, a name
+  rule tests the last component only. (R2, R5) Done when evaluator tests cover
+  A3 and A12, including the O_RDWR case that needs both kinds.
+- [ ] T6 Build the default policy from the project directory and the home
+  directory. (R3) Done when the evaluator gives the A1 and A11 verdicts.
+- [ ] T7 Compile a policy into map entries: one entry per pattern, the last
+  rule per kind keeps its sequence number, keys zero padded. Reject names over
+  63 bytes and paths over the limit. (R2, R10) Done when tests show duplicate
+  patterns merge correctly.
+
+## Phase 3: Helper
+
+- [ ] T8 [P] Bind the libbpf calls we use through CFFI: open, load, attach, map
+  create and update, ring buffer. Done when a Lisp program loads
+  `enforce.bpf.o` and attaches every program.
+- [ ] T9 Embed `enforce.bpf.o` in the helper binary at build time, so the
+  capability-bearing binary reads no object from disk. (R11) Done when the
+  helper loads from its own image.
+- [ ] T10 Check at startup that `bpf` is in the LSM list, and exit with a clear
+  message on any load or attach failure. (R9) Done when a forced failure makes
+  the helper exit non-zero and run nothing.
+- [ ] T11 Swap policies: build an inner map from compiled entries and replace
+  the slot. (R4) Done when A4 passes through the Lisp path.
+- [ ] T12 Flag a process by pid, using a pidfd key. (R1) Done when a flagged
+  shell is denied what the policy denies.
+- [ ] T13 Create the socketpair and fork. The child clears all capability sets and
+  the bounding set, sets `no_new_privs`, becomes non-dumpable, marks its
+  descriptors close-on-exec, and execs `dakusui-agent`. (R11) Done when the
+  agent shows `CapEff` of zero and `NoNewPrivs` of 1 in `/proc/self/status`.
+- [ ] T14 Serve the protocol: `policy` and `flag` requests, typed decoding, and
+  pushed `denial` events. (R7) Done when malformed input gets an error reply and
+  never crashes the helper.
+- [ ] T15 Build both binaries with saved runtime options so `--eval`, `--core`,
+  and similar flags do nothing. (R11) Done when `dakusui --eval` runs no code
+  (part of A8).
+
+## Phase 4: Agent side
+
+- [ ] T16 Write the protocol client and keep the ordered policy in the agent.
+  Send the default policy at startup. (R4) Done when the agent can replace the
+  policy at run time.
+- [ ] T17 Write the launcher: `posix_spawn` a shell that blocks on fd 3, flag
+  it, release it, and pass a scrubbed environment with no API keys. (R1, R11)
+  Done when A1 and A2 pass through the real binaries.
+- [ ] T18 Log each denial event with the process, path, and access kind. (R7)
+  Done when A13 passes: a denied `cat` produces one log line naming the
+  process, path, and kind.
+- [ ] T19 Expose the current policy as text for a tool and for the judge.
+  (R8) Done when A14 passes: a function returns the rules in order, exactly as
+  the user wrote them. Wiring it into the tool list belongs to spec 0003.
+- [ ] T20 Refuse to run a command when the helper socket is closed. (R9) Done when
+  A6 passes.
+
+## Phase 5: Acceptance
+
+- [ ] T21 Port the spike tests into an acceptance harness that uses the real
+  binaries, one test per case A1 through A15 (A12 and A15 also have unit tests in T5
+  and T4). Done when all pass on the development machine.
+- [ ] T22 Add a random-policy test that compares kernel verdicts with the
+  reference evaluator over a temp tree. Done when 1,000 random cases agree.
+- [ ] T23 Stress the torn-walk risk: run concurrent renames against opens and
+  check that no denied file is ever readable. Done when the result is recorded
+  in the plan, pass or fail.
+- [ ] T24 Fill in the spec's verification table, set its status to Implemented,
+  and move the plan to Implemented.
+
+## Notes
+
+Needs before T1: a working SBCL and Coalton install, and a decision on how to
+build the helper's saved image. Record what you choose in an ADR if it is hard
+to undo.
