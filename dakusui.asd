@@ -13,7 +13,8 @@
   :serial t
   :components ((:ct-file "policy")
                (:ct-file "parse")
-               (:ct-file "evaluate")))
+               (:ct-file "evaluate")
+               (:ct-file "default")))
 
 (defsystem "dakusui/helper"
   :description "The dakusui binary: holds the capabilities and owns the BPF maps."
@@ -39,4 +40,5 @@
   :components ((:ct-file "suite")
                (:ct-file "policy")
                (:ct-file "parse")
-               (:ct-file "evaluate")))
+               (:ct-file "evaluate")
+               (:ct-file "default")))

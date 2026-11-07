@@ -85,9 +85,16 @@
   (define (plain-component? part)
     (not (list:member part (make-list "" "."))))
 
+  (declare trim-slash (String -> String))
+  (define (trim-slash path)
+    "PATH without one trailing slash. strip-suffix fails on an empty string."
+    (if (== path "")
+        ""
+        (with-default path (string:strip-suffix "/" path))))
+
   (declare parse-path (String * String -> Result String Pattern))
   (define (parse-path word path)
-    (let trimmed = (with-default path (string:strip-suffix "/" path)))
+    (let trimmed = (trim-slash path))
     (match (string:split #\/ trimmed)
       ((Cons "" parts)
        (cond

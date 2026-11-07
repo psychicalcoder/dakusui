@@ -2,6 +2,7 @@
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames
    (#:list #:coalton/list)
+   (#:result #:coalton/result)
    (#:string #:coalton/string))
   (:export
    #:Effect #:Allow #:Deny
@@ -11,7 +12,9 @@
    #:Rule
    #:Policy
    #:parse-rule
-   #:allows?))
+   #:allows?
+   #:default-policy
+   #:session-policy))
 (in-package #:dakusui/policy)
 
 (coalton-toplevel

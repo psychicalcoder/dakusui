@@ -54,6 +54,16 @@ enforces the policy, and the user can change it while commands run.
   through ptrace, `/proc`, or inherited descriptors.
 - R12: A confined process MUST NOT create a user namespace or change the mount
   tree, because either would change what its path strings mean.
+- R13: The enforcer matches real paths, so the system MUST resolve symlinks
+  before a path enters the policy: in the project and home directories before it
+  builds the default policy, and in each rule added through its interface before
+  it records the rule. For a path that does not exist yet, it resolves the longest
+  part that exists. Name rules have nothing to resolve.
+- R14: A session's policy MUST be the rules of R3, then the rules of its rule set
+  in order, then `deny write P/.dakusui`, always last. A set's rule can therefore
+  override any rule of R3, but no rule can reopen `.dakusui` to a confined
+  command. A session without a set has an empty one. Spec 0004 stores and chooses
+  sets.
 
 ## Acceptance
 
@@ -99,6 +109,14 @@ enforces the policy, and the user can change it while commands run.
   `allow read /a/`, then the rule names `/a`. Given `/a/../b` or a stray
   backslash such as `/a\b`, then it is rejected with a message that names the
   problem.
+- A17 (R13): Given a home directory reached through a symlink, when a command
+  reads `~/.ssh/id_ed25519` under the default policy, then it fails. Given a
+  symlink `/s` to `/data/s`, when the user adds `deny read /s/new` through the
+  interface and `/data/s/new` does not exist yet, then the recorded rule names
+  `/data/s/new`.
+- A18 (R14): Given a set with `allow read,write P` and `allow read ~/.ssh`, when
+  a command reads `~/.ssh/id_ed25519`, then it succeeds. Writing
+  `P/.dakusui/rules/x` fails, and reading it succeeds.
 
 ## Constraints
 
@@ -119,6 +137,12 @@ enforces the policy, and the user can change it while commands run.
 
 - Q9: Do chmod, chown, utimes, and xattr changes count as write? v0 leaves them
   out. (not blocking)
+- Q17: A rule set can override the denies of R3, and sets live in the project, so
+  a cloned repository can ship a set such as `allow read ~/.ssh`. How does a user
+  come to trust a set? (for spec 0004; must be settled before sets load)
+- Q16: A14 shows the rules "as the user wrote them", but R13 records the resolved
+  path, and R10 cleans up a trailing slash. Should A14 show the rules as recorded?
+  (blocks T19)
 
 ## Decisions
 
@@ -130,6 +154,8 @@ Design choices made while writing this spec live in the ADRs:
   with the capabilities and drops them in the agent process.
 - [0006](../../adr/0006-build-paths-by-walking-dentries.md): build paths by
   walking dentries.
+- [0007](../../adr/0007-store-rule-sets-in-the-project.md): store rule sets in
+  the project.
 
 ## Verification
 
@@ -147,3 +173,5 @@ Design choices made while writing this spec live in the ADRs:
 | R10 | A15, A16 | Not started |
 | R11 | A8 | Not started |
 | R12 | A10 | Not started |
+| R13 | A17 | Not started |
+| R14 | A18 | Not started |

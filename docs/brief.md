@@ -33,11 +33,14 @@ user ── Dakusui (no capabilities) ── LLM server
 - **Agent loop.** Dakusui calls the chat completions API. The model requests
   tools through `tool_calls`; Dakusui runs them and replies with `tool`-role
   messages. MCP tools join the same list. Arguments decode into typed values.
-- **Roles.** A role names a model, base URL, and API key. `agent` and `judge`
-  ship built in; users define more.
+- **Roles.** A role names a model, base URL, API key, and optionally a rule set.
+  `agent` and `judge` ship built in; users define more.
 - **Policy.** Ordered rules, last match wins. The default allows the project
   directory and denies `.env`. Users add allows and denies. The agent reads the
   policy through a tool; the judge sees it too.
+- **Rule sets.** Named lists of rules in `.dakusui/rules`, shared by roles and
+  sessions in a project. A set adds to the default policy, and a rule added during
+  a session is saved to its set and applies to that session at once.
 - **Enforcement.** A BPF LSM program checks every file access by confined
   processes. The helper flags each command before it runs, and children inherit
   the flag. The helper owns the policy map and applies updates.

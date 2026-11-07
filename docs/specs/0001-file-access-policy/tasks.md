@@ -28,8 +28,10 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T5 Write the reference evaluator: last match wins, no match denies, a name
   rule tests the last component only. (R2, R5) Done when evaluator tests cover
   A3 and A12, including the O_RDWR case that needs both kinds.
-- [ ] T6 Build the default policy from the project directory and the home
+- [x] T6 Build the default policy from the project directory and the home
   directory. (R3) Done when the evaluator gives the A1 and A11 verdicts.
+- [x] T25 Build a session's policy: the default, then a rule set, then the fixed
+  deny on `.dakusui`. (R14) Done when the evaluator gives the A18 verdicts.
 - [ ] T7 Compile a policy into map entries: one entry per pattern, the last
   rule per kind keeps its sequence number, keys zero padded. Reject names over
   63 bytes and paths over the limit. (R2, R10) Done when tests show duplicate
@@ -64,8 +66,10 @@ a task that can run in parallel with the one before it. The spike code in
 ## Phase 4: Agent side
 
 - [ ] T16 Write the protocol client and keep the ordered policy in the agent.
-  Send the default policy at startup. (R4) Done when the agent can replace the
-  policy at run time.
+  Resolve symlinks in the project and home directories, build the session policy
+  with an empty set until spec 0004 supplies one, and send it at startup. Resolve
+  symlinks in each added rule before recording it. (R4, R13, R14) Done when the
+  agent can replace the policy at run time and A17 passes.
 - [ ] T17 Write the launcher: `posix_spawn` a shell that blocks on fd 3, flag
   it, release it, and pass a scrubbed environment with no API keys. (R1, R11)
   Done when A1 and A2 pass through the real binaries.
@@ -81,8 +85,8 @@ a task that can run in parallel with the one before it. The spike code in
 ## Phase 5: Acceptance
 
 - [ ] T21 Port the spike tests into an acceptance harness that uses the real
-  binaries, one test per case A1 through A15 (A12 and A15 also have unit tests in T5
-  and T4). Done when all pass on the development machine.
+  binaries, one test per case A1 through A18 (A12, A15, A16, and A18 also have unit
+  tests in T5, T4, and T25). Done when all pass on the development machine.
 - [ ] T22 Add a random-policy test that compares kernel verdicts with the
   reference evaluator over a temp tree. Done when 1,000 random cases agree.
 - [ ] T23 Stress the torn-walk risk: run concurrent renames against opens and

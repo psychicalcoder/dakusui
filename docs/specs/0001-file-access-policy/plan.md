@@ -45,8 +45,8 @@ Types `Rule`, `Effect`, `Kind`, `Kinds`, `Pattern`, `Policy`. `Kinds` holds a
 first kind and a list of the rest, so a rule cannot have none. `Pattern` keeps
 its constructors private, because the compiler cannot see whether a string is
 an absolute path. The library parses the text form
-(`deny read,write name:.env`), builds the default policy from the project
-directory, evaluates a path in plain Lisp (the reference for tests), and
+(`deny read,write name:.env`), builds the default and session policies from the
+project and home directories, evaluates a path in plain Lisp (the reference for tests), and
 compiles a policy into map entries.
 
 **4. Helper** (`dakusui`, Coalton with CFFI to libbpf)
