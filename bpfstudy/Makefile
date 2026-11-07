@@ -14,11 +14,12 @@ probe.bpf.o: probe.bpf.c probe.h vmlinux.h
 probe: probe.c probe.h
 	$(CC) -O2 -g -Wall $< -o $@ $(LIBBPF)
 
-enforce.bpf.o: enforce.bpf.c enforce.h vmlinux.h
-	$(CLANG) -target bpf -D__TARGET_ARCH_$(ARCH) -O2 -g -Wall -c $< -o $@
+# The enforcer itself now lives in ../bpf.
+enforce.bpf.o: ../bpf/enforce.bpf.c ../bpf/enforce.h vmlinux.h
+	$(CLANG) -target bpf -D__TARGET_ARCH_$(ARCH) -O2 -g -Wall -I. -c $< -o $@
 
-enforce: enforce.c enforce.h
-	$(CC) -O2 -g -Wall $< -o $@ $(LIBBPF)
+enforce: enforce.c ../bpf/enforce.h
+	$(CC) -O2 -g -Wall -I../bpf $< -o $@ $(LIBBPF)
 
 # File capabilities are lost on every rebuild, so set them before each run.
 run: probe probe.bpf.o

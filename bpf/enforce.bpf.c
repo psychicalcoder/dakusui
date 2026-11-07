@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Spike 2 for spec 0001: the real enforcer, in miniature.
+ * The enforcer for spec 0001.
  *
  * For a confined task, each hook builds the path by walking dentries
  * (ADR 0006), looks up every path prefix and the last name in the rule map,
  * keeps the match with the highest sequence number per access kind (last
  * match wins), and returns -EACCES unless every needed kind is allowed.
  * Anything that goes wrong while building the path denies (fail closed).
- *
- * The questions this answers: does the verifier accept it, how much does it
- * cost per open, and does it give the right verdicts?
  */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>

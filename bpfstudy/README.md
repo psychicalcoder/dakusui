@@ -25,8 +25,8 @@ whether it works. That tells us the two capabilities are not enough.
 
 ## Spike 2: the enforcer
 
-`make run2` builds and runs `enforce`. It tests the matching design in
-`docs/specs/0001-file-access-policy/plan.md`:
+`make run2` builds and runs `enforce`, the test driver for `../bpf/enforce.bpf.c`.
+It tests the matching design in `docs/specs/0001-file-access-policy/plan.md`:
 
 - the verifier accepts the walk plus the last-match lookup;
 - verdicts are right for allow, deny, name rules, order, and live updates;

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Shared by the enforcer (BPF) and its test driver. Spike 2 for spec 0001. */
+/* Shared by the enforcer (BPF) and its userspace. Spec 0001. */
 #ifndef ENFORCE_H
 #define ENFORCE_H
 

@@ -13,7 +13,7 @@ a task that can run in parallel with the one before it. The spike code in
   `dakusui-agent`. Done when `make test` passes on an empty suite and `make
   build` writes both binaries. Pick the test framework and record it if the
   choice is not obvious.
-- [ ] T2 [P] Move the enforcer into `bpf/` from `bpfstudy/enforce.bpf.c` and
+- [x] T2 [P] Move the enforcer into `bpf/` from `bpfstudy/enforce.bpf.c` and
   `enforce.h`, with a make target for `enforce.bpf.o`. Done when the object
   builds and the spike still runs.
 
