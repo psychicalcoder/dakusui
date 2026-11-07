@@ -1,0 +1,145 @@
+(defpackage #:dakusui/serve
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:libbpf #:dakusui/libbpf)
+                    (#:enforcer #:dakusui/enforcer)
+                    (#:protocol #:dakusui/protocol))
+  (:export #:max-line #:serve-lines #:serve-agent))
+(in-package #:dakusui/serve)
+
+;;; Serve the agent's socket. (R7, plan "Socket protocol")
+;;;
+;;; One thread polls the socket and the denial ring buffer. Each request line
+;;; gets one reply line, and denial events go out as they come. No input can
+;;; end the loop, only the agent closing its end.
+
+(cl:defun write-line-to (fd text)
+  "Write TEXT and a newline to FD. Return NIL if the write fails."
+  (cl:let ((octets (sb-ext:string-to-octets text :external-format :utf-8
+                                                 :null-terminate cl:nil)))
+    (cl:setf octets (cl:concatenate '(cl:vector (cl:unsigned-byte 8)) octets #(10)))
+    (cl:setf octets (cl:coerce octets '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+    (cl:loop :with start := 0
+             :while (cl:< start (cl:length octets))
+             :do (cl:let ((n (cffi:with-pointer-to-vector-data (p octets)
+                               (cffi:foreign-funcall "write" :int fd
+                                                     :pointer (cffi:inc-pointer p start)
+                                                     :size (cl:- (cl:length octets) start)
+                                                     :long))))
+                   (cl:cond
+                     ((cl:> n 0) (cl:incf start n))
+                     ((cl:and (cl:< n 0) (cl:= (sb-alien:get-errno) sb-unix:eintr)))
+                     (cl:t (cl:return-from write-line-to cl:nil))))
+             :finally (cl:return cl:t))))
+
+(cl:defun answer (on-line bytes)
+  "The reply to one line of BYTES. A Lisp error here is our bug, not the
+agent's, but it still gets a reply instead of ending the helper."
+  (cl:handler-case
+      (cl:let ((line (sb-ext:octets-to-string bytes :external-format :utf-8)))
+        (cl:funcall on-line line))
+    (sb-int:character-decoding-error ()
+      (protocol:reply-error-text "the line is not UTF-8"))
+    (cl:error (e)
+      (protocol:reply-error-text
+       (cl:let ((cl:*print-pretty* cl:nil))
+         (cl:format cl:nil "internal error: ~A" e))))))
+
+(cl:defun serve-loop (fd events-fd on-events on-line limit)
+  "Poll FD and EVENTS-FD (or -1) until FD reaches its end or fails."
+  (cl:let ((pending (cl:make-array 0 :element-type '(cl:unsigned-byte 8)
+                                     :adjustable cl:t :fill-pointer 0))
+           (chunk (cl:make-array 65536 :element-type '(cl:unsigned-byte 8)))
+           (skipping cl:nil))
+    (cffi:with-foreign-object (fds :int 4)
+      (cl:loop
+        ;; struct pollfd { int fd; short events; short revents; }, POLLIN = 1.
+        (cl:setf (cffi:mem-aref fds :int 0) fd
+                 (cffi:mem-aref fds :int 2) events-fd)
+        (cl:setf (cffi:mem-ref fds :short 4) 1 (cffi:mem-ref fds :short 6) 0
+                 (cffi:mem-ref fds :short 12) 1 (cffi:mem-ref fds :short 14) 0)
+        (cl:let ((ready (cffi:foreign-funcall "poll" :pointer fds :unsigned-long 2
+                                              :int -1 :int)))
+          (cl:cond
+            ((cl:and (cl:< ready 0) (cl:= (sb-alien:get-errno) sb-unix:eintr)))
+            ((cl:< ready 0) (cl:return))
+            (cl:t
+             (cl:when (cl:/= 0 (cffi:mem-ref fds :short 14))
+               (cl:funcall on-events))
+             (cl:when (cl:/= 0 (cffi:mem-ref fds :short 6))
+               (cl:let ((n (cffi:with-pointer-to-vector-data (p chunk)
+                             (cffi:foreign-funcall "read" :int fd :pointer p
+                                                   :size (cl:length chunk) :long))))
+                 (cl:cond
+                   ((cl:and (cl:< n 0) (cl:= (sb-alien:get-errno) sb-unix:eintr)))
+                   ((cl:<= n 0) (cl:return))
+                   (cl:t
+                    (cl:loop :for i :from 0 :below n
+                             :for byte := (cl:aref chunk i)
+                             :do (cl:cond
+                                   ((cl:= byte 10)
+                                    (cl:if skipping
+                                           (cl:setf skipping cl:nil)
+                                           (cl:unless
+                                               (write-line-to fd (answer on-line (cl:copy-seq pending)))
+                                             (cl:return-from serve-loop)))
+                                    (cl:setf (cl:fill-pointer pending) 0))
+                                   (skipping)
+                                   ((cl:>= (cl:fill-pointer pending) limit)
+                                    ;; Reply once, then drop the rest of the line.
+                                    (cl:setf skipping cl:t
+                                             (cl:fill-pointer pending) 0)
+                                    (cl:unless
+                                        (write-line-to fd (protocol:reply-error-text
+                                                           (cl:format cl:nil "the line is longer than ~D bytes" limit)))
+                                      (cl:return-from serve-loop)))
+                                   (cl:t (cl:vector-push-extend byte pending)))))))))))))))
+
+(coalton-toplevel
+  (declare max-line UFix)
+  (define max-line
+    "The longest request line, in bytes. A policy of 1024 patterns fits."
+    1048576)
+
+  (declare serve-lines (I32 * UFix * (String -> String) -> Unit))
+  (define (serve-lines fd limit handle)
+    "Answer each line on FD with HANDLE until the peer closes. No events."
+    (lisp (-> Unit) (fd limit handle)
+      (serve-loop fd -1 (cl:lambda ())
+                  (cl:lambda (line) (call-coalton-function handle line))
+                  limit)
+      Unit))
+
+  (declare send-event (I32 * List U8 -> Unit))
+  (define (send-event fd record)
+    (match (protocol:denial-event record)
+      ((Some line) (lisp (-> Unit) (fd line) (write-line-to fd line) Unit))
+      ((None) Unit)))
+
+  (declare handle-request (libbpf:BpfObject * String -> String))
+  (define (handle-request obj line)
+    (let outcome =
+      (match (protocol:decode-request line)
+        ((Err why) (Err why))
+        ((Ok (protocol:PolicyRequest pol)) (enforcer:install-policy obj pol))
+        ((Ok (protocol:FlagRequest pid)) (enforcer:flag-process obj pid))))
+    (match outcome
+      ((Ok _) protocol:reply-ok)
+      ((Err why) (protocol:reply-error why))))
+
+  (declare serve-agent (libbpf:BpfObject * I32 -> Result String Unit))
+  (define (serve-agent obj fd)
+    "Serve the agent on FD until it closes its end, pushing each denial."
+    (do
+     (denials <- (libbpf:find-map obj "denials"))
+     (ring <- (libbpf:ring-buffer-new denials (fn (record) (send-event fd record))))
+     (let events-fd = (libbpf:ring-buffer-fd ring))
+     (let drain = (fn ()
+                    (libbpf:ring-buffer-poll ring 0)
+                    Unit))
+     (let handle = (fn (line) (handle-request obj line)))
+     (pure (lisp (-> Unit) (fd events-fd drain handle max-line)
+             (serve-loop fd events-fd
+                         (cl:lambda () (call-coalton-function drain))
+                         (cl:lambda (line) (call-coalton-function handle line))
+                         max-line)
+             Unit)))))

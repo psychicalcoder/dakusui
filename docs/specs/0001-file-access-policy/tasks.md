@@ -59,7 +59,7 @@ a task that can run in parallel with the one before it. The spike code in
   (R11) Done when the agent shows `CapEff` of zero and `NoNewPrivs` of 1 in
   `/proc/self/status`. The bounding set stays: dropping it needs CAP_SETPCAP,
   and `no_new_privs` already stops exec from granting capabilities.
-- [ ] T14 Serve the protocol: `policy` and `flag` requests, typed decoding, and
+- [x] T14 Serve the protocol: `policy` and `flag` requests, typed decoding, and
   pushed `denial` events. (R7) Done when malformed input gets an error reply and
   never crashes the helper.
 - [ ] T15 Build both binaries with saved runtime options so `--eval`, `--core`,

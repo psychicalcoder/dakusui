@@ -12,6 +12,9 @@
    #:Rule
    #:Policy
    #:parse-rule
+   #:parse-effect
+   #:parse-kind
+   #:parse-pattern
    #:allows?
    #:default-policy
    #:session-policy

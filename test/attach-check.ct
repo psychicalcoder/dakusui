@@ -3,6 +3,7 @@
   (:local-nicknames (#:libbpf #:dakusui/libbpf)
                     (#:enforcer #:dakusui/enforcer)
                     (#:spawn #:dakusui/spawn)
+                    (#:serve #:dakusui/serve)
                     (#:string #:coalton/string)
                     (#:policy #:dakusui/policy)
                     (#:cell #:coalton/cell)
@@ -10,9 +11,10 @@
   (:export #:main))
 (in-package #:dakusui/attach-check)
 
-;;; The check for T8 through T13. Start the enforcer embedded in this image, then
+;;; The check for T8 through T14. Start the enforcer embedded in this image, then
 ;;; run commands confined to show that policies, live swaps (A4), and denial
-;;; records work. Last, start a stand-in agent to show it holds nothing. It needs CAP_BPF and CAP_PERFMON, so it runs through
+;;; records work. Then start stand-in agents to show the agent holds nothing and
+;;; the helper serves it. It needs CAP_BPF and CAP_PERFMON, so it runs through
 ;;; `make attach-check`, not `make test`.
 
 (coalton-toplevel
@@ -207,13 +209,73 @@ reports its status and descriptors over its socket."
         (Err "the agent inherited a descriptor beyond fd 3"))
        (True (Ok (say "T13 passed: the agent has no capabilities and only fd 3"))))))
 
+  (declare served-script String)
+  (define served-script
+    "A stand-in agent. It writes each reply it gets, and then the event for
+/etc/hostname, to the file named by $1. Events can come before a reply, so ask
+skips them, as the real agent must. Coalton strings, like Lisp's, have no \\n
+escape, so the lines break for real."
+    "exec 4>\"$1\"
+ask() {
+  printf '%s\\n' \"$1\" >&3
+  while IFS= read -r reply <&3; do
+    case $reply in '{\"event\"'*) ;; *) break ;; esac
+  done
+  printf '%s\\n' \"$reply\" >&4
+}
+ask 'not json'
+ask '{\"op\":\"policy\",\"rules\":[{\"effect\":\"allow\",\"kinds\":[\"read\"],\"pattern\":\"/\"},{\"effect\":\"allow\",\"kinds\":[\"write\"],\"pattern\":\"/dev/null\"},{\"effect\":\"deny\",\"kinds\":[\"read\"],\"pattern\":\"name:hostname\"}]}'
+d=$(mktemp -d); mkfifo \"$d/go\"
+sh -c 'read _ < \"$1\"; exec cat /etc/hostname' sh \"$d/go\" >/dev/null 2>&1 &
+pid=$!
+ask \"{\\\"op\\\":\\\"flag\\\",\\\"pid\\\":$pid}\"
+echo go > \"$d/go\"; wait \"$pid\"; printf 'exit %s\\n' \"$?\" >&4
+timeout 5 sh -c 'while IFS= read -r line; do
+  case $line in *'/etc/hostname'*) printf \"%s\\n\" \"$line\"; exit ;; esac
+done' <&3 >&4
+rm -rf \"$d\"
+")
+
+  (declare check-served (libbpf:BpfObject -> Result String Unit))
+  (define (check-served obj)
+    "T14 (R7): serve a stand-in agent through the helper's own loop. It sends
+garbage, a policy, and a flag for its child, which a denial event then reports."
+    (let report-file =
+      (lisp (-> String) ()
+        (cl:format cl:nil "/tmp/dakusui-attach-check-~D" (sb-unix:unix-getpid))))
+    (do
+     (agent <- (spawn:start-agent "/bin/sh" (make-list "-c" served-script "sh" report-file)))
+     (serve:serve-agent obj (spawn:agent-socket agent))
+     (let _ = (libbpf:close-fd (spawn:agent-socket agent)))
+     (let _ = (spawn:wait-agent agent))
+     (let report = (lisp (-> String) (report-file)
+                     (cl:prog1 (cl:or (cl:ignore-errors (uiop:read-file-string report-file)) "")
+                       (cl:ignore-errors (cl:delete-file report-file)))))
+     (let _ = (say report))
+     (let lines = (string:split #\Newline report))
+     (let line = (fn (n) (with-default "" (list:index n lines))))
+     (cond
+       ((not (string:substring? "\"ok\":false" (line 0)))
+        (Err "garbage did not get an error reply"))
+       ((/= (line 1) "{\"ok\":true}")
+        (Err "the policy request failed"))
+       ((/= (line 2) "{\"ok\":true}")
+        (Err "the flag request failed"))
+       ((== (line 3) "exit 0")
+        (Err "the flagged child read a denied file"))
+       ((not (and (string:substring? "\"event\":\"denial\"" (line 4))
+                  (string:substring? "\"path\":\"/etc/hostname\"" (line 4))))
+        (Err "no denial event for /etc/hostname"))
+       (True (Ok (say "T14 passed: the helper served the agent and pushed the denial"))))))
+
   (declare main (Void -> UFix))
   (define (main)
     (let outcome =
       (do
        (obj <- (check-attached))
        (check-enforced obj)
-       (check-agent-start)))
+       (check-agent-start)
+       (check-served obj)))
     (match outcome
       ((Ok _)
        (say "attach-check: passed")

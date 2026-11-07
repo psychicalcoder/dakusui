@@ -81,7 +81,7 @@ the judge, and runs commands through the launcher.
 - **Tests.** `coalton/testing`, Coalton's own wrapper over Fiasco, because tests
   can then be written in Coalton.
 - **Dependencies.** Coalton comes from a checkout in Quicklisp's `local-projects`
-  (tested at commit 21e0c63), Fiasco and CFFI from Quicklisp. Nothing pins them
+  (tested at commit 21e0c63), Fiasco, CFFI, and jzon from Quicklisp. Nothing pins them
   yet. The helper loads `libbpf.so.1` (tested with 1.8.0) by soname, so under
   file capabilities the dynamic linker ignores `LD_LIBRARY_PATH`.
 - **Embedded enforcer.** Loading `dakusui/helper` reads `build/enforce.bpf.o`
@@ -100,8 +100,19 @@ One JSON object per line. The agent sends a request; the helper answers.
 | `{"op":"policy","rules":[{"effect":"allow","kinds":["read"],"pattern":"/usr"}]}` | `{"ok":true}` or `{"ok":false,"error":"..."}` |
 | `{"op":"flag","pid":1234}` | `{"ok":true}` |
 
-The helper also pushes `{"event":"denial","pid":1,"kind":"read","path":"..."}`.
-The agent logs each one (R7).
+The helper also pushes
+`{"event":"denial","pid":1,"comm":"cat","hook":"file_open","kind":"read","reason":"denied by rule","path":"..."}`.
+`kind` is `read`, `write`, `read,write`, or `none` for a hook that denies every
+confined caller. `reason` tells a rule's denial from a missing match or a limit
+of the walk. The agent logs each one (R7). Replies come in the order of the
+requests, but an event can come before any reply, so the agent tells the two
+apart by the `event` field.
+
+The helper parses each line with jzon (strict JSON, depth limit 8) into a typed
+request. A pattern uses the rule text's escapes (R10). Unknown ops and unknown
+fields are errors. Any line that fails, including one over 1 MiB or not UTF-8,
+gets `{"ok":false,"error":"..."}` naming the problem. The helper serves until
+the agent closes its end, then waits for it and exits with its code.
 
 ## Launching a command
 

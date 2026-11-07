@@ -1,7 +1,9 @@
 (defpackage #:dakusui/helper
   (:use #:coalton #:coalton-prelude)
-  (:local-nicknames (#:enforcer #:dakusui/enforcer)
-                    (#:spawn #:dakusui/spawn))
+  (:local-nicknames (#:libbpf #:dakusui/libbpf)
+                    (#:enforcer #:dakusui/enforcer)
+                    (#:spawn #:dakusui/spawn)
+                    (#:serve #:dakusui/serve))
   (:export #:main))
 (in-package #:dakusui/helper)
 
@@ -13,18 +15,29 @@
       (cl:finish-output cl:*error-output*)
       Unit))
 
+  (declare run-agent (libbpf:BpfObject * spawn:Agent -> UFix))
+  (define (run-agent obj agent)
+    "Serve the agent until it closes its end, then wait for it. If serving
+cannot start, close our end, so the agent sees the helper gone. (R9)"
+    (let served = (serve:serve-agent obj (spawn:agent-socket agent)))
+    (let _ = (libbpf:close-fd (spawn:agent-socket agent)))
+    (let code = (spawn:wait-agent agent))
+    (match served
+      ((Err why)
+       (complain why)
+       1)
+      ((Ok _) (lisp (-> UFix) (code) code))))
+
   (declare main (Void -> UFix))
   (define (main)
     "Start enforcement and then the agent, or exit non-zero before anything
 runs. (R9, R11) Exit with the agent's code."
     (match (do
             (lsm-list <- (enforcer:read-lsm-list))
-            (_ <- (enforcer:start lsm-list))
-            (spawn:start-agent (spawn:agent-path) Nil))
+            (obj <- (enforcer:start lsm-list))
+            (agent <- (spawn:start-agent (spawn:agent-path) Nil))
+            (pure (Tuple obj agent)))
       ((Err why)
        (complain why)
        1)
-      ((Ok agent)
-       ;; Serving the socket comes in T14.
-       (let code = (spawn:wait-agent agent))
-       (lisp (-> UFix) (code) code)))))
+      ((Ok (Tuple obj agent)) (run-agent obj agent)))))

@@ -4,6 +4,8 @@
                     (#:libbpf #:dakusui/libbpf)
                     (#:enforcer #:dakusui/enforcer)
                     (#:spawn #:dakusui/spawn)
+                    (#:protocol #:dakusui/protocol)
+                    (#:serve #:dakusui/serve)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
   (:export #:run-tests))

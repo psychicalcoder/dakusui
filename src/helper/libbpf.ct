@@ -20,7 +20,8 @@
    #:close-fd
    #:RingBuffer
    #:ring-buffer-new
-   #:ring-buffer-poll))
+   #:ring-buffer-poll
+   #:ring-buffer-fd))
 (in-package #:dakusui/libbpf)
 
 ;;; The libbpf calls the helper uses, and the descriptor calls around them.
@@ -65,6 +66,8 @@
   (fd :int) (key :pointer) (value :pointer) (flags :uint64))
 (cffi:defcfun ("ring_buffer__new" %ring-buffer-new) :pointer
   (fd :int) (callback :pointer) (ctx :pointer) (opts :pointer))
+(cffi:defcfun ("ring_buffer__epoll_fd" %ring-buffer-epoll-fd) :int
+  (rb :pointer))
 (cffi:defcfun ("ring_buffer__poll" %ring-buffer-poll) :int
   (rb :pointer) (timeout-ms :int))
 (cffi:defcfun ("close" %close) :int
@@ -307,4 +310,9 @@ can end the wait early, which SBCL's own signals do. That counts as no records."
     (if (== status (negate eintr))
         (Ok 0)
         (map (fn (count) (lisp (-> UFix) (count) count))
-             (check-status "ring_buffer__poll" status)))))
+             (check-status "ring_buffer__poll" status))))
+
+  (declare ring-buffer-fd (RingBuffer -> I32))
+  (define (ring-buffer-fd (RingBuffer rb))
+    "A descriptor that polls readable when records wait."
+    (lisp (-> I32) (rb) (%ring-buffer-epoll-fd rb))))

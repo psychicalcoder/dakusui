@@ -1,0 +1,252 @@
+(defpackage #:dakusui/protocol
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:policy #:dakusui/policy)
+                    (#:list #:coalton/list))
+  (:export #:Request #:PolicyRequest #:FlagRequest
+           #:decode-request
+           #:reply-ok #:reply-error #:reply-error-text
+           #:denial-event))
+(in-package #:dakusui/protocol)
+
+;;; The socket protocol of spec 0001: one JSON object per line. (R7)
+;;;
+;;; Each line is parsed at the edge into a typed Request, or into an error
+;;; message that names the problem. Nothing here touches the kernel.
+
+(coalton-toplevel
+  (repr :native cl:t)
+  (define-type LispValue)
+
+  (define-type Json
+    "A parsed JSON value. Floats carry no value, since no field takes one."
+    JNull
+    (JBool Boolean)
+    (JInteger Integer)
+    JFloat
+    (JString String)
+    (JArray (List Json))
+    (JObject (List (Tuple String Json))))
+
+  (derive Eq)
+  (define-type Request
+    (PolicyRequest policy:Policy)
+    (FlagRequest I32))
+
+  (declare max-depth UFix)
+  (define max-depth 8)
+
+  (declare to-json (LispValue -> Json))
+  (define (to-json v)
+    "Convert what jzon returns. Its objects are hash tables and its arrays
+vectors. true is T, false is NIL, and null is the symbol NULL."
+    (let kind =
+      (lisp (-> UFix) (v)
+        (cl:typecase v
+          (cl:string 0)
+          (cl:integer 1)
+          (cl:real 2)
+          (cl:vector 3)
+          (cl:hash-table 4)
+          (cl:t (cl:cond ((cl:eq v cl:t) 5)
+                         ((cl:null v) 6)
+                         (cl:t 7))))))
+    (match kind
+      (0 (JString (lisp (-> String) (v)
+                    (cl:coerce v '(cl:simple-array cl:character (cl:*))))))
+      (1 (JInteger (lisp (-> Integer) (v) v)))
+      (2 JFloat)
+      (3 (JArray (map to-json (lisp (-> (List LispValue)) (v) (cl:coerce v 'cl:list)))))
+      (4 (JObject
+          (list:zip
+           (map to-json-key (lisp (-> (List LispValue)) (v)
+                              (cl:loop :for k :being :the :hash-keys :of v :collect k)))
+           (map to-json (lisp (-> (List LispValue)) (v)
+                          (cl:loop :for x :being :the :hash-values :of v :collect x))))))
+      (5 (JBool True))
+      (6 (JBool False))
+      (_ JNull)))
+
+  (declare to-json-key (LispValue -> String))
+  (define (to-json-key k)
+    (lisp (-> String) (k)
+      (cl:coerce k '(cl:simple-array cl:character (cl:*)))))
+
+  (declare parse-json (String -> Result String Json))
+  (define (parse-json line)
+    (let parsed =
+      (lisp (-> (Result String LispValue)) (line max-depth)
+        (cl:handler-case
+            (cl:let ((value (com.inuoe.jzon:parse line :max-depth max-depth)))
+              (coalton (Ok (lisp (-> LispValue) () value))))
+          (cl:error (e)
+            (cl:let ((why (cl:let ((cl:*print-pretty* cl:nil)) (cl:princ-to-string e))))
+              (coalton (Err (lisp (-> String) () why))))))))
+    (match parsed
+      ((Ok value) (Ok (to-json value)))
+      ((Err why) (Err (<> "not JSON: " why)))))
+
+  (declare quoted (String -> String))
+  (define (quoted text)
+    (lisp (-> String) (text) (com.inuoe.jzon:stringify text)))
+
+  (declare in-context (String * Result String :a -> Result String :a))
+  (define (in-context prefix result)
+    (match result
+      ((Ok x) (Ok x))
+      ((Err why) (Err (<> prefix why)))))
+
+  (declare as-object (Json -> Result String (List (Tuple String Json))))
+  (define (as-object json)
+    (match json
+      ((JObject fields) (Ok fields))
+      (_ (Err "expected an object"))))
+
+  (declare only-fields (List String * List (Tuple String Json) -> Result String Unit))
+  (define (only-fields allowed fields)
+    (match (list:find (fn ((Tuple name _)) (not (list:member name allowed))) fields)
+      ((Some (Tuple name _)) (Err (<> "unknown field " (quoted name))))
+      ((None) (Ok Unit))))
+
+  (declare field (String * List (Tuple String Json) -> Result String Json))
+  (define (field name fields)
+    (match (list:find (fn ((Tuple key _)) (== key name)) fields)
+      ((Some (Tuple _ value)) (Ok value))
+      ((None) (Err (<> "missing field " (quoted name))))))
+
+  (declare as-string (String * Json -> Result String String))
+  (define (as-string what json)
+    (match json
+      ((JString s) (Ok s))
+      (_ (Err (<> what " must be a string")))))
+
+  (declare as-array (String * Json -> Result String (List Json)))
+  (define (as-array what json)
+    (match json
+      ((JArray items) (Ok items))
+      (_ (Err (<> what " must be a list")))))
+
+  (declare as-pid (Json -> Result String I32))
+  (define (as-pid json)
+    (match json
+      ((JInteger n)
+       (if (and (>= n 1) (<= n 2147483647))
+           (Ok (lisp (-> I32) (n) n))
+           (Err "\"pid\" must be from 1 to 2147483647")))
+      (_ (Err "\"pid\" must be an integer"))))
+
+  (declare decode-kinds (List Json -> Result String policy:Kinds))
+  (define (decode-kinds items)
+    (do
+     (words <- (traverse (fn (item) (as-string "each kind" item)) items))
+     (kinds <- (traverse policy:parse-kind words))
+     (match kinds
+       ((Cons first rest) (Ok (policy:Kinds first rest)))
+       ((Nil) (Err "\"kinds\" must not be empty")))))
+
+  (declare decode-rule (Json -> Result String policy:Rule))
+  (define (decode-rule json)
+    (do
+     (fields <- (as-object json))
+     (only-fields (make-list "effect" "kinds" "pattern") fields)
+     (effect <- (>>= (>>= (field "effect" fields) (fn (j) (as-string "\"effect\"" j)))
+                     policy:parse-effect))
+     (kinds <- (>>= (>>= (field "kinds" fields) (fn (j) (as-array "\"kinds\"" j)))
+                    decode-kinds))
+     (pattern <- (>>= (>>= (field "pattern" fields) (fn (j) (as-string "\"pattern\"" j)))
+                      policy:parse-pattern))
+     (pure (policy:Rule effect kinds pattern))))
+
+  (declare decode-rules (UFix * List Json -> Result String (List policy:Rule)))
+  (define (decode-rules index items)
+    (match items
+      ((Nil) (Ok Nil))
+      ((Cons item rest)
+       (do
+        (r <- (in-context (lisp (-> String) (index) (cl:format cl:nil "rule ~D: " index))
+                          (decode-rule item)))
+        (more <- (decode-rules (+ index 1) rest))
+        (pure (Cons r more))))))
+
+  (declare decode-request (String -> Result String Request))
+  (define (decode-request line)
+    "Decode one request line. Unknown ops and unknown fields are errors."
+    (do
+     (json <- (parse-json line))
+     (fields <- (as-object json))
+     (op <- (>>= (field "op" fields) (fn (j) (as-string "\"op\"" j))))
+     (match op
+       ("policy"
+        (do
+         (only-fields (make-list "op" "rules") fields)
+         (items <- (>>= (field "rules" fields) (fn (j) (as-array "\"rules\"" j))))
+         (rules <- (decode-rules 1 items))
+         (pure (PolicyRequest (policy:Policy rules)))))
+       ("flag"
+        (do
+         (only-fields (make-list "op" "pid") fields)
+         (pid <- (>>= (field "pid" fields) as-pid))
+         (pure (FlagRequest pid))))
+       (_ (Err (<> "unknown op " (quoted op)))))))
+
+  (declare reply-ok String)
+  (define reply-ok "{\"ok\":true}")
+
+  (declare reply-error (String -> String))
+  (define (reply-error why)
+    (mconcat (make-list "{\"ok\":false,\"error\":" (quoted why) "}")))
+
+  (declare denial-event (List U8 -> Optional String))
+  (define (denial-event record)
+    "The event line for a struct denial from the ring buffer, or None if the
+record is too short. Text the kernel gave us that is not UTF-8 shows as ?."
+    (lisp (-> (Optional String)) (record)
+      (cl:if (cl:< (cl:length record) 32)
+             (coalton None)
+             (cl:let* ((bytes (cl:coerce record '(cl:vector (cl:unsigned-byte 8))))
+                       (event (denial-json bytes)))
+               (coalton (Some (lisp (-> String) () event))))))))
+
+(cl:defparameter *hook-names*
+  #("file_open" "file_truncate" "path_truncate" "path_mknod" "path_mkdir"
+    "path_rmdir" "path_unlink" "path_symlink" "path_rename" "path_rename"
+    "path_link" "userns_create" "ptrace_access_check")
+  "Indexed by the H_ values in bpf/enforce.h.")
+
+(cl:defparameter *reasons*
+  #("ok" "too many components" "name too long" "path too long"
+    "walk step limit" "internal error" "no matching rule" "denied by rule"
+    "always denied")
+  "Indexed by the ST_ values in bpf/enforce.h.")
+
+(cl:defun u32-at (bytes offset)
+  (cl:loop :for i :from 0 :below 4
+           :sum (cl:ash (cl:aref bytes (cl:+ offset i)) (cl:* 8 i))))
+
+(cl:defun text-at (bytes start end)
+  "The NUL-terminated text in BYTES from START, before END."
+  (cl:let* ((end (cl:min end (cl:length bytes)))
+            (stop (cl:or (cl:position 0 bytes :start (cl:min start end) :end end) end)))
+    (sb-ext:octets-to-string bytes :start (cl:min start stop) :end stop
+                                   :external-format '(:utf-8 :replacement #\?))))
+
+(cl:defun name-at (names index)
+  (cl:if (cl:< index (cl:length names)) (cl:aref names index) "unknown"))
+
+(cl:defun denial-json (bytes)
+  "struct denial: pid, hook, need, status, comm[16], path[256]."
+  (cl:let ((need (u32-at bytes 8)))
+    (cl:format cl:nil
+               "{\"event\":\"denial\",\"pid\":~D,\"comm\":~A,\"hook\":~A,\"kind\":~A,\"reason\":~A,\"path\":~A}"
+               (u32-at bytes 0)
+               (com.inuoe.jzon:stringify (text-at bytes 16 32))
+               (com.inuoe.jzon:stringify (name-at *hook-names* (u32-at bytes 4)))
+               (com.inuoe.jzon:stringify (cl:case need
+                                           (1 "read") (2 "write") (3 "read,write")
+                                           (cl:t "none")))
+               (com.inuoe.jzon:stringify (name-at *reasons* (u32-at bytes 12)))
+               (com.inuoe.jzon:stringify (text-at bytes 32 (cl:+ 32 256))))))
+
+(cl:defun reply-error-text (why)
+  "reply-error, callable from Lisp."
+  (cl:let ((why (cl:coerce why '(cl:simple-array cl:character (cl:*)))))
+    (coalton (reply-error (lisp (-> String) () why)))))
