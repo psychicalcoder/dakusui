@@ -1,13 +1,27 @@
 (defpackage #:dakusui/helper
   (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:enforcer #:dakusui/enforcer))
   (:export #:main))
 (in-package #:dakusui/helper)
 
 (coalton-toplevel
+  (declare complain (String -> Unit))
+  (define (complain text)
+    (lisp (-> Unit) (text)
+      (cl:format cl:*error-output* "dakusui: ~A~%" text)
+      (cl:finish-output cl:*error-output*)
+      Unit))
+
   (declare main (Void -> UFix))
   (define (main)
-    "Stub. Exit non-zero, since nothing is enforced yet."
-    (lisp (-> Void) ()
-      (cl:format cl:*error-output* "dakusui: not implemented~%")
-      (cl:values))
-    1))
+    "Start enforcement, or exit non-zero before anything else runs. (R9)"
+    (match (do
+            (lsm-list <- (enforcer:read-lsm-list))
+            (enforcer:start lsm-list))
+      ((Err why)
+       (complain why)
+       1)
+      ((Ok _)
+       ;; The agent comes in T13. Until then nothing can run, so exit non-zero.
+       (complain "the enforcer is attached, but the agent is not implemented yet")
+       1))))

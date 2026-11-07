@@ -45,7 +45,7 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T9 Embed `enforce.bpf.o` in the helper binary at build time, so the
   capability-bearing binary reads no object from disk. (R11) Done when the
   helper loads from its own image.
-- [ ] T10 Check at startup that `bpf` is in the LSM list, and exit with a clear
+- [x] T10 Check at startup that `bpf` is in the LSM list, and exit with a clear
   message on any load or attach failure. (R9) Done when a forced failure makes
   the helper exit non-zero and run nothing.
 - [ ] T11 Swap policies: build an inner map from compiled entries and replace

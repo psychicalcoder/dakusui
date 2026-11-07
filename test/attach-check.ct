@@ -112,12 +112,12 @@
 
   (declare check-attached (Void -> Result String libbpf:BpfObject))
   (define (check-attached)
+    "The helper's own startup. It fails unless every program attached."
     (do
-     (obj <- (enforcer:open-enforcer))
-     (check-names "the object file holds" (libbpf:program-names obj))
-     (libbpf:load-object obj)
-     (attached <- (libbpf:attach-all obj))
-     (check-names "attach-all returned" attached)
+     (lsm-list <- (enforcer:read-lsm-list))
+     (obj <- (enforcer:start lsm-list))
+     (let attached = (libbpf:program-names obj))
+     (check-names "the enforcer holds" attached)
      (let _ = (map (fn (name) (say (<> "attached " name))) attached))
      (pure obj)))
 

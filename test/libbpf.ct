@@ -29,6 +29,24 @@
             ((Ok obj) (list:length (libbpf:program-names obj)))
             ((Err _) 0)))))
 
+;;; T10: start refuses before it loads anything when bpf is not active. (R9)
+
+(define-test start-refuses-without-the-bpf-lsm ()
+  (is (== (Err "bpf is not an active LSM, so nothing can be enforced. Active: capability,landlock,yama. Add bpf to the lsm= boot parameter.")
+          (map (const Unit) (enforcer:start (<> "capability,landlock,yama" (into #\Newline)))))))
+
+(define-test start-does-not-take-bpf-as-a-substring ()
+  (is (== False
+          (match (enforcer:start "capability,bpfx,nobpf")
+            ((Ok _) True)
+            ((Err _) False)))))
+
+(define-test read-lsm-list-reports-what-the-kernel-lists ()
+  (is (== True
+          (match (enforcer:read-lsm-list)
+            ((Ok text) (string:substring? "capability" text))
+            ((Err _) False)))))
+
 (define-test map-update-rejects-a-wrong-key-size ()
   (is (== "bpf_map_update_elem: wrong key size"
           (failure-message

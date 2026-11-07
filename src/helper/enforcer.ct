@@ -1,7 +1,9 @@
 (defpackage #:dakusui/enforcer
   (:use #:coalton #:coalton-prelude)
-  (:local-nicknames (#:libbpf #:dakusui/libbpf))
-  (:export #:open-enforcer))
+  (:local-nicknames (#:libbpf #:dakusui/libbpf)
+                    (#:list #:coalton/list)
+                    (#:string #:coalton/string))
+  (:export #:open-enforcer #:read-lsm-list #:start))
 (in-package #:dakusui/enforcer)
 
 ;;; The enforcer, embedded in the image. (R11)
@@ -24,4 +26,37 @@
   (declare open-enforcer (Void -> Result String libbpf:BpfObject))
   (define (open-enforcer)
     "Open the embedded enforcer, ready to load."
-    (libbpf:open-object (lisp (-> libbpf:Octets) () *enforcer-octets*))))
+    (libbpf:open-object (lisp (-> libbpf:Octets) () *enforcer-octets*)))
+
+  (declare lsm-file String)
+  (define lsm-file "/sys/kernel/security/lsm")
+
+  (declare read-lsm-list (Void -> Result String String))
+  (define (read-lsm-list)
+    "The kernel's active LSMs, as the comma-separated text of lsm-file."
+    (lisp (-> (Result String String)) (lsm-file)
+      (cl:handler-case
+          (cl:let ((text (uiop:read-file-string lsm-file)))
+            (coalton (Ok (lisp (-> String) () text))))
+        (cl:error (e)
+          (cl:let ((why (cl:princ-to-string e)))
+            (coalton (Err (lisp (-> String) () why))))))))
+
+  (declare start (String -> Result String libbpf:BpfObject))
+  (define (start lsm-list)
+    "Check LSM-LIST, then load the enforcer and attach every program. Each
+failure is an Err that says which step failed. (R9)"
+    (let active =
+      (lisp (-> String) (lsm-list)
+        (cl:string-trim '(#\Newline #\Space) lsm-list)))
+    (if (not (list:member "bpf" (string:split #\, active)))
+        (Err (mconcat (make-list "bpf is not an active LSM, so nothing can be enforced. "
+                                 "Active: " active ". "
+                                 "Add bpf to the lsm= boot parameter.")))
+        (match (do
+                (obj <- (open-enforcer))
+                (libbpf:load-object obj)
+                (libbpf:attach-all obj)
+                (pure obj))
+          ((Ok obj) (Ok obj))
+          ((Err why) (Err (<> "cannot start the enforcer: " why)))))))
