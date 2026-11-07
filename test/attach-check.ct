@@ -1,15 +1,17 @@
 (defpackage #:dakusui/attach-check
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:libbpf #:dakusui/libbpf)
+                    (#:enforcer #:dakusui/enforcer)
                     (#:policy #:dakusui/policy)
                     (#:cell #:coalton/cell)
                     (#:list #:coalton/list))
   (:export #:main))
 (in-package #:dakusui/attach-check)
 
-;;; T8's check. Load enforce.bpf.o, attach every program, then run two commands
-;;; confined to show that the maps and the ring buffer work too. It needs CAP_BPF
-;;; and CAP_PERFMON, so it runs through `make attach-check`, not `make test`.
+;;; The check for T8 and T9. Load the enforcer embedded in this image, attach
+;;; every program, then run two commands confined to show that the maps and the
+;;; ring buffer work too. It needs CAP_BPF and CAP_PERFMON, so it runs through
+;;; `make attach-check`, not `make test`.
 
 (coalton-toplevel
   (repr :native sb-impl::process)
@@ -21,14 +23,6 @@
       (cl:write-line text)
       (cl:finish-output)
       Unit))
-
-  (declare object-path (Void -> Result String String))
-  (define (object-path)
-    (lisp (-> (Result String String)) ()
-      (cl:let ((path (cl:second sb-ext:*posix-argv*)))
-        (cl:if path
-               (coalton (Ok (lisp (-> String) () path)))
-               (coalton (Err "usage: attach-check PATH-TO-enforce.bpf.o"))))))
 
   (declare expected-programs (List String))
   (define expected-programs
@@ -116,10 +110,10 @@
          (cl:coerce (cl:subseq field 0 end) '(cl:vector (cl:unsigned-byte 8)))
          :external-format :utf-8))))
 
-  (declare check-attached (String -> Result String libbpf:BpfObject))
-  (define (check-attached path)
+  (declare check-attached (Void -> Result String libbpf:BpfObject))
+  (define (check-attached)
     (do
-     (obj <- (libbpf:open-object path))
+     (obj <- (enforcer:open-enforcer))
      (check-names "the object file holds" (libbpf:program-names obj))
      (libbpf:load-object obj)
      (attached <- (libbpf:attach-all obj))
@@ -156,8 +150,7 @@
   (define (main)
     (let outcome =
       (do
-       (path <- (object-path))
-       (obj <- (check-attached path))
+       (obj <- (check-attached))
        (check-enforced obj)))
     (match outcome
       ((Ok _)

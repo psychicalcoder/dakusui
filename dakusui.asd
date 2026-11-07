@@ -31,6 +31,7 @@
   :pathname "src/helper/"
   :serial t
   :components ((:ct-file "libbpf")
+               (:ct-file "enforcer")
                (:ct-file "main")))
 
 (defsystem "dakusui/agent"

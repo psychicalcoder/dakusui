@@ -42,7 +42,7 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T8 [P] Bind the libbpf calls we use through CFFI: open, load, attach, map
   create and update, ring buffer. Done when a Lisp program loads
   `enforce.bpf.o` and attaches every program.
-- [ ] T9 Embed `enforce.bpf.o` in the helper binary at build time, so the
+- [x] T9 Embed `enforce.bpf.o` in the helper binary at build time, so the
   capability-bearing binary reads no object from disk. (R11) Done when the
   helper loads from its own image.
 - [ ] T10 Check at startup that `bpf` is in the LSM list, and exit with a clear

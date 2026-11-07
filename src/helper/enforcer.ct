@@ -1,0 +1,27 @@
+(defpackage #:dakusui/enforcer
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:libbpf #:dakusui/libbpf))
+  (:export #:open-enforcer))
+(in-package #:dakusui/enforcer)
+
+;;; The enforcer, embedded in the image. (R11)
+;;;
+;;; Loading this file reads build/enforce.bpf.o, so the bytes are in the image
+;;; that `make build` saves. The binary that holds the capabilities never reads
+;;; an object from disk, so no one can swap the object.
+
+(cl:defparameter *enforcer-octets*
+  (cl:let ((path (asdf:system-relative-pathname "dakusui" "build/enforce.bpf.o")))
+    (cl:unless (cl:probe-file path)
+      (cl:error "~A is missing. Run `make bpf` first." path))
+    (cl:with-open-file (in path :element-type '(cl:unsigned-byte 8))
+      (cl:let ((octets (cl:make-array (cl:file-length in)
+                                      :element-type '(cl:unsigned-byte 8))))
+        (cl:read-sequence octets in)
+        octets))))
+
+(coalton-toplevel
+  (declare open-enforcer (Void -> Result String libbpf:BpfObject))
+  (define (open-enforcer)
+    "Open the embedded enforcer, ready to load."
+    (libbpf:open-object (lisp (-> libbpf:Octets) () *enforcer-octets*))))

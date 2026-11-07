@@ -2,6 +2,7 @@
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:list #:coalton/list))
   (:export
+   #:Octets
    #:BpfObject
    #:open-object
    #:load-object
@@ -30,8 +31,10 @@
 
 (cffi:use-foreign-library libbpf)
 
-(cffi:defcfun ("bpf_object__open_file" %open-file) :pointer
-  (path :string) (opts :pointer))
+(cffi:defcfun ("bpf_object__open_mem" %open-mem) :pointer
+  (buffer :pointer) (size :size) (opts :pointer))
+(cffi:defcfun ("libbpf_strerror" %strerror) :int
+  (err :int) (buffer :pointer) (size :size))
 (cffi:defcfun ("bpf_object__load" %load) :int
   (obj :pointer))
 (cffi:defcfun ("bpf_object__next_program" %next-program) :pointer
@@ -69,6 +72,21 @@
                :do (cl:setf (cffi:mem-aref pointer :uint8 i) byte))
       (cl:funcall function pointer))))
 
+(cl:defun error-text (errno)
+  "libbpf's text for ERRNO, which may be one of libbpf's own codes."
+  (cffi:with-foreign-object (buffer :char 128)
+    (%strerror errno buffer 128)
+    (cffi:foreign-string-to-lisp buffer)))
+
+(cl:defun permanent-copy (octets)
+  "Copy OCTETS to foreign memory that is never freed. libbpf documents no
+lifetime for an open_mem buffer, and the object lives as long as the process."
+  (cl:let ((pointer (cffi:foreign-alloc :uint8 :count (cl:max 1 (cl:length octets)))))
+    (cl:loop :for byte :across octets
+             :for i :from 0
+             :do (cl:setf (cffi:mem-aref pointer :uint8 i) byte))
+    pointer))
+
 (cl:defvar *record-handler* cl:nil
   "The Coalton function that receives each ring buffer record.")
 
@@ -85,6 +103,10 @@
 (coalton-toplevel
   (repr :native cffi:foreign-pointer)
   (define-type Pointer)
+
+  (repr :native (cl:simple-array (cl:unsigned-byte 8) (cl:*)))
+  (define-type Octets
+    "The bytes of a file.")
 
   (repr :transparent)
   (define-type BpfObject
@@ -104,7 +126,7 @@
   (declare failure (String * I32 -> Result String :a))
   (define (failure call errno)
     (Err (lisp (-> String) (call errno)
-           (cl:format cl:nil "~A: ~A" call (sb-int:strerror errno)))))
+           (cl:format cl:nil "~A: ~A" call (error-text errno)))))
 
   (declare check-pointer (String * Pointer -> Result String Pointer))
   (define (check-pointer call pointer)
@@ -120,11 +142,14 @@
         (failure call (negate status))
         (Ok status)))
 
-  (declare open-object (String -> Result String BpfObject))
-  (define (open-object path)
-    "Parse the object file. This needs no capabilities."
-    (let opened = (lisp (-> Pointer) (path) (%open-file path (cffi:null-pointer))))
-    (map BpfObject (check-pointer (<> "bpf_object__open_file " path) opened)))
+  (declare open-object (Octets -> Result String BpfObject))
+  (define (open-object octets)
+    "Parse an object file held in memory. This needs no capabilities. There is
+no open from a path, so the helper reads no object from disk. (R11)"
+    (let opened =
+      (lisp (-> Pointer) (octets)
+        (%open-mem (permanent-copy octets) (cl:length octets) (cffi:null-pointer))))
+    (map BpfObject (check-pointer "bpf_object__open_mem" opened)))
 
   (declare load-object (BpfObject -> Result String Unit))
   (define (load-object (BpfObject obj))

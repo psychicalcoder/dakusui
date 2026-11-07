@@ -76,6 +76,9 @@ the judge, and runs commands through the launcher.
   (tested at commit 21e0c63), Fiasco and CFFI from Quicklisp. Nothing pins them
   yet. The helper loads `libbpf.so.1` (tested with 1.8.0) by soname, so under
   file capabilities the dynamic linker ignores `LD_LIBRARY_PATH`.
+- **Embedded enforcer.** Loading `dakusui/helper` reads `build/enforce.bpf.o`
+  into the image, and libbpf opens it from memory. The library binds no open
+  from a path, so the helper cannot read an object from disk (R11).
 - **Kernel check.** `make attach-check` grants the capabilities to a check
   binary, loads `enforce.bpf.o`, attaches every program, and runs a denied and
   an allowed read. It removes the capabilities after the run. It needs `sudo`.

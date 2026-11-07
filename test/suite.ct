@@ -2,6 +2,7 @@
   (:use #:coalton #:coalton-prelude #:coalton-testing)
   (:local-nicknames (#:policy #:dakusui/policy)
                     (#:libbpf #:dakusui/libbpf)
+                    (#:enforcer #:dakusui/enforcer)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
   (:export #:run-tests))

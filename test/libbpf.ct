@@ -13,9 +13,21 @@
       ((Ok _) "")
       ((Err message) message))))
 
-(define-test open-object-names-the-file-and-the-reason ()
-  (is (== "bpf_object__open_file /no/such.o: No such file or directory"
-          (failure-message (libbpf:open-object "/no/such.o")))))
+(define-test open-object-rejects-bytes-that-are-not-elf ()
+  (is (== "bpf_object__open_mem: BPF object format invalid"
+          (failure-message
+           (libbpf:open-object
+            (lisp (-> libbpf:Octets) ()
+              (cl:make-array 16 :element-type '(cl:unsigned-byte 8)
+                                :initial-element 7)))))))
+
+;;; T9: the helper opens the enforcer from its own image. (R11)
+
+(define-test open-enforcer-finds-every-program ()
+  (is (== 13
+          (match (enforcer:open-enforcer)
+            ((Ok obj) (list:length (libbpf:program-names obj)))
+            ((Err _) 0)))))
 
 (define-test map-update-rejects-a-wrong-key-size ()
   (is (== "bpf_map_update_elem: wrong key size"
