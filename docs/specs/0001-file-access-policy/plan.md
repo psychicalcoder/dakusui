@@ -53,9 +53,17 @@ compiles a policy into map entries.
 **4. Helper** (`dakusui`, Coalton with CFFI to libbpf)
 
 At start: check that `bpf` is in the LSM list, load and attach the programs,
-create the socketpair, fork. The child clears its capabilities, sets
-`no_new_privs`, becomes non-dumpable, and execs `dakusui-agent`. If any step
-fails, exit (R9). Then serve the socket.
+create the socketpair, fork. The child puts its end of the socketpair on fd 3,
+marks every other descriptor close-on-exec, sets `no_new_privs`, clears its
+capabilities, and execs `dakusui-agent`. Exec resets the dumpable flag, so the
+agent makes itself non-dumpable, and marks fd 3 close-on-exec so commands do
+not inherit it. If any step fails, exit (R9). Then serve the socket.
+
+The child keeps the bounding set. Dropping it needs CAP_SETPCAP, which the
+helper lacks. It would stop an exec of a file with capabilities, such as
+`dakusui` itself, from granting them. Under `no_new_privs` an exec grants
+nothing beyond what the process holds, which is nothing, and every descendant
+inherits the flag.
 
 **5. Agent** (`dakusui-agent`, Coalton)
 

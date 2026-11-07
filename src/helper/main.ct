@@ -1,6 +1,7 @@
 (defpackage #:dakusui/helper
   (:use #:coalton #:coalton-prelude)
-  (:local-nicknames (#:enforcer #:dakusui/enforcer))
+  (:local-nicknames (#:enforcer #:dakusui/enforcer)
+                    (#:spawn #:dakusui/spawn))
   (:export #:main))
 (in-package #:dakusui/helper)
 
@@ -14,14 +15,16 @@
 
   (declare main (Void -> UFix))
   (define (main)
-    "Start enforcement, or exit non-zero before anything else runs. (R9)"
+    "Start enforcement and then the agent, or exit non-zero before anything
+runs. (R9, R11) Exit with the agent's code."
     (match (do
             (lsm-list <- (enforcer:read-lsm-list))
-            (enforcer:start lsm-list))
+            (_ <- (enforcer:start lsm-list))
+            (spawn:start-agent (spawn:agent-path) Nil))
       ((Err why)
        (complain why)
        1)
-      ((Ok _)
-       ;; The agent comes in T13. Until then nothing can run, so exit non-zero.
-       (complain "the enforcer is attached, but the agent is not implemented yet")
-       1))))
+      ((Ok agent)
+       ;; Serving the socket comes in T14.
+       (let code = (spawn:wait-agent agent))
+       (lisp (-> UFix) (code) code)))))

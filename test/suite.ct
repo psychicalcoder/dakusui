@@ -3,6 +3,7 @@
   (:local-nicknames (#:policy #:dakusui/policy)
                     (#:libbpf #:dakusui/libbpf)
                     (#:enforcer #:dakusui/enforcer)
+                    (#:spawn #:dakusui/spawn)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
   (:export #:run-tests))

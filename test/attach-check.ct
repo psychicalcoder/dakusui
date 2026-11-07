@@ -2,15 +2,17 @@
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:libbpf #:dakusui/libbpf)
                     (#:enforcer #:dakusui/enforcer)
+                    (#:spawn #:dakusui/spawn)
+                    (#:string #:coalton/string)
                     (#:policy #:dakusui/policy)
                     (#:cell #:coalton/cell)
                     (#:list #:coalton/list))
   (:export #:main))
 (in-package #:dakusui/attach-check)
 
-;;; The check for T8 through T12. Start the enforcer embedded in this image, then
+;;; The check for T8 through T13. Start the enforcer embedded in this image, then
 ;;; run commands confined to show that policies, live swaps (A4), and denial
-;;; records work. It needs CAP_BPF and CAP_PERFMON, so it runs through
+;;; records work. Last, start a stand-in agent to show it holds nothing. It needs CAP_BPF and CAP_PERFMON, so it runs through
 ;;; `make attach-check`, not `make test`.
 
 (coalton-toplevel
@@ -166,12 +168,52 @@ allow rule, and the same command's next read succeeds."
      (check-live-swap obj base)
      (pure (say "A4 passed: a running command saw the new policy"))))
 
+  (declare read-socket (I32 -> String))
+  (define (read-socket fd)
+    "Read the socket FD to its end, then close it."
+    (lisp (-> String) (fd)
+      (cl:with-open-stream (in (sb-sys:make-fd-stream fd :input cl:t
+                                                         :external-format :utf-8
+                                                         :auto-close cl:t))
+        (cl:with-output-to-string (out)
+          (cl:loop :for line := (cl:read-line in cl:nil)
+                   :while line
+                   :do (cl:write-line line out))))))
+
+  (declare check-agent-start (Void -> Result String Unit))
+  (define (check-agent-start)
+    "T13 (R11): start a stand-in agent the way the helper starts the real one,
+while this process holds the capabilities and every BPF descriptor. The child
+reports its status and descriptors over its socket."
+    (let script =
+      (<> "grep -E '^(CapInh|CapPrm|CapEff|CapAmb|CapBnd|NoNewPrivs):' /proc/self/status >&3; "
+          "exec 1>&3; exec ls -l /proc/self/fd"))
+    (do
+     (agent <- (spawn:start-agent "/bin/sh" (make-list "-c" script)))
+     (let report = (read-socket (spawn:agent-socket agent)))
+     (let zero = (fn (field)
+                   (string:substring? (<> field (<> (into #\Tab) "0000000000000000"))
+                                      report)))
+     (let _ = (spawn:wait-agent agent))
+     (let _ = (say report))
+     (cond
+       ((not (list:all zero (make-list "CapInh:" "CapPrm:" "CapEff:" "CapAmb:")))
+        (Err "the agent kept a capability"))
+       ((not (string:substring? (<> "NoNewPrivs:" (<> (into #\Tab) "1")) report))
+        (Err "the agent can gain privileges on exec"))
+       ((string:substring? "bpf" report)
+        (Err "the agent inherited a BPF descriptor"))
+       ((string:substring? " 5 -> " report)
+        (Err "the agent inherited a descriptor beyond fd 3"))
+       (True (Ok (say "T13 passed: the agent has no capabilities and only fd 3"))))))
+
   (declare main (Void -> UFix))
   (define (main)
     (let outcome =
       (do
        (obj <- (check-attached))
-       (check-enforced obj)))
+       (check-enforced obj)
+       (check-agent-start)))
     (match outcome
       ((Ok _)
        (say "attach-check: passed")

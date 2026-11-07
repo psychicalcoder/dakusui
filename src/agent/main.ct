@@ -1,13 +1,44 @@
 (defpackage #:dakusui/agent
   (:use #:coalton #:coalton-prelude)
-  (:export #:main))
+  (:export #:main #:harden))
 (in-package #:dakusui/agent)
 
 (coalton-toplevel
+  (declare complain (String -> Unit))
+  (define (complain text)
+    (lisp (-> Unit) (text)
+      (cl:format cl:*error-output* "dakusui-agent: ~A~%" text)
+      (cl:finish-output cl:*error-output*)
+      Unit))
+
+  (declare harden (Void -> Result String Unit))
+  (define (harden)
+    "Finish what the helper started before exec. (R11, ADR 0005) Exec resets
+the dumpable flag, so clear it again: a confined command must not read our
+memory through /proc. Then keep the helper socket on fd 3 from commands."
+    (lisp (-> (Result String Unit)) ()
+      (cl:flet ((refuse (what)
+                  (cl:let ((why (cl:format cl:nil "~A: ~A" what
+                                           (sb-int:strerror (sb-alien:get-errno)))))
+                    (coalton (Err (lisp (-> String) () why))))))
+        (cl:cond
+          ;; PR_SET_DUMPABLE (4).
+          ((cl:< (cffi:foreign-funcall "prctl" :int 4 :unsigned-long 0
+                                       :unsigned-long 0 :unsigned-long 0
+                                       :unsigned-long 0 :int)
+                 0)
+           (refuse "PR_SET_DUMPABLE"))
+          ;; F_SETFD (2), FD_CLOEXEC (1).
+          ((cl:< (cffi:foreign-funcall "fcntl" :int 3 :int 2 :int 1 :int) 0)
+           (refuse "no helper socket on fd 3; start dakusui instead. fcntl"))
+          (cl:t (coalton (Ok Unit)))))))
+
   (declare main (Void -> UFix))
   (define (main)
-    "Stub. Exit non-zero, since nothing is enforced yet."
-    (lisp (-> Void) ()
-      (cl:format cl:*error-output* "dakusui-agent: not implemented~%")
-      (cl:values))
-    1))
+    (match (harden)
+      ((Err why)
+       (complain why)
+       1)
+      ((Ok _)
+       (complain "not implemented")
+       1))))

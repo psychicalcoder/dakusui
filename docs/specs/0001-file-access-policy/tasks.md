@@ -52,10 +52,13 @@ a task that can run in parallel with the one before it. The spike code in
   the slot. (R4) Done when A4 passes through the Lisp path.
 - [x] T12 Flag a process by pid, using a pidfd key. (R1) Done when a flagged
   shell is denied what the policy denies.
-- [ ] T13 Create the socketpair and fork. The child clears all capability sets and
-  the bounding set, sets `no_new_privs`, becomes non-dumpable, marks its
-  descriptors close-on-exec, and execs `dakusui-agent`. (R11) Done when the
-  agent shows `CapEff` of zero and `NoNewPrivs` of 1 in `/proc/self/status`.
+- [x] T13 Create the socketpair and fork. The child puts its end on fd 3, marks
+  its other descriptors close-on-exec, sets `no_new_privs`, clears all
+  capability sets, and execs `dakusui-agent`. The agent makes itself
+  non-dumpable, since exec resets that flag, and marks fd 3 close-on-exec.
+  (R11) Done when the agent shows `CapEff` of zero and `NoNewPrivs` of 1 in
+  `/proc/self/status`. The bounding set stays: dropping it needs CAP_SETPCAP,
+  and `no_new_privs` already stops exec from granting capabilities.
 - [ ] T14 Serve the protocol: `policy` and `flag` requests, typed decoding, and
   pushed `denial` events. (R7) Done when malformed input gets an error reply and
   never crashes the helper.

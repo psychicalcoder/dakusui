@@ -26,17 +26,18 @@
 
 (defsystem "dakusui/helper"
   :description "The dakusui binary: holds the capabilities and owns the BPF maps."
-  :depends-on ("coalton" "cffi" "dakusui/policy")
+  :depends-on ("coalton" "cffi" "sb-posix" "dakusui/policy")
   :defsystem-depends-on ("coalton-asdf")
   :pathname "src/helper/"
   :serial t
   :components ((:ct-file "libbpf")
                (:ct-file "enforcer")
+               (:ct-file "spawn")
                (:ct-file "main")))
 
 (defsystem "dakusui/agent"
   :description "The dakusui-agent binary: runs the LLM loop and owns the policy."
-  :depends-on ("coalton" "dakusui/policy")
+  :depends-on ("coalton" "cffi" "dakusui/policy")
   :defsystem-depends-on ("coalton-asdf")
   :pathname "src/agent/"
   :components ((:ct-file "main")))
@@ -54,4 +55,5 @@
                (:ct-file "evaluate")
                (:ct-file "default")
                (:ct-file "compile")
-               (:ct-file "libbpf")))
+               (:ct-file "libbpf")
+               (:ct-file "spawn")))
