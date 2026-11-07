@@ -85,8 +85,8 @@ enforces the policy, and the user can change it while commands run.
 
 - A12 (R5): Given `allow read /` and `allow write /w` only, when a command opens
   `/w/f` write-only, then it succeeds; opens `/etc/hostname` read-only, then it
-  succeeds; opens `/w/f` read-write, then it fails, because read is not allowed
-  there.
+  succeeds; opens `/etc/hostname` read-write, then it fails, because write is not
+  allowed there.
 - A13 (R7): Given a denied access, when the command fails, then Dakusui logs one
   line naming the process, the path, and the access kind.
 - A14 (R8): Given any policy, when the agent calls the policy tool or the judge

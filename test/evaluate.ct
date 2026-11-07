@@ -1,0 +1,73 @@
+(in-package #:dakusui/test)
+
+;;; T5: the reference evaluator. (R2, R5)
+
+(coalton-toplevel
+  (declare policy-of (List String -> policy:Policy))
+  (define (policy-of lines)
+    (policy:Policy (map (fn (line) (unwrap (policy:parse-rule line))) lines))))
+
+(define-test evaluate-a3-last-match-wins ()
+  (let p = (policy-of (make-list "allow read /p/a/x" "deny read /p/a")))
+  (is (not (policy:allows? p read-only "/p/a/x"))))
+
+(define-test evaluate-later-allow-beats-an-earlier-deny ()
+  (let p = (policy-of (make-list "deny read /p/a" "allow read /p/a/x")))
+  (is (policy:allows? p read-only "/p/a/x"))
+  (is (not (policy:allows? p read-only "/p/a/y"))))
+
+(define-test evaluate-no-match-denies ()
+  (is (not (policy:allows? (policy:Policy Nil) read-only "/a")))
+  (let p = (policy-of (make-list "allow read /a")))
+  (is (not (policy:allows? p read-only "/b"))))
+
+(define-test evaluate-path-covers-itself-and-beneath ()
+  (let p = (policy-of (make-list "allow read /p/a")))
+  (is (policy:allows? p read-only "/p/a"))
+  (is (policy:allows? p read-only "/p/a/b/c"))
+  (is (not (policy:allows? p read-only "/p")))
+  ;; A prefix stops at a component boundary.
+  (is (not (policy:allows? p read-only "/p/ab"))))
+
+(define-test evaluate-root-covers-everything ()
+  (let p = (policy-of (make-list "allow read /")))
+  (is (policy:allows? p read-only "/"))
+  (is (policy:allows? p read-only "/a/b")))
+
+(define-test evaluate-name-tests-the-last-component-only ()
+  (let p = (policy-of (make-list "allow read /" "deny read name:.env")))
+  (is (not (policy:allows? p read-only "/.env")))
+  (is (not (policy:allows? p read-only "/a/b/.env")))
+  (is (policy:allows? p read-only "/.env/x"))
+  (is (policy:allows? p read-only "/a/.envrc"))
+  (is (policy:allows? p read-only "/")))
+
+(define-test evaluate-order-decides-between-name-and-path ()
+  (let p = (policy-of (make-list "deny read name:.env" "allow read /a")))
+  (is (policy:allows? p read-only "/a/.env")))
+
+(define-test evaluate-kinds-are-decided-apart ()
+  (let p = (policy-of (make-list "allow read,write /a" "deny write /a/b")))
+  (is (policy:allows? p read-only "/a/b"))
+  (is (not (policy:allows? p write-only "/a/b")))
+  (is (policy:allows? p write-only "/a/c"))
+  ;; A rule for one kind says nothing about the other.
+  (let q = (policy-of (make-list "allow read /a")))
+  (is (not (policy:allows? q write-only "/a"))))
+
+(define-test evaluate-a12 ()
+  (let p = (policy-of (make-list "allow read /" "allow write /w")))
+  (is (policy:allows? p write-only "/w/f"))
+  (is (policy:allows? p read-only "/etc/hostname"))
+  (is (not (policy:allows? p read-write "/etc/hostname"))))
+
+;; O_RDWR needs both kinds.
+(define-test evaluate-read-write-needs-both-kinds ()
+  (let read-missing = (policy-of (make-list "allow write /w")))
+  (is (policy:allows? read-missing write-only "/w/f"))
+  (is (not (policy:allows? read-missing read-write "/w/f")))
+  ;; Different rules may allow each kind.
+  (let separate = (policy-of (make-list "allow read /" "allow write /w")))
+  (is (policy:allows? separate read-write "/w/f"))
+  (let both = (policy-of (make-list "allow read,write /w")))
+  (is (policy:allows? both read-write "/w/f")))

@@ -10,7 +10,8 @@
    #:Pattern
    #:Rule
    #:Policy
-   #:parse-rule))
+   #:parse-rule
+   #:allows?))
 (in-package #:dakusui/policy)
 
 (coalton-toplevel

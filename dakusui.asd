@@ -12,7 +12,8 @@
   :pathname "src/policy/"
   :serial t
   :components ((:ct-file "policy")
-               (:ct-file "parse")))
+               (:ct-file "parse")
+               (:ct-file "evaluate")))
 
 (defsystem "dakusui/helper"
   :description "The dakusui binary: holds the capabilities and owns the BPF maps."
@@ -37,4 +38,5 @@
   :serial t
   :components ((:ct-file "suite")
                (:ct-file "policy")
-               (:ct-file "parse")))
+               (:ct-file "parse")
+               (:ct-file "evaluate")))

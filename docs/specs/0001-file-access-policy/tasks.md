@@ -25,7 +25,7 @@ a task that can run in parallel with the one before it. The spike code in
   relative paths, globs, and unknown kinds, each with a message that names the
   problem. (R10) Done when the parser tests cover A15 and every example in the
   spec.
-- [ ] T5 Write the reference evaluator: last match wins, no match denies, a name
+- [x] T5 Write the reference evaluator: last match wins, no match denies, a name
   rule tests the last component only. (R2, R5) Done when evaluator tests cover
   A3 and A12, including the O_RDWR case that needs both kinds.
 - [ ] T6 Build the default policy from the project directory and the home
