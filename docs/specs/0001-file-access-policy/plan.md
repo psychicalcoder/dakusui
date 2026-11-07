@@ -24,8 +24,9 @@ every file operation of flagged processes (ADRs 0002, 0004, 0005, 0006).
   look up every path prefix and the last component's name in the rule map, and
   take the match with the highest sequence number. No match means deny.
 - On deny, return `-EACCES` and write a record to the `denials` ring buffer.
-- Over the limits (32 components, 63-byte names, about 190 bytes in all), deny
-  and log. Failing closed is safer than guessing.
+- Over the limits (32 components, 63 bytes per component, 190 bytes before the
+  last component), deny and log. Failing closed is safer than guessing. The
+  compiler rejects a rule beyond these limits, because it could never match.
 
 **2. Rule map**
 

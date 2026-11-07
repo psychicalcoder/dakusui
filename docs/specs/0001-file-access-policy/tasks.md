@@ -32,7 +32,7 @@ a task that can run in parallel with the one before it. The spike code in
   directory. (R3) Done when the evaluator gives the A1 and A11 verdicts.
 - [x] T25 Build a session's policy: the default, then a rule set, then the fixed
   deny on `.dakusui`. (R14) Done when the evaluator gives the A18 verdicts.
-- [ ] T7 Compile a policy into map entries: one entry per pattern, the last
+- [x] T7 Compile a policy into map entries: one entry per pattern, the last
   rule per kind keeps its sequence number, keys zero padded. Reject names over
   63 bytes and paths over the limit. (R2, R10) Done when tests show duplicate
   patterns merge correctly.

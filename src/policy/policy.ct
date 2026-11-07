@@ -14,7 +14,12 @@
    #:parse-rule
    #:allows?
    #:default-policy
-   #:session-policy))
+   #:session-policy
+   #:Decision
+   #:Entry
+   #:compile-policy
+   #:entry-key-bytes
+   #:entry-value-bytes))
 (in-package #:dakusui/policy)
 
 (coalton-toplevel

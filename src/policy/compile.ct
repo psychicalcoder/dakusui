@@ -1,0 +1,170 @@
+(in-package #:dakusui/policy)
+
+;;; Compile a policy into the entries of the rule map. (R2, R10)
+;;;
+;;; The byte layouts mirror struct rule_key and struct rule_val in
+;;; bpf/enforce.h, on little-endian x86-64. The limits mirror the walk in
+;;; bpf/enforce.bpf.c, which denies any path beyond them, so a rule beyond them
+;;; could never match.
+
+(coalton-toplevel
+  (declare key-length UFix)
+  (define key-length 256)
+
+  (declare component-length UFix)
+  (define component-length 64)
+
+  (declare max-components UFix)
+  (define max-components 32)
+
+  (declare max-component-bytes UFix)
+  (define max-component-bytes (- component-length 1))
+
+  (declare max-parent-bytes UFix)
+  (define max-parent-bytes (- key-length (+ component-length 2)))
+
+  (derive Eq)
+  (define-struct Decision
+    "The last rule to decide a kind: its 1-based place in the policy, and effect."
+    (seq UFix)
+    (effect Effect))
+
+  (derive Eq)
+  (define-struct Entry
+    "One map entry: a pattern, and the decision for each kind."
+    (pattern Pattern)
+    (on-read (Optional Decision))
+    (on-write (Optional Decision)))
+
+  (declare utf8-bytes (String -> List U8))
+  (define (utf8-bytes text)
+    (lisp (-> (List U8)) (text)
+      (cl:coerce (sb-ext:string-to-octets text :external-format :utf-8) 'cl:list)))
+
+  (declare byte-length (String -> UFix))
+  (define (byte-length text)
+    (list:length (utf8-bytes text)))
+
+  (declare has-nul? (String -> Boolean))
+  (define (has-nul? text)
+    (lisp (-> Boolean) (text)
+      (cl:and (cl:find (cl:code-char 0) text) cl:t)))
+
+  (declare check-name (String -> Result String Unit))
+  (define (check-name name)
+    (cond
+      ((has-nul? name)
+       (complain "NUL in name" name "no file name can hold one"))
+      ((> (byte-length name) max-component-bytes)
+       (complain "name too long" name "the limit is 63 bytes"))
+      (True (Ok Unit))))
+
+  (declare check-path (String -> Result String Unit))
+  (define (check-path path)
+    (let parts =
+      (match (string:split #\/ path)
+        ((Cons _ rest) rest)
+        ((Nil) Nil)))
+    (let last-bytes = (byte-length (with-default "" (list:last parts))))
+    (let parent-bytes = (- (byte-length path) (+ last-bytes 1)))
+    (cond
+      ((== path "/") (Ok Unit))
+      ((has-nul? path)
+       (complain "NUL in path" path "no path can hold one"))
+      ((> (list:length parts) max-components)
+       (complain "too many components in path" path "the limit is 32"))
+      ((list:any (fn (part) (> (byte-length part) max-component-bytes)) parts)
+       (complain "path component too long in" path "the limit is 63 bytes each"))
+      ((> parent-bytes max-parent-bytes)
+       (complain "path too long" path
+                 "the limit is 190 bytes before the last component"))
+      (True (Ok Unit))))
+
+  (declare check-rule (Rule -> Result String Unit))
+  (define (check-rule r)
+    (match r
+      ((Rule _ _ (PathPrefix path)) (check-path path))
+      ((Rule _ _ (FileName name)) (check-name name))))
+
+  (declare merge-rule (Entry * UFix * Effect * Kinds -> Entry))
+  (define (merge-rule old seq effect listed)
+    "Later rules overwrite earlier ones, kind by kind."
+    (let chosen = (Some (Decision seq effect)))
+    (Entry (.pattern old)
+           (if (covers? listed Read) chosen (.on-read old))
+           (if (covers? listed Write) chosen (.on-write old))))
+
+  (declare add-rule (List Entry * UFix * Rule -> List Entry))
+  (define (add-rule entries seq r)
+    (match r
+      ((Rule effect listed pat)
+       (if (list:any (fn (entry) (== (.pattern entry) pat)) entries)
+           (map (fn (entry)
+                  (if (== (.pattern entry) pat)
+                      (merge-rule entry seq effect listed)
+                      entry))
+                entries)
+           (<> entries
+               (make-list (merge-rule (Entry pat None None) seq effect listed)))))))
+
+  (declare add-rules (List Entry * UFix * List Rule -> List Entry))
+  (define (add-rules entries seq rules)
+    (match rules
+      ((Nil) entries)
+      ((Cons r rest) (add-rules (add-rule entries seq r) (+ seq 1) rest))))
+
+  (declare compile-policy (Policy -> Result String (List Entry)))
+  (define (compile-policy pol)
+    "One entry per pattern, in order of first appearance. The error names the
+pattern that the enforcer could never match."
+    (match pol
+      ((Policy rules)
+       (do
+        (traverse check-rule rules)
+        (pure (add-rules Nil 1 rules))))))
+
+  (declare u32-bytes (UFix -> List U8))
+  (define (u32-bytes n)
+    (lisp (-> (List U8)) (n)
+      (cl:loop :for shift :from 0 :below 32 :by 8
+               :collect (cl:ldb (cl:byte 8 shift) n))))
+
+  (declare zeros (UFix -> List U8))
+  (define (zeros n)
+    (lisp (-> (List U8)) (n)
+      (cl:make-list n :initial-element 0)))
+
+  (declare entry-key-bytes (Entry -> List U8))
+  (define (entry-key-bytes entry)
+    "struct rule_key: the tag, then the string padded with zeros."
+    (let tagged =
+      (match (.pattern entry)
+        ((PathPrefix path) (Tuple 0 path))
+        ((FileName name) (Tuple 1 name))))
+    (let text = (utf8-bytes (snd tagged)))
+    (mconcat (make-list (u32-bytes (fst tagged))
+                        text
+                        (zeros (- key-length (list:length text))))))
+
+  (declare decision-seq (Optional Decision -> UFix))
+  (define (decision-seq found)
+    "Sequence number 0 means no rule for this kind."
+    (match found
+      ((Some d) (.seq d))
+      ((None) 0)))
+
+  (declare decision-effect (Optional Decision -> U8))
+  (define (decision-effect found)
+    (match found
+      ((Some d) (if (== (.effect d) Allow) 1 0))
+      ((None) 0)))
+
+  (declare entry-value-bytes (Entry -> List U8))
+  (define (entry-value-bytes entry)
+    "struct rule_val: index 0 is read, index 1 is write."
+    (mconcat (make-list (u32-bytes (decision-seq (.on-read entry)))
+                        (u32-bytes (decision-seq (.on-write entry)))
+                        (make-list (decision-effect (.on-read entry))
+                                   (decision-effect (.on-write entry))
+                                   0
+                                   0)))))

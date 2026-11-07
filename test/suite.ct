@@ -1,6 +1,8 @@
 (defpackage #:dakusui/test
   (:use #:coalton #:coalton-prelude #:coalton-testing)
-  (:local-nicknames (#:policy #:dakusui/policy))
+  (:local-nicknames (#:policy #:dakusui/policy)
+                    (#:list #:coalton/list)
+                    (#:string #:coalton/string))
   (:export #:run-tests))
 (in-package #:dakusui/test)
 
