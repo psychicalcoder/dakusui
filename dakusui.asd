@@ -17,12 +17,21 @@
                (:ct-file "default")
                (:ct-file "compile")))
 
+(defsystem "dakusui/attach-check"
+  :description "A check that needs capabilities. Run it with `make attach-check`."
+  :depends-on ("coalton" "cffi" "dakusui/policy" "dakusui/helper")
+  :defsystem-depends-on ("coalton-asdf")
+  :pathname "test/"
+  :components ((:ct-file "attach-check")))
+
 (defsystem "dakusui/helper"
   :description "The dakusui binary: holds the capabilities and owns the BPF maps."
-  :depends-on ("coalton" "dakusui/policy")
+  :depends-on ("coalton" "cffi" "dakusui/policy")
   :defsystem-depends-on ("coalton-asdf")
   :pathname "src/helper/"
-  :components ((:ct-file "main")))
+  :serial t
+  :components ((:ct-file "libbpf")
+               (:ct-file "main")))
 
 (defsystem "dakusui/agent"
   :description "The dakusui-agent binary: runs the LLM loop and owns the policy."
@@ -43,4 +52,5 @@
                (:ct-file "parse")
                (:ct-file "evaluate")
                (:ct-file "default")
-               (:ct-file "compile")))
+               (:ct-file "compile")
+               (:ct-file "libbpf")))

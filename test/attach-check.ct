@@ -1,0 +1,168 @@
+(defpackage #:dakusui/attach-check
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:libbpf #:dakusui/libbpf)
+                    (#:policy #:dakusui/policy)
+                    (#:cell #:coalton/cell)
+                    (#:list #:coalton/list))
+  (:export #:main))
+(in-package #:dakusui/attach-check)
+
+;;; T8's check. Load enforce.bpf.o, attach every program, then run two commands
+;;; confined to show that the maps and the ring buffer work too. It needs CAP_BPF
+;;; and CAP_PERFMON, so it runs through `make attach-check`, not `make test`.
+
+(coalton-toplevel
+  (repr :native sb-impl::process)
+  (define-type Process)
+
+  (declare say (String -> Unit))
+  (define (say text)
+    (lisp (-> Unit) (text)
+      (cl:write-line text)
+      (cl:finish-output)
+      Unit))
+
+  (declare object-path (Void -> Result String String))
+  (define (object-path)
+    (lisp (-> (Result String String)) ()
+      (cl:let ((path (cl:second sb-ext:*posix-argv*)))
+        (cl:if path
+               (coalton (Ok (lisp (-> String) () path)))
+               (coalton (Err "usage: attach-check PATH-TO-enforce.bpf.o"))))))
+
+  (declare expected-programs (List String))
+  (define expected-programs
+    (make-list "e_inherit" "e_file_open" "e_file_truncate" "e_path_truncate"
+               "e_path_mknod" "e_path_mkdir" "e_path_rmdir" "e_path_unlink"
+               "e_path_symlink" "e_path_rename" "e_path_link" "e_userns_create"
+               "e_ptrace_access_check"))
+
+  (declare check-names (String * List String -> Result String Unit))
+  (define (check-names label names)
+    (if (and (== (list:length names) (list:length expected-programs))
+             (list:all (fn (name) (list:member name names)) expected-programs))
+        (Ok Unit)
+        (Err (<> label " the wrong programs"))))
+
+  (declare install-policy (libbpf:BpfObject * List String -> Result String Unit))
+  (define (install-policy obj lines)
+    "Build an inner map from rule text and swap it in, as T11 will."
+    (do
+     (rules <- (traverse policy:parse-rule lines))
+     (entries <- (policy:compile-policy (policy:Policy rules)))
+     (outer <- (libbpf:find-map obj "rules"))
+     ;; The sizes of struct rule_key and struct rule_val, and the
+     ;; max_entries of inner_template.
+     (inner <- (libbpf:create-hash-map 260 12 1024))
+     (traverse (fn (entry)
+                 (libbpf:map-update inner
+                                    (policy:entry-key-bytes entry)
+                                    (policy:entry-value-bytes entry)))
+               entries)
+     (libbpf:map-set-inner outer inner)
+     (pure (libbpf:close-map inner))))
+
+  (declare start-blocked (String -> Process))
+  (define (start-blocked file)
+    "A shell that waits on stdin, then runs `cat FILE`."
+    (lisp (-> Process) (file)
+      (sb-ext:run-program "/bin/sh"
+                          (cl:list "-c" "read _ && exec cat \"$1\"" "sh" file)
+                          :wait cl:nil :input :stream :output cl:nil :error cl:nil)))
+
+  (declare pidfd-bytes (Process -> Result String (List U8)))
+  (define (pidfd-bytes process)
+    "The key of the confined map: a pidfd. 434 is pidfd_open on x86-64."
+    (let fd =
+      (lisp (-> I32) (process)
+        (cffi:foreign-funcall "syscall"
+                              :long 434
+                              :int (sb-ext:process-pid process)
+                              :uint 0
+                              :int)))
+    (if (< fd 0)
+        (Err "pidfd_open failed")
+        (Ok (lisp (-> (List U8)) (fd)
+              (cl:loop :for shift :from 0 :below 32 :by 8
+                       :collect (cl:ldb (cl:byte 8 shift) fd))))))
+
+  (declare release-and-wait (Process -> I32))
+  (define (release-and-wait process)
+    "Let the shell go on, and return its exit code."
+    (lisp (-> I32) (process)
+      (cl:let ((input (sb-ext:process-input process)))
+        (cl:write-line "go" input)
+        (cl:close input))
+      (sb-ext:process-wait process)
+      (sb-ext:process-exit-code process)))
+
+  (declare run-confined (libbpf:BpfObject * String -> Result String I32))
+  (define (run-confined obj file)
+    "Flag a shell before it runs `cat FILE`, and return the exit code."
+    (let process = (start-blocked file))
+    (do
+     (confined <- (libbpf:find-map obj "confined"))
+     (key <- (pidfd-bytes process))
+     (libbpf:map-update confined key (make-list 1 0 0 0))
+     (pure (release-and-wait process))))
+
+  (declare denial-path (List U8 -> String))
+  (define (denial-path record)
+    "The path field of struct denial, which starts at byte 32."
+    (lisp (-> String) (record)
+      (cl:let* ((field (cl:nthcdr 32 record))
+                (end (cl:or (cl:position 0 field) (cl:length field))))
+        (sb-ext:octets-to-string
+         (cl:coerce (cl:subseq field 0 end) '(cl:vector (cl:unsigned-byte 8)))
+         :external-format :utf-8))))
+
+  (declare check-attached (String -> Result String libbpf:BpfObject))
+  (define (check-attached path)
+    (do
+     (obj <- (libbpf:open-object path))
+     (check-names "the object file holds" (libbpf:program-names obj))
+     (libbpf:load-object obj)
+     (attached <- (libbpf:attach-all obj))
+     (check-names "attach-all returned" attached)
+     (let _ = (map (fn (name) (say (<> "attached " name))) attached))
+     (pure obj)))
+
+  (declare check-enforced (libbpf:BpfObject -> Result String Unit))
+  (define (check-enforced obj)
+    (let denied = (cell:new Nil))
+    (do
+     (ring <- (do
+               (denials <- (libbpf:find-map obj "denials"))
+               (libbpf:ring-buffer-new
+                denials
+                (fn (record)
+                  (cell:push! denied (denial-path record))
+                  Unit))))
+     (install-policy obj (make-list "allow read /" "deny read name:hostname"))
+     (allowed-code <- (run-confined obj "/etc/passwd"))
+     (denied-code <- (run-confined obj "/etc/hostname"))
+     (libbpf:ring-buffer-poll ring 200)
+     (let paths = (cell:read denied))
+     (cond
+       ((/= allowed-code 0)
+        (Err "a confined read that the policy allows failed"))
+       ((== denied-code 0)
+        (Err "a confined read that the policy denies succeeded"))
+       ((not (list:member "/etc/hostname" paths))
+        (Err "no denial record named /etc/hostname"))
+       (True (Ok Unit)))))
+
+  (declare main (Void -> UFix))
+  (define (main)
+    (let outcome =
+      (do
+       (path <- (object-path))
+       (obj <- (check-attached path))
+       (check-enforced obj)))
+    (match outcome
+      ((Ok _)
+       (say "attach-check: passed")
+       0)
+      ((Err message)
+       (say (<> "attach-check: " message))
+       1))))

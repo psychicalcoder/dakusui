@@ -1,0 +1,38 @@
+(in-package #:dakusui/test)
+
+;;; T8: the libbpf bindings, on the paths that need no capabilities. The paths
+;;; that do need them run in `make attach-check`.
+
+(coalton-toplevel
+  (declare no-such-map libbpf:BpfMap)
+  (define no-such-map (libbpf::BpfMap -1 4 4))
+
+  (declare failure-message (Result String :a -> String))
+  (define (failure-message outcome)
+    (match outcome
+      ((Ok _) "")
+      ((Err message) message))))
+
+(define-test open-object-names-the-file-and-the-reason ()
+  (is (== "bpf_object__open_file /no/such.o: No such file or directory"
+          (failure-message (libbpf:open-object "/no/such.o")))))
+
+(define-test map-update-rejects-a-wrong-key-size ()
+  (is (== "bpf_map_update_elem: wrong key size"
+          (failure-message
+           (libbpf:map-update no-such-map (make-list 0 0 0) (make-list 0 0 0 0))))))
+
+(define-test map-update-rejects-a-wrong-value-size ()
+  (is (== "bpf_map_update_elem: wrong value size"
+          (failure-message
+           (libbpf:map-update no-such-map (make-list 0 0 0 0) (make-list 0))))))
+
+(define-test map-update-reports-the-kernel-error ()
+  (is (== "bpf_map_update_elem: Bad file descriptor"
+          (failure-message
+           (libbpf:map-update no-such-map (make-list 0 0 0 0) (make-list 0 0 0 0))))))
+
+(define-test ring-buffer-new-reports-a-bad-map ()
+  (is (== "ring_buffer__new: File descriptor in bad state"
+          (failure-message
+           (libbpf:ring-buffer-new no-such-map (fn (_) Unit))))))
