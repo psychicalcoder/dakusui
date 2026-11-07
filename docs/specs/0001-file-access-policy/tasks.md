@@ -62,7 +62,7 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T14 Serve the protocol: `policy` and `flag` requests, typed decoding, and
   pushed `denial` events. (R7) Done when malformed input gets an error reply and
   never crashes the helper.
-- [ ] T15 Build both binaries with saved runtime options so `--eval`, `--core`,
+- [x] T15 Build both binaries with saved runtime options so `--eval`, `--core`,
   and similar flags do nothing. (R11) Done when `dakusui --eval` runs no code
   (part of A8).
 

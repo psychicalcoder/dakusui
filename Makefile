@@ -3,7 +3,7 @@ SOURCES := dakusui.asd scripts/tools.lisp $(shell find src -name '*.ct')
 CLANG ?= clang
 BPFTOOL ?= bpftool
 
-.PHONY: build bpf test attach-check clean
+.PHONY: build bpf test options-check attach-check clean
 # Each build compiles the shared systems, so builds must not race.
 .NOTPARALLEL:
 .DELETE_ON_ERROR:
@@ -32,8 +32,12 @@ test: build/enforce.bpf.o
 build/attach-check: $(SOURCES) test/attach-check.ct build/enforce.bpf.o
 	$(SBCL) --eval '(build-binary "dakusui/attach-check" "$@")'
 
-# Needs sudo for setcap. The capabilities stay on the file only for this run,
-# because this image still honors SBCL's runtime options (T15).
+# No SBCL option of either binary runs code (T15, R11, part of A8).
+options-check: build
+	sh test/options-check.sh
+
+# Needs sudo for setcap. The check installs any policy it likes, so it holds
+# the capabilities only while it runs.
 attach-check: build/attach-check
 	sudo setcap cap_bpf,cap_perfmon=ep build/attach-check
 	build/attach-check; \

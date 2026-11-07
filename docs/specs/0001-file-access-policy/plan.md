@@ -78,6 +78,10 @@ the judge, and runs commands through the launcher.
 
 - **Images.** `scripts/tools.lisp` calls `save-lisp-and-die` directly, not ASDF's
   `program-op`, so the options of the capability-bearing image stay in plain view.
+  Both binaries save their runtime options, so the runtime reads none from the
+  command line, and each replaces SBCL's toplevel with its own `main`, so
+  `--eval`, `--load`, and init files do nothing. `make options-check` tries
+  each such option on both binaries.
 - **Tests.** `coalton/testing`, Coalton's own wrapper over Fiasco, because tests
   can then be written in Coalton.
 - **Dependencies.** Coalton comes from a checkout in Quicklisp's `local-projects`
@@ -159,6 +163,10 @@ default policy also denies `~/.config/dakusui`, where those keys live.
   the lookup in `bpf_loop` callbacks.
 - **A Lisp binary with capabilities.** Build with saved runtime options, and
   keep the helper small. If hardening proves hard, rewrite the helper in C.
+  SBCL's ldb monitor is compiled in. A fatal runtime error before `main` could
+  enter it, since `main` turns it off only when it starts. No such error was
+  found that an outside process can trigger: a starved address space ends the
+  runtime with exit code 1. An SBCL built without `:sb-ldb` would close this.
 - **Torn walks.** The kernel's own path builder retries when a rename races
   with it; ours does not. A rename needs write access to both paths, so a
   confined process cannot move a denied file, but review and test this.
