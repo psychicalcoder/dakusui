@@ -15,12 +15,16 @@
    #:map-update
    #:map-set-inner
    #:close-map
+   #:fd-bytes
+   #:pidfd-open
+   #:close-fd
    #:RingBuffer
    #:ring-buffer-new
    #:ring-buffer-poll))
 (in-package #:dakusui/libbpf)
 
-;;; The libbpf calls the helper uses. Spec 0001, plan part 4.
+;;; The libbpf calls the helper uses, and the descriptor calls around them.
+;;; Spec 0001, plan part 4.
 ;;;
 ;;; Every failure is an Err that names the call and the reason. libbpf also
 ;;; logs details, such as the verifier's output, to stderr.
@@ -244,9 +248,9 @@ list of any other length is an error, not an out-of-bounds read."
                      ;; 0 is BPF_ANY: create the element or replace it.
                      (%map-update fd key-pointer value-pointer 0)))))))))))
 
-  (declare fd-bytes (BpfMap -> List U8))
-  (define (fd-bytes m)
-    (let fd = (.fd m))
+  (declare fd-bytes (I32 -> List U8))
+  (define (fd-bytes fd)
+    "A descriptor as a map key or value: a 32-bit int, little-endian."
     (lisp (-> (List U8)) (fd)
       (cl:loop :for shift :from 0 :below 32 :by 8
                :collect (cl:ldb (cl:byte 8 shift) fd))))
@@ -254,15 +258,29 @@ list of any other length is an error, not an out-of-bounds read."
   (declare map-set-inner (BpfMap * BpfMap -> Result String Unit))
   (define (map-set-inner outer inner)
     "Put INNER in slot 0 of the array of maps OUTER. The swap is atomic."
-    (map-update outer (make-list 0 0 0 0) (fd-bytes inner)))
+    (map-update outer (make-list 0 0 0 0) (fd-bytes (.fd inner))))
+
+  (declare pidfd-open (I32 -> Result String I32))
+  (define (pidfd-open pid)
+    "A descriptor for process PID. 434 is pidfd_open on x86-64."
+    (let fd =
+      (lisp (-> I32) (pid)
+        (cffi:foreign-funcall "syscall" :long 434 :int pid :uint 0 :int)))
+    (if (< fd 0)
+        (failure (lisp (-> String) (pid) (cl:format cl:nil "pidfd_open ~D" pid))
+                 (lisp (-> I32) () (sb-alien:get-errno)))
+        (Ok fd)))
+
+  (declare close-fd (I32 -> Unit))
+  (define (close-fd fd)
+    (lisp (-> Unit) (fd)
+      (%close fd)
+      Unit))
 
   (declare close-map (BpfMap -> Unit))
   (define (close-map m)
     "Close our descriptor. A map stays alive while an outer map holds it."
-    (let fd = (.fd m))
-    (lisp (-> Unit) (fd)
-      (%close fd)
-      Unit))
+    (close-fd (.fd m)))
 
   (declare ring-buffer-new (BpfMap * (List U8 -> Unit) -> Result String RingBuffer))
   (define (ring-buffer-new m handler)

@@ -5,7 +5,7 @@
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
   (:export #:open-enforcer #:read-lsm-list #:start
-           #:check-capacity #:install-policy))
+           #:check-capacity #:install-policy #:flag-process))
 (in-package #:dakusui/enforcer)
 
 ;;; The enforcer, embedded in the image. (R11)
@@ -99,4 +99,25 @@ the new one. On any failure the old policy stays in force. (R4)"
             (let _ = (libbpf:close-map inner))
             swapped)
       ((Ok _) (Ok Unit))
-      ((Err why) (Err (<> "cannot install the policy: " why))))))
+      ((Err why) (Err (<> "cannot install the policy: " why)))))
+
+  (declare flag-process (libbpf:BpfObject * I32 -> Result String Unit))
+  (define (flag-process obj pid)
+    "Confine process PID and every child it creates from now on. (R1)
+
+The confined map is keyed by a pidfd, which names the task itself. A pid names
+whatever holds it now, so the caller must flag a child it has not reaped yet:
+until then, no other process can take its pid."
+    (match (do
+            (confined <- (libbpf:find-map obj "confined"))
+            (pidfd <- (libbpf:pidfd-open pid))
+            (let flagged = (libbpf:map-update confined
+                                              (libbpf:fd-bytes pidfd)
+                                              (make-list 1 0 0 0)))
+            ;; The flag lives in the task's storage, not in the descriptor.
+            (let _ = (libbpf:close-fd pidfd))
+            flagged)
+      ((Ok _) (Ok Unit))
+      ((Err why)
+       (Err (<> (lisp (-> String) (pid) (cl:format cl:nil "cannot flag process ~D: " pid))
+                why))))))

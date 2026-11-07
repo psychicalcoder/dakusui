@@ -73,3 +73,17 @@
   (is (== (Err "the policy has 1025 patterns, but the rule map holds 1024")
           (enforcer:check-capacity 1025 1024)))
   (is (== (Ok Unit) (enforcer:check-capacity 1024 1024))))
+
+;;; T12: a pidfd names a live process. (R1)
+
+(define-test pidfd-open-opens-our-own-process ()
+  (is (== True
+          (match (libbpf:pidfd-open (lisp (-> I32) () (sb-unix:unix-getpid)))
+            ((Ok fd) (libbpf:close-fd fd) True)
+            ((Err _) False)))))
+
+(define-test pidfd-open-names-a-bad-pid ()
+  (is (== (Err "pidfd_open 0: Invalid argument")
+          (libbpf:pidfd-open 0)))
+  (is (== (Err "pidfd_open 2147483647: No such process")
+          (libbpf:pidfd-open 2147483647))))

@@ -8,7 +8,7 @@
   (:export #:main))
 (in-package #:dakusui/attach-check)
 
-;;; The check for T8 through T11. Start the enforcer embedded in this image, then
+;;; The check for T8 through T12. Start the enforcer embedded in this image, then
 ;;; run commands confined to show that policies, live swaps (A4), and denial
 ;;; records work. It needs CAP_BPF and CAP_PERFMON, so it runs through
 ;;; `make attach-check`, not `make test`.
@@ -75,28 +75,11 @@ the script can wait for our lines and report to us."
       (sb-ext:process-wait process)
       (sb-ext:process-exit-code process)))
 
-  (declare pidfd-bytes (Process -> Result String (List U8)))
-  (define (pidfd-bytes process)
-    "The key of the confined map: a pidfd. 434 is pidfd_open on x86-64."
-    (let fd =
-      (lisp (-> I32) (process)
-        (cffi:foreign-funcall "syscall"
-                              :long 434
-                              :int (sb-ext:process-pid process)
-                              :uint 0
-                              :int)))
-    (if (< fd 0)
-        (Err "pidfd_open failed")
-        (Ok (lisp (-> (List U8)) (fd)
-              (cl:loop :for shift :from 0 :below 32 :by 8
-                       :collect (cl:ldb (cl:byte 8 shift) fd))))))
-
   (declare flag (libbpf:BpfObject * Process -> Result String Unit))
   (define (flag obj process)
-    (do
-     (confined <- (libbpf:find-map obj "confined"))
-     (key <- (pidfd-bytes process))
-     (libbpf:map-update confined key (make-list 1 0 0 0))))
+    "T12: flag the shell through the helper's path. We have not reaped it, so
+its pid is still its own."
+    (enforcer:flag-process obj (lisp (-> I32) (process) (sb-ext:process-pid process))))
 
   (declare run-confined (libbpf:BpfObject * String -> Result String I32))
   (define (run-confined obj file)

@@ -50,7 +50,7 @@ a task that can run in parallel with the one before it. The spike code in
   the helper exit non-zero and run nothing.
 - [x] T11 Swap policies: build an inner map from compiled entries and replace
   the slot. (R4) Done when A4 passes through the Lisp path.
-- [ ] T12 Flag a process by pid, using a pidfd key. (R1) Done when a flagged
+- [x] T12 Flag a process by pid, using a pidfd key. (R1) Done when a flagged
   shell is denied what the policy denies.
 - [ ] T13 Create the socketpair and fork. The child clears all capability sets and
   the bounding set, sets `no_new_privs`, becomes non-dumpable, marks its
