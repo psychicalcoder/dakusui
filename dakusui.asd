@@ -32,4 +32,6 @@
                "dakusui/policy" "dakusui/helper" "dakusui/agent")
   :defsystem-depends-on ("coalton-asdf")
   :pathname "test/"
-  :components ((:ct-file "suite")))
+  :serial t
+  :components ((:ct-file "suite")
+               (:ct-file "policy")))

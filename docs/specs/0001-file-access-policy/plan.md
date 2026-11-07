@@ -41,7 +41,10 @@ the same pattern and kind, the compiler keeps the last one.
 
 **3. Policy library** (Coalton, used by both programs)
 
-Types `Rule`, `Effect`, `Kind`, `Pattern`, `Policy`. It parses the text form
+Types `Rule`, `Effect`, `Kind`, `Kinds`, `Pattern`, `Policy`. `Kinds` holds a
+first kind and a list of the rest, so a rule cannot have none. `Pattern` keeps
+its constructors private, because the compiler cannot see whether a string is
+an absolute path. The library parses the text form
 (`deny read,write name:.env`), builds the default policy from the project
 directory, evaluates a path in plain Lisp (the reference for tests), and
 compiles a policy into map entries.

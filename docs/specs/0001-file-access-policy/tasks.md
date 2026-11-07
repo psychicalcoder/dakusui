@@ -19,7 +19,7 @@ a task that can run in parallel with the one before it. The spike code in
 
 ## Phase 2: Policy library (no kernel needed)
 
-- [ ] T3 Define the types: `Rule`, `Effect`, `Kind`, `Pattern`, `Policy`.
+- [x] T3 Define the types: `Rule`, `Effect`, `Kind`, `Pattern`, `Policy`.
   (R10) Done when they compile and the compiler rejects ill-typed rules.
 - [ ] T4 Parse the text form, such as `deny read,write name:.env`. Reject
   relative paths, globs, and unknown kinds, each with a message that names the

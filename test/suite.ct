@@ -1,5 +1,6 @@
 (defpackage #:dakusui/test
   (:use #:coalton #:coalton-prelude #:coalton-testing)
+  (:local-nicknames (#:policy #:dakusui/policy))
   (:export #:run-tests))
 (in-package #:dakusui/test)
 
@@ -11,3 +12,19 @@
   "Run every test without the debugger. Return true when all pass."
   (fiasco:run-package-tests :packages '(#:dakusui/test/fiasco)
                             :interactive cl:nil))
+
+(cl:defun type-error-message (form)
+  "Compile the Coalton expression FORM. Return its type error as a string, or
+NIL if it compiles. Any other failure propagates and fails the test."
+  (cl:handler-case (cl:progn (cl:macroexpand-1 `(coalton ,form)) cl:nil)
+    (coalton-impl/typechecker/base:tc-error (e)
+      (cl:let ((cl:*print-pretty* cl:nil))
+        (cl:princ-to-string e)))))
+
+(cl:defun well-typed-p (form)
+  (cl:null (type-error-message form)))
+
+(cl:defun mismatch-p (form)
+  "True if FORM fails on the types of its parts, not on an unknown name."
+  (cl:let ((message (type-error-message form)))
+    (cl:and message (cl:search "mismatch" message) cl:t)))

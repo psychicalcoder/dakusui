@@ -1,3 +1,46 @@
 (defpackage #:dakusui/policy
-  (:use #:coalton #:coalton-prelude))
+  (:use #:coalton #:coalton-prelude)
+  (:export
+   #:Effect #:Allow #:Deny
+   #:Kind #:Read #:Write
+   #:Kinds
+   #:Pattern
+   #:Rule
+   #:Policy))
 (in-package #:dakusui/policy)
+
+(coalton-toplevel
+  (derive Eq)
+  (define-type Effect
+    "What a rule does to an access it matches. (R10)"
+    Allow
+    Deny)
+
+  (derive Eq)
+  (define-type Kind
+    "An access kind. (R5)"
+    Read
+    Write)
+
+  (derive Eq)
+  (define-type Kinds
+    "One or more access kinds, in the order the user wrote them. (R10)"
+    (Kinds Kind (List Kind)))
+
+  ;; The constructors stay private. The compiler cannot see whether a string
+  ;; is an absolute path, so only this library may build a Pattern. (R10)
+  (derive Eq)
+  (define-type Pattern
+    "What a rule matches. (R10)"
+    (PathPrefix String)
+    (FileName String))
+
+  (derive Eq)
+  (define-type Rule
+    "One rule of a policy. (R10)"
+    (Rule Effect Kinds Pattern))
+
+  (derive Eq)
+  (define-type Policy
+    "Rules in order. The last match wins, and no match denies. (R2)"
+    (Policy (List Rule))))
