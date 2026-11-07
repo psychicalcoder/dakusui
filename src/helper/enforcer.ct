@@ -1,9 +1,11 @@
 (defpackage #:dakusui/enforcer
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:libbpf #:dakusui/libbpf)
+                    (#:policy #:dakusui/policy)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
-  (:export #:open-enforcer #:read-lsm-list #:start))
+  (:export #:open-enforcer #:read-lsm-list #:start
+           #:check-capacity #:install-policy))
 (in-package #:dakusui/enforcer)
 
 ;;; The enforcer, embedded in the image. (R11)
@@ -59,4 +61,42 @@ failure is an Err that says which step failed. (R9)"
                 (libbpf:attach-all obj)
                 (pure obj))
           ((Ok obj) (Ok obj))
-          ((Err why) (Err (<> "cannot start the enforcer: " why)))))))
+          ((Err why) (Err (<> "cannot start the enforcer: " why))))))
+
+  (declare check-capacity (UFix * UFix -> Result String Unit))
+  (define (check-capacity patterns limit)
+    (if (> patterns limit)
+        (Err (lisp (-> String) (patterns limit)
+               (cl:format cl:nil "the policy has ~D patterns, but the rule map holds ~D"
+                          patterns limit)))
+        (Ok Unit)))
+
+  (declare fill-map (libbpf:BpfMap * List policy:Entry -> Result String Unit))
+  (define (fill-map inner entries)
+    (map (const Unit)
+         (traverse (fn (entry)
+                     (libbpf:map-update inner
+                                        (policy:entry-key-bytes entry)
+                                        (policy:entry-value-bytes entry)))
+                   entries)))
+
+  (declare install-policy (libbpf:BpfObject * policy:Policy -> Result String Unit))
+  (define (install-policy obj pol)
+    "Compile POL into a new inner map and swap it into the rule map's one slot.
+The swap is atomic, so no command sees half a policy, and the next open uses
+the new one. On any failure the old policy stays in force. (R4)"
+    (match (do
+            (entries <- (policy:compile-policy pol))
+            ;; inner_template fixes the shape that the kernel accepts in the slot.
+            (template <- (libbpf:find-map obj "inner_template"))
+            (check-capacity (list:length entries) (libbpf:map-capacity template))
+            (outer <- (libbpf:find-map obj "rules"))
+            (inner <- (libbpf:create-hash-map-like template))
+            (let swapped = (do
+                            (fill-map inner entries)
+                            (libbpf:map-set-inner outer inner)))
+            ;; The slot holds its own reference to the inner map.
+            (let _ = (libbpf:close-map inner))
+            swapped)
+      ((Ok _) (Ok Unit))
+      ((Err why) (Err (<> "cannot install the policy: " why))))))

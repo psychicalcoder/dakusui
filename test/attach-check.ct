@@ -8,9 +8,9 @@
   (:export #:main))
 (in-package #:dakusui/attach-check)
 
-;;; The check for T8 and T9. Load the enforcer embedded in this image, attach
-;;; every program, then run two commands confined to show that the maps and the
-;;; ring buffer work too. It needs CAP_BPF and CAP_PERFMON, so it runs through
+;;; The check for T8 through T11. Start the enforcer embedded in this image, then
+;;; run commands confined to show that policies, live swaps (A4), and denial
+;;; records work. It needs CAP_BPF and CAP_PERFMON, so it runs through
 ;;; `make attach-check`, not `make test`.
 
 (coalton-toplevel
@@ -38,31 +38,42 @@
         (Ok Unit)
         (Err (<> label " the wrong programs"))))
 
-  (declare install-policy (libbpf:BpfObject * List String -> Result String Unit))
-  (define (install-policy obj lines)
-    "Build an inner map from rule text and swap it in, as T11 will."
+  (declare install (libbpf:BpfObject * List String -> Result String Unit))
+  (define (install obj lines)
+    "Parse rule text and install it through the helper's path."
     (do
      (rules <- (traverse policy:parse-rule lines))
-     (entries <- (policy:compile-policy (policy:Policy rules)))
-     (outer <- (libbpf:find-map obj "rules"))
-     ;; The sizes of struct rule_key and struct rule_val, and the
-     ;; max_entries of inner_template.
-     (inner <- (libbpf:create-hash-map 260 12 1024))
-     (traverse (fn (entry)
-                 (libbpf:map-update inner
-                                    (policy:entry-key-bytes entry)
-                                    (policy:entry-value-bytes entry)))
-               entries)
-     (libbpf:map-set-inner outer inner)
-     (pure (libbpf:close-map inner))))
+     (enforcer:install-policy obj (policy:Policy rules))))
 
-  (declare start-blocked (String -> Process))
-  (define (start-blocked file)
-    "A shell that waits on stdin, then runs `cat FILE`."
-    (lisp (-> Process) (file)
-      (sb-ext:run-program "/bin/sh"
-                          (cl:list "-c" "read _ && exec cat \"$1\"" "sh" file)
-                          :wait cl:nil :input :stream :output cl:nil :error cl:nil)))
+  (declare start-shell (String * String -> Process))
+  (define (start-shell script file)
+    "Run sh -c SCRIPT with FILE as $1. Its stdin and stdout are pipes to us, so
+the script can wait for our lines and report to us."
+    (lisp (-> Process) (script file)
+      (sb-ext:run-program "/bin/sh" (cl:list "-c" script "sh" file)
+                          :wait cl:nil :input :stream :output :stream :error cl:nil)))
+
+  (declare send-line (Process -> Unit))
+  (define (send-line process)
+    (lisp (-> Unit) (process)
+      (cl:let ((input (sb-ext:process-input process)))
+        (cl:write-line "go" input)
+        (cl:finish-output input))
+      Unit))
+
+  (declare read-reply (Process -> String))
+  (define (read-reply process)
+    "The shell's next line of output, or the empty string at its end."
+    (lisp (-> String) (process)
+      (cl:read-line (sb-ext:process-output process) cl:nil "")))
+
+  (declare wait-exit (Process -> I32))
+  (define (wait-exit process)
+    "Close the shell's stdin, and return its exit code."
+    (lisp (-> I32) (process)
+      (cl:close (sb-ext:process-input process))
+      (sb-ext:process-wait process)
+      (sb-ext:process-exit-code process)))
 
   (declare pidfd-bytes (Process -> Result String (List U8)))
   (define (pidfd-bytes process)
@@ -80,25 +91,45 @@
               (cl:loop :for shift :from 0 :below 32 :by 8
                        :collect (cl:ldb (cl:byte 8 shift) fd))))))
 
-  (declare release-and-wait (Process -> I32))
-  (define (release-and-wait process)
-    "Let the shell go on, and return its exit code."
-    (lisp (-> I32) (process)
-      (cl:let ((input (sb-ext:process-input process)))
-        (cl:write-line "go" input)
-        (cl:close input))
-      (sb-ext:process-wait process)
-      (sb-ext:process-exit-code process)))
+  (declare flag (libbpf:BpfObject * Process -> Result String Unit))
+  (define (flag obj process)
+    (do
+     (confined <- (libbpf:find-map obj "confined"))
+     (key <- (pidfd-bytes process))
+     (libbpf:map-update confined key (make-list 1 0 0 0))))
 
   (declare run-confined (libbpf:BpfObject * String -> Result String I32))
   (define (run-confined obj file)
     "Flag a shell before it runs `cat FILE`, and return the exit code."
-    (let process = (start-blocked file))
+    (let process = (start-shell "read _ && exec cat \"$1\" >/dev/null" file))
     (do
-     (confined <- (libbpf:find-map obj "confined"))
-     (key <- (pidfd-bytes process))
-     (libbpf:map-update confined key (make-list 1 0 0 0))
-     (pure (release-and-wait process))))
+     (flag obj process)
+     (let _ = (send-line process))
+     (pure (wait-exit process))))
+
+  (declare check-live-swap (libbpf:BpfObject * List String -> Result String Unit))
+  (define (check-live-swap obj before)
+    "A4 (R4): a running command fails to read /etc/hostname, then we append an
+allow rule, and the same command's next read succeeds."
+    (let process =
+      (start-shell (mconcat
+                    (make-list "read _ || exit 9; "
+                               "if cat \"$1\" >/dev/null 2>&1; then echo read; else echo denied; fi; "
+                               "read _ && exec cat \"$1\" >/dev/null"))
+                   "/etc/hostname"))
+    (do
+     (flag obj process)
+     (let _ = (send-line process))
+     (let first = (read-reply process))
+     (install obj (<> before (make-list "allow read /etc/hostname")))
+     (let _ = (send-line process))
+     (let code = (wait-exit process))
+     (cond
+       ((/= first "denied")
+        (Err (<> "A4: before the change, the read gave " first)))
+       ((/= code 0)
+        (Err "A4: after the change, the running command still could not read"))
+       (True (Ok Unit)))))
 
   (declare denial-path (List U8 -> String))
   (define (denial-path record)
@@ -124,6 +155,9 @@
   (declare check-enforced (libbpf:BpfObject -> Result String Unit))
   (define (check-enforced obj)
     (let denied = (cell:new Nil))
+    ;; The scripts redirect to /dev/null, which is a confined write.
+    (let base = (make-list "allow read /" "allow write /dev/null"
+                           "deny read name:hostname"))
     (do
      (ring <- (do
                (denials <- (libbpf:find-map obj "denials"))
@@ -132,7 +166,7 @@
                 (fn (record)
                   (cell:push! denied (denial-path record))
                   Unit))))
-     (install-policy obj (make-list "allow read /" "deny read name:hostname"))
+     (install obj base)
      (allowed-code <- (run-confined obj "/etc/passwd"))
      (denied-code <- (run-confined obj "/etc/hostname"))
      (libbpf:ring-buffer-poll ring 200)
@@ -144,7 +178,10 @@
         (Err "a confined read that the policy denies succeeded"))
        ((not (list:member "/etc/hostname" paths))
         (Err "no denial record named /etc/hostname"))
-       (True (Ok Unit)))))
+       (True (Ok Unit)))
+     (install obj base)
+     (check-live-swap obj base)
+     (pure (say "A4 passed: a running command saw the new policy"))))
 
   (declare main (Void -> UFix))
   (define (main)

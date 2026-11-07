@@ -5,7 +5,7 @@
 
 (coalton-toplevel
   (declare no-such-map libbpf:BpfMap)
-  (define no-such-map (libbpf::BpfMap -1 4 4))
+  (define no-such-map (libbpf::BpfMap -1 4 4 1))
 
   (declare failure-message (Result String :a -> String))
   (define (failure-message outcome)
@@ -66,3 +66,10 @@
   (is (== "ring_buffer__new: File descriptor in bad state"
           (failure-message
            (libbpf:ring-buffer-new no-such-map (fn (_) Unit))))))
+
+;;; T11: a policy must fit the rule map. (R4)
+
+(define-test check-capacity-names-both-numbers ()
+  (is (== (Err "the policy has 1025 patterns, but the rule map holds 1024")
+          (enforcer:check-capacity 1025 1024)))
+  (is (== (Ok Unit) (enforcer:check-capacity 1024 1024))))

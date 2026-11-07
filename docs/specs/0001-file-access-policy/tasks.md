@@ -48,7 +48,7 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T10 Check at startup that `bpf` is in the LSM list, and exit with a clear
   message on any load or attach failure. (R9) Done when a forced failure makes
   the helper exit non-zero and run nothing.
-- [ ] T11 Swap policies: build an inner map from compiled entries and replace
+- [x] T11 Swap policies: build an inner map from compiled entries and replace
   the slot. (R4) Done when A4 passes through the Lisp path.
 - [ ] T12 Flag a process by pid, using a pidfd key. (R1) Done when a flagged
   shell is denied what the policy denies.

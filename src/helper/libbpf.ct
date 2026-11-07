@@ -10,7 +10,8 @@
    #:attach-all
    #:BpfMap
    #:find-map
-   #:create-hash-map
+   #:map-capacity
+   #:create-hash-map-like
    #:map-update
    #:map-set-inner
    #:close-map
@@ -50,6 +51,8 @@
 (cffi:defcfun ("bpf_map__key_size" %key-size) :uint32
   (map :pointer))
 (cffi:defcfun ("bpf_map__value_size" %value-size) :uint32
+  (map :pointer))
+(cffi:defcfun ("bpf_map__max_entries" %max-entries) :uint32
   (map :pointer))
 (cffi:defcfun ("bpf_map_create" %map-create) :int
   (type :int) (name :pointer) (key-size :uint32) (value-size :uint32)
@@ -117,7 +120,8 @@ lifetime for an open_mem buffer, and the object lives as long as the process."
     "A map descriptor and the sizes the kernel will read from each update."
     (fd I32)
     (key-size UFix)
-    (value-size UFix))
+    (value-size UFix)
+    (max-entries UFix))
 
   (repr :transparent)
   (define-type RingBuffer
@@ -194,12 +198,22 @@ program stays attached until the process exits."
                           (lisp (-> I32) (m) (%map-fd m))))
      (pure (BpfMap fd
                    (lisp (-> UFix) (m) (%key-size m))
-                   (lisp (-> UFix) (m) (%value-size m))))))
+                   (lisp (-> UFix) (m) (%value-size m))
+                   (lisp (-> UFix) (m) (%max-entries m))))))
 
-  (declare create-hash-map (UFix * UFix * UFix -> Result String BpfMap))
-  (define (create-hash-map key-size value-size max-entries)
-    "BPF_MAP_TYPE_HASH is 1 in linux/bpf.h."
-    (map (fn (fd) (BpfMap fd key-size value-size))
+  (declare map-capacity (BpfMap -> UFix))
+  (define (map-capacity m)
+    "The most elements the map holds."
+    (.max-entries m))
+
+  (declare create-hash-map-like (BpfMap -> Result String BpfMap))
+  (define (create-hash-map-like template)
+    "A new, empty hash map with the shape of TEMPLATE, as an inner map of an
+array of maps must have. BPF_MAP_TYPE_HASH is 1 in linux/bpf.h."
+    (let key-size = (.key-size template))
+    (let value-size = (.value-size template))
+    (let max-entries = (.max-entries template))
+    (map (fn (fd) (BpfMap fd key-size value-size max-entries))
          (check-status
           "bpf_map_create"
           (lisp (-> I32) (key-size value-size max-entries)
