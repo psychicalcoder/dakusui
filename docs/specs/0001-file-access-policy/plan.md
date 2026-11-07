@@ -58,6 +58,19 @@ fails, exit (R9). Then serve the socket.
 Owns the ordered policy, exposes it through a `show_policy` tool (R8) and to
 the judge, and runs commands through the launcher.
 
+## Build and test
+
+`dakusui.asd` defines `dakusui/policy`, `dakusui/helper`, `dakusui/agent`, and
+`dakusui/test`. `make build` writes `build/dakusui` and `build/dakusui-agent`.
+`make test` runs the unit tests.
+
+- **Images.** `scripts/tools.lisp` calls `save-lisp-and-die` directly, not ASDF's
+  `program-op`, so the options of the capability-bearing image stay in plain view.
+- **Tests.** `coalton/testing`, Coalton's own wrapper over Fiasco, because tests
+  can then be written in Coalton.
+- **Dependencies.** Coalton comes from a checkout in Quicklisp's `local-projects`
+  (tested at commit 21e0c63), Fiasco from Quicklisp. Nothing pins them yet.
+
 ## Socket protocol
 
 One JSON object per line. The agent sends a request; the helper answers.

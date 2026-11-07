@@ -1,0 +1,13 @@
+(defpackage #:dakusui/agent
+  (:use #:coalton #:coalton-prelude)
+  (:export #:main))
+(in-package #:dakusui/agent)
+
+(coalton-toplevel
+  (declare main (Void -> UFix))
+  (define (main)
+    "Stub. Exit non-zero, since nothing is enforced yet."
+    (lisp (-> Void) ()
+      (cl:format cl:*error-output* "dakusui-agent: not implemented~%")
+      (cl:values))
+    1))

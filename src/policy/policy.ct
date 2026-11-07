@@ -1,0 +1,3 @@
+(defpackage #:dakusui/policy
+  (:use #:coalton #:coalton-prelude))
+(in-package #:dakusui/policy)

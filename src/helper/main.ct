@@ -1,0 +1,13 @@
+(defpackage #:dakusui/helper
+  (:use #:coalton #:coalton-prelude)
+  (:export #:main))
+(in-package #:dakusui/helper)
+
+(coalton-toplevel
+  (declare main (Void -> UFix))
+  (define (main)
+    "Stub. Exit non-zero, since nothing is enforced yet."
+    (lisp (-> Void) ()
+      (cl:format cl:*error-output* "dakusui: not implemented~%")
+      (cl:values))
+    1))

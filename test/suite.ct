@@ -1,0 +1,13 @@
+(defpackage #:dakusui/test
+  (:use #:coalton #:coalton-prelude #:coalton-testing)
+  (:export #:run-tests))
+(in-package #:dakusui/test)
+
+(fiasco:define-test-package #:dakusui/test/fiasco)
+
+(coalton-fiasco-init #:dakusui/test/fiasco)
+
+(cl:defun run-tests ()
+  "Run every test without the debugger. Return true when all pass."
+  (fiasco:run-package-tests :packages '(#:dakusui/test/fiasco)
+                            :interactive cl:nil))

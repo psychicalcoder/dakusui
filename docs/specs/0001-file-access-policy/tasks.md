@@ -8,7 +8,7 @@ a task that can run in parallel with the one before it. The spike code in
 
 ## Phase 1: Foundations
 
-- [ ] T1 Create the project skeleton: three ASDF systems (`policy`, `helper`,
+- [x] T1 Create the project skeleton: three ASDF systems (`policy`, `helper`,
   `agent`), a test runner, and `make build` that produces `dakusui` and
   `dakusui-agent`. Done when `make test` passes on an empty suite and `make
   build` writes both binaries. Pick the test framework and record it if the

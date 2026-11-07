@@ -1,3 +1,6 @@
+# Build output
+build/
+
 # Spike build output
 bpfstudy/probe
 bpfstudy/enforce
