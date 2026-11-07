@@ -1,12 +1,16 @@
 (defpackage #:dakusui/policy
   (:use #:coalton #:coalton-prelude)
+  (:local-nicknames
+   (#:list #:coalton/list)
+   (#:string #:coalton/string))
   (:export
    #:Effect #:Allow #:Deny
    #:Kind #:Read #:Write
    #:Kinds
    #:Pattern
    #:Rule
-   #:Policy))
+   #:Policy
+   #:parse-rule))
 (in-package #:dakusui/policy)
 
 (coalton-toplevel

@@ -1,0 +1,179 @@
+(in-package #:dakusui/test)
+
+;;; T4: the text form of a rule. (R10)
+
+(coalton-toplevel
+  (declare read-only (policy:Kinds))
+  (define read-only (policy:Kinds policy:Read Nil))
+
+  (declare write-only (policy:Kinds))
+  (define write-only (policy:Kinds policy:Write Nil))
+
+  (declare read-write (policy:Kinds))
+  (define read-write (policy:Kinds policy:Read (make-list policy:Write)))
+
+  (declare parses? (String * policy:Effect * policy:Kinds * policy:Pattern -> Boolean))
+  (define (parses? line effect kinds pattern)
+    "True if LINE parses to exactly this rule."
+    (match (policy:parse-rule line)
+      ((Ok rule) (== rule (policy:Rule effect kinds pattern)))
+      ((Err _) False)))
+
+  (declare error-names? (String * String * String -> Boolean))
+  (define (error-names? line problem word)
+    "True if LINE is rejected by a message naming both PROBLEM and WORD."
+    (match (policy:parse-rule line)
+      ((Ok _) False)
+      ((Err message) (and (coalton/string:substring? problem message)
+                          (coalton/string:substring? word message))))))
+
+(define-test parse-a15-name-rule ()
+  (is (parses? "deny read,write name:.env"
+               policy:Deny read-write (policy::FileName ".env"))))
+
+(define-test parse-a15-rejects-relative-path ()
+  (is (error-names? "deny read src/a.c" "relative path" "src/a.c")))
+
+(define-test parse-a15-rejects-glob ()
+  (is (error-names? "deny read *.pem" "glob" "*.pem")))
+
+(define-test parse-a15-rejects-unknown-kind ()
+  (is (error-names? "deny exec /usr" "unknown access kind" "exec"))
+  (is (error-names? "deny read,exec /usr" "unknown access kind" "exec")))
+
+;; The rules of R3, with its spacing. P and ~ are expanded before parsing (T6).
+(define-test parse-r3-default-rules ()
+  (is (parses? "allow read        /"
+               policy:Allow read-only (policy::PathPrefix "/")))
+  (is (parses? "allow read,write  /home/u/proj"
+               policy:Allow read-write (policy::PathPrefix "/home/u/proj")))
+  (is (parses? "allow write       /tmp"
+               policy:Allow write-only (policy::PathPrefix "/tmp")))
+  (is (parses? "allow write       /dev/null"
+               policy:Allow write-only (policy::PathPrefix "/dev/null")))
+  (is (parses? "allow write       /dev/tty"
+               policy:Allow write-only (policy::PathPrefix "/dev/tty")))
+  (is (parses? "deny  read,write  /home/u/.ssh"
+               policy:Deny read-write (policy::PathPrefix "/home/u/.ssh")))
+  (is (parses? "deny  read,write  /home/u/.aws"
+               policy:Deny read-write (policy::PathPrefix "/home/u/.aws")))
+  (is (parses? "deny  read,write  /home/u/.gnupg"
+               policy:Deny read-write (policy::PathPrefix "/home/u/.gnupg")))
+  (is (parses? "deny  read,write  /home/u/.config/dakusui"
+               policy:Deny read-write (policy::PathPrefix "/home/u/.config/dakusui")))
+  (is (parses? "deny  read,write  name:.env"
+               policy:Deny read-write (policy::FileName ".env"))))
+
+(define-test parse-spec-examples ()
+  ;; R10
+  (is (parses? "deny read,write name:.git"
+               policy:Deny read-write (policy::FileName ".git")))
+  ;; A3, with the kinds that R10 requires
+  (is (parses? "allow read /p/a/x"
+               policy:Allow read-only (policy::PathPrefix "/p/a/x")))
+  (is (parses? "deny read /p/a"
+               policy:Deny read-only (policy::PathPrefix "/p/a")))
+  ;; A12
+  (is (parses? "allow write /w"
+               policy:Allow write-only (policy::PathPrefix "/w"))))
+
+(define-test parse-keeps-the-written-kind-order ()
+  (is (parses? "deny write,read /a"
+               policy:Deny
+               (policy:Kinds policy:Write (make-list policy:Read))
+               (policy::PathPrefix "/a"))))
+
+(define-test parse-accepts-any-whitespace-between-fields ()
+  (is (parses? #.(cl:format cl:nil "  deny~Cread~%  /a  " #\Tab)
+               policy:Deny read-only (policy::PathPrefix "/a"))))
+
+(define-test parse-rejects-a-bad-effect ()
+  (is (error-names? "permit read /a" "unknown effect" "permit"))
+  (is (error-names? "DENY read /a" "unknown effect" "DENY")))
+
+(define-test parse-rejects-empty-kinds ()
+  (is (error-names? "deny , /a" "unknown access kind" "\"\""))
+  (is (error-names? "deny read, /a" "unknown access kind" "\"\""))
+  (is (error-names? "deny read,,write /a" "unknown access kind" "\"\"")))
+
+(define-test parse-rejects-the-wrong-field-count ()
+  (is (error-names? "" "bad rule" "three fields"))
+  (is (error-names? "deny" "bad rule" "three fields"))
+  ;; R10 requires kinds.
+  (is (error-names? "allow /p/a/x" "bad rule" "/p/a/x"))
+  ;; A space needs a backslash, and two rules are not one.
+  (is (error-names? "deny read /my files" "bad rule" "/my files"))
+  (is (error-names? "deny read /a
+deny read /b" "bad rule" "three fields")))
+
+(define-test parse-rejects-unexpanded-placeholders ()
+  (is (error-names? "deny read ~/.ssh" "relative path" "~/.ssh"))
+  (is (error-names? "allow read P" "relative path" "P")))
+
+(define-test parse-rejects-every-glob-character ()
+  (is (error-names? "deny read /a/*.pem" "glob" "/a/*.pem"))
+  (is (error-names? "deny read /a/?.pem" "glob" "/a/?.pem"))
+  (is (error-names? "deny read /a/[ab].pem" "glob" "/a/[ab].pem"))
+  (is (error-names? "deny read name:*.pem" "glob" "name:*.pem")))
+
+;; A16. Without the cleanup, /a/ could never match an exact path string.
+(define-test parse-ignores-one-trailing-slash ()
+  (is (parses? "deny read /a/" policy:Deny read-only (policy::PathPrefix "/a")))
+  (is (parses? "deny read /a/b/" policy:Deny read-only (policy::PathPrefix "/a/b")))
+  (is (parses? "allow read /" policy:Allow read-only (policy::PathPrefix "/"))))
+
+(define-test parse-rejects-dot-dot ()
+  (is (error-names? "deny read /a/../b" "\"..\"" "/a/../b"))
+  (is (error-names? "deny read /.." "\"..\"" "/.."))
+  (is (error-names? "deny read /a/../" "\"..\"" "/a/../")))
+
+(define-test parse-rejects-other-paths-that-could-never-match ()
+  (is (error-names? "deny read //" "plain form" "//"))
+  (is (error-names? "deny read //a" "plain form" "//a"))
+  (is (error-names? "deny read /a//" "plain form" "/a//"))
+  (is (error-names? "deny read /a//b" "plain form" "/a//b"))
+  (is (error-names? "deny read /a/./b" "plain form" "/a/./b")))
+
+;; A16: a backslash makes the next character literal.
+(define-test parse-unescapes-whitespace ()
+  (is (parses? "allow read /my\\ dir"
+               policy:Allow read-only (policy::PathPrefix "/my dir")))
+  (is (parses? "allow read /a\\  "
+               policy:Allow read-only (policy::PathPrefix "/a ")))
+  (is (parses? #.(cl:format cl:nil "allow read /a\\~Cb" #\Tab)
+               policy:Allow read-only
+               (policy::PathPrefix #.(cl:format cl:nil "/a~Cb" #\Tab)))))
+
+(define-test parse-unescapes-glob-characters ()
+  (is (parses? "deny read /a/\\*.pem"
+               policy:Deny read-only (policy::PathPrefix "/a/*.pem")))
+  (is (parses? "deny read /a/\\?"
+               policy:Deny read-only (policy::PathPrefix "/a/?")))
+  (is (parses? "deny read /app/\\[id]"
+               policy:Deny read-only (policy::PathPrefix "/app/[id]")))
+  (is (parses? "deny read name:\\*.pem"
+               policy:Deny read-only (policy::FileName "*.pem"))))
+
+(define-test parse-unescapes-a-backslash ()
+  (is (parses? "deny read /a\\\\b"
+               policy:Deny read-only (policy::PathPrefix "/a\\b")))
+  (is (parses? "deny read name:a\\\\b"
+               policy:Deny read-only (policy::FileName "a\\b"))))
+
+(define-test parse-rejects-stray-backslashes ()
+  (is (error-names? "deny read /a\\b" "bad escape" "/a\\b"))
+  (is (error-names? "deny read /a\\" "bad escape" "/a\\"))
+  (is (error-names? "deny read /app/\\[id\\]" "bad escape" "/app/\\[id\\]"))
+  (is (error-names? "deny read /a\\/b" "bad escape" "/a\\/b"))
+  (is (error-names? "deny read name:a\\b" "bad escape" "a\\b")))
+
+;; An escape cannot smuggle in what the path rules forbid.
+(define-test parse-checks-paths-after-unescaping ()
+  (is (error-names? "deny read \\ /a" "relative path" "\\ /a"))
+  (is (error-names? "deny read \\*" "relative path" "\\*")))
+
+(define-test parse-rejects-names-that-could-never-match ()
+  (is (error-names? "deny read name:" "empty name" "name:"))
+  (is (error-names? "deny read name:a/b" "bad name" "a/b"))
+  (is (error-names? "deny read name:." "bad name" "\".\""))
+  (is (error-names? "deny read name:.." "bad name" "\"..\"")))

@@ -10,7 +10,9 @@
   :depends-on ("coalton")
   :defsystem-depends-on ("coalton-asdf")
   :pathname "src/policy/"
-  :components ((:ct-file "policy")))
+  :serial t
+  :components ((:ct-file "policy")
+               (:ct-file "parse")))
 
 (defsystem "dakusui/helper"
   :description "The dakusui binary: holds the capabilities and owns the BPF maps."
@@ -34,4 +36,5 @@
   :pathname "test/"
   :serial t
   :components ((:ct-file "suite")
-               (:ct-file "policy")))
+               (:ct-file "policy")
+               (:ct-file "parse")))

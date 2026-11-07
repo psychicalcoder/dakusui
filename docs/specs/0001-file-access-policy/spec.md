@@ -44,7 +44,11 @@ enforces the policy, and the user can change it while commands run.
   a pattern: an absolute path, which covers itself and everything beneath it
   whether or not it exists yet, or `name:X`, which matches a path whose last
   component is X. Example: `deny read,write name:.env`. A name rule applies on
-  the whole machine, so `name:.git` would reach every git repository.
+  the whole machine, so `name:.git` would reach every git repository. In a
+  pattern, `\` makes the next character literal. It is required before
+  whitespace, `*`, `?`, `[`, and `\`; before any other character, or at the end
+  of the pattern, it is an error. A path ignores one trailing slash. A path MUST
+  NOT contain a `..` or `.` component or an empty component.
 - R11: Only the Dakusui process MUST be able to change the policy. A confined
   command MUST NOT reach the helper, gain capabilities, or tamper with Dakusui
   through ptrace, `/proc`, or inherited descriptors.
@@ -59,7 +63,7 @@ enforces the policy, and the user can change it while commands run.
   it succeeds. Reading `~/.ssh/id_ed25519` or writing `/etc/hostname` fails.
 - A2 (R1): Given a Python script that opens `/etc/shadow`, when the agent runs
   it, then the open fails.
-- A3 (R2): Given `allow /p/a/x` then `deny /p/a`, when a command opens
+- A3 (R2): Given `allow read /p/a/x` then `deny read /p/a`, when a command opens
   `/p/a/x`, then it fails.
 - A4 (R4): Given a running command, when the user adds an allow rule, then the
   command's next open succeeds without a restart.
@@ -91,6 +95,10 @@ enforces the policy, and the user can change it while commands run.
 - A15 (R10): Given the rule `deny read,write name:.env`, then it parses. Given a
   relative path, a glob such as `*.pem`, or an unknown kind, then it is
   rejected with a message that names the problem.
+- A16 (R10): Given `allow read /my\ dir`, then the rule names `/my dir`. Given
+  `allow read /a/`, then the rule names `/a`. Given `/a/../b` or a stray
+  backslash such as `/a\b`, then it is rejected with a message that names the
+  problem.
 
 ## Constraints
 
@@ -111,7 +119,6 @@ enforces the policy, and the user can change it while commands run.
 
 - Q9: Do chmod, chown, utimes, and xattr changes count as write? v0 leaves them
   out. (not blocking)
-None blocking.
 
 ## Decisions
 
@@ -137,6 +144,6 @@ Design choices made while writing this spec live in the ADRs:
 | R7 | A13 | Not started |
 | R8 | A14 | Not started |
 | R9 | A6 | Not started |
-| R10 | A15 | Not started |
+| R10 | A15, A16 | Not started |
 | R11 | A8 | Not started |
 | R12 | A10 | Not started |
