@@ -71,8 +71,9 @@ At start, in this order:
 3. Load and attach the programs.
 4. Write the helper's pid to the liveness map, and open a file, so the hook
    records the helper's start time.
-5. Pin every link and the `confined` map.
-6. Check that the start time was recorded.
+5. Check that the start time was recorded. Checking before pinning means a
+   failed registration leaves no pins behind.
+6. Pin every link and the `confined` map.
 7. Create the socketpair and fork the agent.
 
 If any step fails, exit before the agent starts (R9). The child puts its end
@@ -101,11 +102,16 @@ pins one link per program and the `confined` map, which cleanup needs, and
 nothing else. The helper pins every link before it starts the agent.
 
 At start, the helper clears every stale session in its mount: one whose helper
-is gone or has another start time. It opens the session's `confined` map, walks
-`/proc`, and kills each live, non-zombie process the map flags, through a pidfd.
-It repeats until a pass finds none, then unpins the session. If 100 passes do
-not clear it, it keeps the pins, warns, and starts anyway: the processes stay
-denied everything. At a normal exit, the helper clears its own session the
+is gone, has another start time, or is a zombie. It opens the session's
+`confined` map, walks every thread in `/proc/<pid>/task/`, and kills each live,
+non-zombie thread the map flags, through a thread pidfd. Threads, not
+processes: the flag is per task, and a process whose main thread has exited
+shows as a zombie while its other threads still run. It repeats until a pass
+finds none, then unpins the session, the links first and the map last. A
+session without its map pin never confined anything, since the map is pinned
+first, so it is unpinned at once. If a flag cannot be read, the pass does not
+count as clean. If 100 passes do not clear it, it keeps the pins, warns, and
+starts anyway: the tasks stay denied everything. At a normal exit, the helper clears its own session the
 same way, so only a crash leaves pins behind. No session is unpinned while a
 task it confines lives (R9).
 
