@@ -130,7 +130,10 @@ Then it waits for the helper to go, tries to read src/a.c, and waits on."
 
   (declare start-a19 (client:Client * String -> Boolean))
   (define (start-a19 helper project)
-    "Start A19's victim through the launcher, before A6 kills the helper."
+    "Start A19's victim through the launcher, before A6 kills the helper, and
+wait until it reports. The command returns once it has put the victim in the
+background, and an exec after the helper is gone fails, so killing the
+helper sooner could stop the victim before it starts."
     (let helper-pid = (lisp (-> I32) () (cffi:foreign-funcall "getppid" :int)))
     (let command =
       (mconcat (make-list "setsid sh -c '" a19-script "' sh "
@@ -140,7 +143,19 @@ Then it waits for the helper to go, tries to read src/a.c, and waits on."
       ((Err why)
        (say (<> "FAIL A19 cannot start the victim: " why))
        False)
-      ((Ok _) True)))
+      ((Ok _)
+       (let report = (<> project "/a19"))
+       (let started =
+         (lisp (-> Boolean) (report)
+           (cl:loop :repeat 500
+                    :when (cl:find-if (cl:lambda (l) (uiop:string-prefix-p "victim " l))
+                                      (coalton (log-lines (lisp (-> String) () report))))
+                      :do (cl:return cl:t)
+                    :do (cl:sleep 0.01)
+                    :finally (cl:return cl:nil))))
+       (if started
+           True
+           (progn (say "FAIL A19 the victim never reported") False)))))
 
   (declare check-a19 (String -> Boolean))
   (define (check-a19 project)
