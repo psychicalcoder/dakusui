@@ -172,6 +172,16 @@ enforces the policy, and the user can change it while commands run.
   TCP or UDP, such as `ssh localhost` or a language server, which is the
   escape R15 closes for Unix sockets. Network limits are a non-goal. Should
   loopback be the exception? (not blocking)
+- Q20: T23 found torn walks: a rename that races a confined open can make the
+  enforcer build a path that never existed, and allow it. R6 says renames
+  MUST NOT bypass a rule. Should the walk check `rename_lock` and deny or
+  retry when it changed, use `bpf_d_path` where the hook allows it, or
+  something else? (blocking for R6)
+- Q21: Renaming an ancestor moves a denied directory to a path no rule covers,
+  and the rename itself needs only write access to the ancestor. Does R6 forbid
+  this? If so, should the rename hook deny moving a directory that contains a
+  denied path, or should a deny also cover renames of its ancestors?
+  (blocking for R6)
 
 ## Decisions
 

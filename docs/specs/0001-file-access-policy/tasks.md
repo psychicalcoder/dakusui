@@ -123,13 +123,13 @@ a task that can run in parallel with the one before it. The spike code in
 
 ## Phase 5: Acceptance
 
-- [ ] T21 Port the spike tests into an acceptance harness that uses the real
+- [x] T21 Port the spike tests into an acceptance harness that uses the real
   binaries, one test per case A1 through A19 (A12, A15, A16, and A18 also have unit
   tests in T5, T4, and T25; A20 and A21 are deferred with R15). Done when all
   pass on the development machine.
-- [ ] T22 Add a random-policy test that compares kernel verdicts with the
+- [x] T22 Add a random-policy test that compares kernel verdicts with the
   reference evaluator over a temp tree. Done when 1,000 random cases agree.
-- [ ] T23 Stress the torn-walk risk: run concurrent renames against opens and
+- [x] T23 Stress the torn-walk risk: run concurrent renames against opens and
   check that no denied file is ever readable. Done when the result is recorded
   in the plan, pass or fail.
 - [ ] T24 Fill in the spec's verification table, set its status to Implemented,

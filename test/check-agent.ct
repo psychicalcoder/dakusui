@@ -1,6 +1,7 @@
 (defpackage #:dakusui/check-agent
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:agent #:dakusui/agent)
+                    (#:policy #:dakusui/policy)
                     (#:client #:dakusui/client)
                     (#:session #:dakusui/session)
                     (#:launch #:dakusui/launch)
@@ -10,26 +11,123 @@
   (:export #:main))
 (in-package #:dakusui/check-agent)
 
-;;; A stand-in for dakusui-agent, built from the agent's own code. make
-;;; attach-check puts it next to a copy of the real helper, which starts it as
-;;; it starts the real agent. It builds a temp project, sends the default
-;;; policy, and runs A13, A1, A2, A6, and A19 through the launcher. (T17, T18,
-;;; T29, R1, R7, R9, R11) The agent first reads .env itself, so only the policy
-;;; can deny it.
+;;; The acceptance harness (T21). A stand-in for dakusui-agent, built from the
+;;; agent's own code. make attach-check puts it next to a copy of the real
+;;; helper, which starts it as it starts the real agent. It builds a temp tree,
+;;; sends the session policy, and runs one check per acceptance case, A1
+;;; through A19, through the launcher, plus the spike's other cases. The
+;;; random-policy test (T22) and the torn-walk test (T23) live in
+;;; check-stress.ct, and the order of the run in check-main.ct.
+;;;
+;;; The agent itself is not confined, so it builds every fixture, and it reads
+;;; .env first, so only the policy can deny it.
 
-(cl:defun make-project ()
-  "A temp project with .env and src/a.c. The agent is not confined."
-  (cl:let ((base (cffi:with-foreign-string (template "/tmp/dakusui-check-XXXXXX")
-                   (cffi:foreign-string-to-lisp
-                    (cffi:foreign-funcall "mkdtemp" :pointer template :pointer)))))
-    (cl:ensure-directories-exist (cl:format cl:nil "~A/src/" base))
-    (cl:with-open-file (out (cl:format cl:nil "~A/.env" base) :direction :output)
-      (cl:write-line "SECRET=check" out))
-    (cl:with-open-file (out (cl:format cl:nil "~A/src/a.c" base) :direction :output)
-      (cl:write-line "int main(void) { return 0; }" out))
+(cl:defvar *muted* cl:nil
+  "True while a stress test runs: denial events are counted, not logged, so
+millions of them do not flood the terminal and the log.")
+
+(cl:defvar *muted-events* 0)
+
+(cl:defun file-lines (path)
+  (cl:with-open-file (in path :if-does-not-exist cl:nil)
+    (cl:if in
+           (cl:loop :for line := (cl:read-line in cl:nil) :while line :collect line)
+           cl:nil)))
+
+(cl:defun write-text (path text)
+  (cl:ensure-directories-exist path)
+  (cl:with-open-file (out path :direction :output :if-exists :supersede)
+    (cl:write-line text out)))
+
+(cl:defun make-symlink (target path)
+  (cl:unless (cl:zerop (cffi:foreign-funcall "symlink" :string target :string path :int))
+    (cl:error "symlink ~A -> ~A failed" path target)))
+
+(cl:defun real-path (path)
+  (cl:let ((p (cffi:foreign-funcall "realpath" :string path
+                                    :pointer (cffi:null-pointer) :pointer)))
+    (cl:if (cffi:null-pointer-p p)
+           path
+           (cl:unwind-protect (cffi:foreign-string-to-lisp p)
+             (cffi:foreign-free p)))))
+
+(cl:defun chain (component n)
+  (cl:format cl:nil "~{/~A~}" (cl:make-list n :initial-element component)))
+
+(cl:defparameter *ptrace-py*
+  "import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+# PTRACE_ATTACH (16)
+sys.exit(0 if libc.ptrace(16, int(sys.argv[1]), 0, 0) == 0 else 3)
+")
+
+(cl:defparameter *mem-py*
+  "import sys
+f = open('/proc/%s/mem' % sys.argv[1], 'rb')
+print('opened')
+")
+
+(cl:defparameter *getfd-py*
+  "import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+got = []
+for pid in sys.argv[1:]:
+    p = os.pidfd_open(int(pid))
+    for fd in range(64):
+        # pidfd_getfd (438)
+        if libc.syscall(438, p, fd, 0) >= 0:
+            got.append((pid, fd))
+print('got', got)
+sys.exit(0 if got else 3)
+")
+
+(cl:defun make-base ()
+  "A temp tree for every check. The agent is not confined, so it builds it.
+BASE/p is the project, BASE/home the home directory, which the agent reaches
+through the symlink BASE/homelink (A17)."
+  (cl:let* ((made (cffi:with-foreign-string (template "/tmp/dakusui-check-XXXXXX")
+                    (cffi:foreign-string-to-lisp
+                     (cffi:foreign-funcall "mkdtemp" :pointer template :pointer))))
+            (base (real-path made)))
+    (cl:flet ((at (sub) (cl:format cl:nil "~A/~A" base sub)))
+      (write-text (at "p/.env") "SECRET=check")
+      (write-text (at "p/src/a.c") "int main(void) { return 0; }")
+      (write-text (at "p/a/x") "a3")
+      (write-text (at "p/locked/x") "locked")
+      (write-text (at "p/my dir/f") "spaced")
+      (write-text (at "p/.dakusui/rules/x") "rule")
+      (write-text (at (cl:format cl:nil "p/deep20~A/file" (chain "a" 20))) "deep")
+      (write-text (at (cl:format cl:nil "p/deep40~A/file" (chain "b" 40))) "deep")
+      (write-text (at "home/.ssh/id_ed25519") "PRIVATE KEY")
+      (make-symlink (at "home") (at "homelink"))
+      (write-text (at "outside/secret") "outside")
+      (make-symlink (at "outside/secret") (at "p/link"))
+      (write-text (at "anc/sub/secret") "ancestor")
+      (cl:ensure-directories-exist (at "data/s/"))
+      (make-symlink (at "data/s") (at "s"))
+      (cl:ensure-directories-exist (at "w/"))
+      (write-text (at "ro") "read only")
+      (write-text (at "ptrace.py") *ptrace-py*)
+      (write-text (at "mem.py") *mem-py*)
+      (write-text (at "getfd.py") *getfd-py*))
     base))
 
 (coalton-toplevel
+  (define-struct Ctx
+    "What every check needs: the helper, the temp tree, and the denial log."
+    (helper client:Client)
+    (base String)
+    (project String)
+    (home String)
+    (homelink String)
+    (log-file String))
+
+  (declare in-base (Ctx * String -> String))
+  (define (in-base c sub) (mconcat (make-list (.base c) "/" sub)))
+
+  (declare in-project (Ctx * String -> String))
+  (define (in-project c sub) (mconcat (make-list (.project c) "/" sub)))
+
   (declare say (String -> Unit))
   (define (say text)
     (lisp (-> Unit) (text)
@@ -37,71 +135,495 @@
       (cl:finish-output)
       Unit))
 
+  (declare verdict (Boolean * String * String -> Boolean))
+  (define (verdict passed label detail)
+    "Print one line for a check, and give back PASSED."
+    (say (mconcat (make-list (if passed "ok   " "FAIL ") label ": " detail)))
+    passed)
+
+  (declare show-n (UFix -> String))
+  (define (show-n n)
+    (lisp (-> String) (n) (cl:format cl:nil "~D" n)))
+
+  (declare show-i32 (I32 -> String))
+  (define (show-i32 n)
+    (lisp (-> String) (n) (cl:format cl:nil "~D" n)))
+
   (declare readable? (String -> Boolean))
   (define (readable? path)
     "True if this unconfined process can read PATH."
     (lisp (-> Boolean) (path)
       (cl:and (cl:ignore-errors (cl:with-open-file (in path) (cl:read-line in cl:nil ""))) cl:t)))
 
-  (define-type Wanted
-    (Succeeds String)
-    (Fails String))
+  (declare exists? (String -> Boolean))
+  (define (exists? path)
+    (lisp (-> Boolean) (path)
+      (cl:and (cl:probe-file path) cl:t)))
 
-  (declare check (client:Client * String * String * String * Wanted -> Boolean))
-  (define (check helper project label command wanted)
-    "Run COMMAND in PROJECT, and report whether it ended as WANTED says: with
-code 0 and the text in its output, or with another code and the text."
-    (match (launch:run-command helper project command)
-      ((Err why)
-       (say (mconcat (make-list "FAIL " label ": " why)))
-       False)
+  (declare touch (String -> Unit))
+  (define (touch path)
+    (lisp (-> Unit) (path)
+      (cl:with-open-file (out path :direction :output :if-exists :supersede))
+      Unit))
+
+  (declare log-lines (String -> List String))
+  (define (log-lines path)
+    (lisp (-> (List String)) (path) (file-lines path)))
+
+  (declare wait-lines (String * UFix -> List String))
+  (define (wait-lines path n)
+    "The lines of PATH, once it has N of them, or after three seconds."
+    (lisp (-> (List String)) (path n)
+      (cl:loop :repeat 300
+               :for lines := (file-lines path)
+               :until (cl:>= (cl:length lines) n)
+               :do (cl:sleep 0.01)
+               :finally (cl:return lines))))
+
+  (declare log-grew? (String * UFix -> Boolean))
+  (define (log-grew? path before)
+    "True once the log at PATH has more than BEFORE lines, within two seconds."
+    (lisp (-> Boolean) (path before)
+      (cl:loop :repeat 200
+               :when (cl:> (cl:length (file-lines path)) before) :do (cl:return cl:t)
+               :do (cl:sleep 0.01)
+               :finally (cl:return cl:nil))))
+
+  (define-type Wanted
+    "How a command should end: with code 0 and the text in its output; with
+another code and the text; or the same, plus a new line in the denial log,
+so the policy, not the file mode, refused it."
+    (Succeeds String)
+    (Fails String)
+    (Denied String))
+
+  (declare check (Ctx * String * String * Wanted -> Boolean))
+  (define (check c label command wanted)
+    "Run COMMAND in the project, and report whether it ended as WANTED says."
+    (let before = (list:length (log-lines (.log-file c))))
+    (match (launch:run-command (.helper c) (.project c) command)
+      ((Err why) (verdict False label why))
       ((Ok o)
        (let code = (launch:outcome-code o))
        (let output = (launch:outcome-output o))
        (let passed =
          (match wanted
            ((Succeeds text) (and (== code 0) (string:substring? text output)))
-           ((Fails text) (and (/= code 0) (string:substring? text output)))))
-       (say (mconcat (make-list (if passed "ok   " "FAIL ") label
-                                (lisp (-> String) (code) (cl:format cl:nil " (exit ~D): " code))
-                                output)))
-       passed)))
+           ((Fails text) (and (/= code 0) (string:substring? text output)))
+           ((Denied text) (and (/= code 0) (string:substring? text output)
+                               (log-grew? (.log-file c) before)))))
+       (verdict passed label (mconcat (make-list "(exit " (show-i32 code) ") " output))))))
 
-  (declare log-lines (String -> List String))
-  (define (log-lines path)
-    (lisp (-> (List String)) (path)
-      (cl:with-open-file (in path :if-does-not-exist cl:nil)
-        (cl:if in
-               (cl:loop :for line := (cl:read-line in cl:nil) :while line :collect line)
-               cl:nil))))
+  (declare rules-of (List String -> Result String (List policy:Rule)))
+  (define (rules-of texts)
+    (traverse policy:parse-rule texts))
 
-  (declare check-a13 (client:Client * String * String -> Boolean))
-  (define (check-a13 helper project log-file)
+  (declare with-rules (Ctx * session:Session * String * List String
+                       * (session:Session -> List Boolean) -> List Boolean))
+  (define (with-rules c s label texts body)
+    "Make TEXTS the session's rule set, run BODY, then empty the set again."
+    (match (>>= (rules-of texts) (fn (rules) (session:replace-rules s rules)))
+      ((Err why) (make-list (verdict False label (<> "cannot install the rules: " why))))
+      ((Ok changed)
+       (let results = (body changed))
+       (match (session:replace-rules s Nil)
+         ((Ok _) results)
+         ((Err why) (Cons (verdict False label (<> "cannot restore the policy: " why))
+                          results))))))
+
+  (declare with-policy (Ctx * session:Session * String * List String
+                        * (Unit -> List Boolean) -> List Boolean))
+  (define (with-policy c s label texts body)
+    "Send the whole policy TEXTS, not a session policy, run BODY, then send
+the session's policy again."
+    (match (>>= (rules-of texts) (fn (rules) (client:send-policy (.helper c) (policy:Policy rules))))
+      ((Err why) (make-list (verdict False label (<> "cannot send the policy: " why))))
+      ((Ok _)
+       (let results = (body Unit))
+       (match (client:send-policy (.helper c) (session:current-policy s))
+         ((Ok _) results)
+         ((Err why) (Cons (verdict False label (<> "cannot restore the policy: " why))
+                          results))))))
+
+  (declare background (Ctx * String -> Result String Unit))
+  (define (background c script)
+    "Start SCRIPT confined, in the background, and return once it is started."
+    (map (fn (_) Unit)
+         (launch:run-command (.helper c) (.project c)
+                             (mconcat (make-list "sh -c '" script "' </dev/null >/dev/null 2>&1 &"))))))
+
+;;; A13, A1, A2: the default policy.
+
+(coalton-toplevel
+  (declare check-a13 (Ctx -> Boolean))
+  (define (check-a13 c)
     "A denied cat gives one log line naming the process, path, and kind. The
 event comes on the reader thread, so wait for it, then a little more, in case
 a second line follows."
+    (let log-file = (.log-file c))
     (let before = (list:length (log-lines log-file)))
-    (let ran = (launch:run-command helper project "cat .env"))
-    (lisp (-> Unit) (log-file before)
-      (cl:loop :repeat 200
-               :until (cl:> (cl:length (coalton (log-lines (lisp (-> String) () log-file)))) before)
-               :do (cl:sleep 0.01))
-      (cl:sleep 0.3)
-      Unit)
+    (let ran = (launch:run-command (.helper c) (.project c) "cat .env"))
+    (let _ = (log-grew? log-file before))
+    (lisp (-> Unit) () (cl:sleep 0.3) Unit)
     (let new = (list:drop before (log-lines log-file)))
-    (let wanted = (mconcat (make-list "denied read of " project "/.env by cat (pid ")))
+    (let wanted = (mconcat (make-list "denied read of " (.project c) "/.env by cat (pid ")))
     (let passed = (and (== 1 (list:length new))
                        (string:substring? wanted (with-default "" (list:head new)))
                        (match ran ((Ok o) (/= 0 (launch:outcome-code o))) ((Err _) False))))
-    (say (mconcat (make-list (if passed "ok   " "FAIL ") "A13 one log line for a denied cat: "
-                             (mconcat (map (fn (line) (<> line "; ")) new)))))
-    passed)
+    (verdict passed "A13 one log line for a denied cat"
+             (mconcat (map (fn (line) (<> line "; ")) new))))
 
-  (declare check-a6 (client:Client * String -> Boolean))
-  (define (check-a6 helper project)
+  (declare check-defaults (Ctx -> List Boolean))
+  (define (check-defaults c)
+    (let home-key = (<> (.homelink c) "/.ssh/id_ed25519"))
+    (let shm = (lisp (-> String) ()
+                 (cl:format cl:nil "/dev/shm/dakusui-check-~D" (cffi:foreign-funcall "getpid" :int))))
+    (let results =
+      (make-list
+       (check c "A1 cat .env is denied" "cat .env" (Denied "Permission denied"))
+       (check c "A1 cat src/a.c succeeds" "cat src/a.c" (Succeeds "int main"))
+       (check c "A2 python opens .env" "python3 -c 'print(open(\".env\").read())'"
+              (Denied "PermissionError"))
+       (check c "A2 a grandchild is confined" "sh -c 'sh -c \"cat .env\"'" (Denied "Permission denied"))
+       (check c "A11 read /etc/hostname" "cat /etc/hostname" (Succeeds ""))
+       (check c "A11 read ~/.ssh/id_ed25519" (<> "cat " home-key) (Denied "Permission denied"))
+       ;; The file mode refuses this before the policy is asked.
+       (check c "A11 write /etc/hostname" "echo x >> /etc/hostname" (Fails "Permission denied"))
+       ;; So try a file the user may write, where the policy allows no write.
+       (check c "A11 write outside the allowed paths" (<> "echo x > " shm) (Denied "Permission denied"))
+       (check c "A17 a home reached through a symlink still hides ~/.ssh"
+              (<> "cat " home-key) (Denied "Permission denied"))
+       (check c "a command gets PATH" "env" (Succeeds "PATH="))
+       (check c "no API key reaches a command" "env | grep -c -e OPENAI_API_KEY -e BASH_ENV"
+              (Fails "0"))))
+    (lisp (-> Unit) (shm) (cl:ignore-errors (cl:delete-file shm)) Unit)
+    results))
+
+;;; A3, A12: whole policies of the spec's own.
+
+(coalton-toplevel
+  (declare check-a3 (Ctx * session:Session -> List Boolean))
+  (define (check-a3 c s)
+    "allow read P/a/x, then deny read P/a: the later deny wins. The policy
+also allows reading /, or no command could start."
+    (with-policy c s "A3"
+      (make-list "allow read /" "allow write /dev/null"
+                 (<> "allow read " (in-project c "a/x"))
+                 (<> "deny read " (in-project c "a")))
+      (fn (_)
+        (make-list
+         (check c "A3 the last match wins: deny after allow" "cat a/x" (Denied "Permission denied"))
+         (check c "A3 a file outside P/a is still readable" "cat src/a.c" (Succeeds "int main"))))))
+
+  (declare check-a12 (Ctx * session:Session -> List Boolean))
+  (define (check-a12 c s)
+    "allow read /, allow write W, and nothing else. /etc/hostname read-write
+fails on its file mode alone, so BASE/ro, which the user may write, stands in
+for it."
+    (let w = (in-base c "w"))
+    (let ro = (in-base c "ro"))
+    (with-policy c s "A12"
+      (make-list "allow read /" (<> "allow write " w))
+      (fn (_)
+        (make-list
+         (check c "A12 open W/f write-only" (mconcat (make-list "echo x > " w "/f && echo wrote"))
+                (Succeeds "wrote"))
+         (check c "A12 open /etc/hostname read-only" "cat /etc/hostname" (Succeeds ""))
+         (check c "A12 open a file read-write where only read is allowed"
+                (<> "exec 5<> " ro) (Denied "Permission denied")))))))
+
+;;; A4, A7: changes while a command runs.
+
+(coalton-toplevel
+  (declare check-a4 (Ctx * session:Session -> List Boolean))
+  (define (check-a4 c s)
+    "A running command is denied P/locked/x. The user allows it, and the same
+shell's next open succeeds."
+    (let report = (in-project c "a4"))
+    (let script = "exec 5>>a4; if read -r _ < locked/x; then echo early >&5; else echo denied >&5; fi; while [ ! -e a4-go ]; do sleep 0.01; done; if read -r _ < locked/x; then echo read >&5; else echo still-denied >&5; fi")
+    (with-rules c s "A4" (make-list (<> "deny read " (in-project c "locked")))
+      (fn (denied)
+        (make-list
+         (match (background c script)
+           ((Err why) (verdict False "A4" why))
+           ((Ok _)
+            (let early = (wait-lines report 1))
+            (let added = (>>= (policy:parse-rule (<> "allow read " (in-project c "locked")))
+                              (fn (r) (session:add-rule denied r))))
+            (touch (in-project c "a4-go"))
+            (let lines = (wait-lines report 2))
+            (verdict (and (== early (make-list "denied"))
+                          (== lines (make-list "denied" "read"))
+                          (match added ((Ok _) True) ((Err _) False)))
+                     "A4 an added allow reaches a running command"
+                     (mconcat (map (fn (line) (<> line "; ")) lines)))))))))
+
+  (declare check-a7 (Ctx * session:Session -> List Boolean))
+  (define (check-a7 c s)
+    "A running command holds src/a.c open. The user denies src: reads on the
+descriptor go on, and a new open fails."
+    (let report = (in-project c "a7"))
+    (let script = "exec 5>>a7; exec 4< src/a.c; echo ready >&5; while [ ! -e a7-go ]; do sleep 0.01; done; if read -r _ <&4; then echo fd-read >&5; else echo fd-failed >&5; fi; if read -r _ < src/a.c; then echo opened >&5; else echo open-denied >&5; fi")
+    (match (background c script)
+      ((Err why) (make-list (verdict False "A7" why)))
+      ((Ok _)
+       (let ready = (wait-lines report 1))
+       (match (>>= (policy:parse-rule (<> "deny read " (in-project c "src")))
+                   (fn (r) (session:add-rule s r)))
+         ((Err why)
+          (touch (in-project c "a7-go"))
+          (make-list (verdict False "A7" (<> "cannot add the rule: " why))))
+         ((Ok _)
+          (touch (in-project c "a7-go"))
+          (let lines = (wait-lines report 3))
+          (let restored = (session:replace-rules s Nil))
+          (make-list
+           (verdict (and (== ready (make-list "ready"))
+                         (== lines (make-list "ready" "fd-read" "open-denied"))
+                         (match restored ((Ok _) True) ((Err _) False)))
+                    "A7 an open descriptor survives a deny, a new open does not"
+                    (mconcat (map (fn (line) (<> line "; ")) lines))))))))))
+
+;;; A5, A9, and the spike's other cases for R5 and R6.
+
+(coalton-toplevel
+  (declare check-links (Ctx * session:Session -> List Boolean))
+  (define (check-links c s)
+    (let outside = (in-base c "outside"))
+    (with-rules c s "A5" (make-list (<> "deny read,write " outside))
+      (fn (_)
+        (make-list
+         (check c "A5 a symlink in P to a denied file" "cat link" (Denied "Permission denied"))
+         (check c "A5 a symlink the command makes"
+                (mconcat (make-list "ln -s " outside "/secret made && cat made"))
+                (Denied "Permission denied"))
+         (check c "R6 rename a file into a denied directory"
+                (mconcat (make-list "mv src/a.c " outside "/a.c"))
+                (Denied "Permission denied"))
+         (check c "R6 rename a denied file out"
+                (mconcat (make-list "mv " outside "/secret stolen"))
+                (Denied "Permission denied"))
+         (check c "A9 hard link" "ln src/a.c hard" (Denied ""))))))
+
+  (declare note-ancestor-rename (Ctx * session:Session -> Unit))
+  (define (note-ancestor-rename c s)
+    "Not a pass or a fail: a question for the spec. A rule covers a path, so
+renaming a writable ancestor moves a denied directory to a path no rule
+covers. Report what happens."
+    (let anc = (in-base c "anc"))
+    (let _ = (with-rules c s "R6 note" (make-list (mconcat (make-list "deny read,write " anc "/sub")))
+      (fn (_)
+        (let ran = (launch:run-command (.helper c) (.project c)
+                                       (mconcat (make-list "mv " anc " " anc "2 && cat " anc "2/sub/secret"))))
+        (say (<> "note R6 rename an ancestor of a denied directory, then read it: "
+                 (match ran
+                   ((Ok o) (mconcat (make-list "exit " (show-i32 (launch:outcome-code o)) ", "
+                                               (launch:outcome-output o))))
+                   ((Err why) why))))
+        Nil)))
+    Unit)
+
+  (declare check-spike (Ctx -> List Boolean))
+  (define (check-spike c)
+    "The spike's cases that no acceptance case names, under the default
+policy."
+    (make-list
+     (check c "R5 mkdir, rmdir, create, rename, truncate, mknod, symlink, unlink in P"
+            "mkdir d1 && rmdir d1 && echo hi > n && mv n n2 && truncate -s 0 n2 && rm n2 && mkfifo pf && rm pf && ln -s src/a.c sl && rm sl && echo done"
+            (Succeeds "done"))
+     (check c "R5 truncate .env" "truncate -s 0 .env" (Denied "Permission denied"))
+     (check c "R5 open read-write in P" "exec 5<> src/a.c && echo opened" (Succeeds "opened"))
+     (check c "R5 write /dev/null" "echo x > /dev/null && echo wrote" (Succeeds "wrote"))
+     (check c "limit a path of 25 components"
+            (lisp (-> String) () (cl:format cl:nil "cat deep20~A/file" (chain "a" 20)))
+            (Succeeds "deep"))
+     (check c "limit a path over 32 components fails closed"
+            (lisp (-> String) () (cl:format cl:nil "cat deep40~A/file" (chain "b" 40)))
+            (Denied "")))))
+
+;;; A8, A10: reaching outside the confinement.
+
+(coalton-toplevel
+  (declare check-a8 (Ctx -> List Boolean))
+  (define (check-a8 c)
+    (let agent-pid = (lisp (-> I32) () (cffi:foreign-funcall "getpid" :int)))
+    (let helper-pid = (lisp (-> I32) () (cffi:foreign-funcall "getppid" :int)))
+    (let py = (fn (script args) (mconcat (make-list "python3 " (in-base c script) " " args))))
+    (let helper-binary = (lisp (-> String) ()
+                           (cl:namestring (cl:merge-pathnames "dakusui" sb-ext:*runtime-pathname*))))
+    (let marker = (in-project c "a8-eval"))
+    ;; A dumpable process of ours that is not confined: the file mode would
+    ;; let us read its /proc files, so only the ptrace hook stops a command.
+    (let sleeper = (lisp (-> I32) ()
+                     (sb-ext:process-pid (sb-ext:run-program "sleep" '("60") :search cl:t :wait cl:nil))))
+    (let environ = (<> "/proc/" (<> (show-i32 sleeper) "/environ")))
+    (let results =
+      (make-list
+       (check c "A8 ptrace the helper" (py "ptrace.py" (show-i32 helper-pid)) (Fails ""))
+       (check c "A8 ptrace the agent" (py "ptrace.py" (show-i32 agent-pid)) (Fails ""))
+       (check c "A8 read the agent's /proc/<pid>/mem" (py "mem.py" (show-i32 agent-pid))
+              (Fails "PermissionError"))
+       (check c "A8 read the helper's /proc/<pid>/mem" (py "mem.py" (show-i32 helper-pid))
+              (Fails "PermissionError"))
+       (check c "A8 duplicate the agent's and the helper's descriptors"
+              (py "getfd.py" (mconcat (make-list (show-i32 agent-pid) " " (show-i32 helper-pid))))
+              (Fails ""))
+       (verdict (readable? environ) "A8 the agent can read its own sleeper's environ" environ)
+       (check c "A8 read an unconfined process's environ" (<> "cat " environ) (Denied ""))
+       (let ((before (exists? marker)))
+         (match (launch:run-command
+                 (.helper c) (.project c)
+                 (mconcat (make-list "'" helper-binary "' --eval '(progn (close (open \"" marker
+                                     "\" :direction :output)) (sb-ext:exit :code 42))'")))
+           ((Err why) (verdict False "A8 run dakusui with --eval" why))
+           ((Ok o)
+            (verdict (and (not before) (/= 42 (launch:outcome-code o)) (not (exists? marker)))
+                     "A8 run dakusui with --eval"
+                     (mconcat (make-list "(exit " (show-i32 (launch:outcome-code o)) ") "
+                                         (launch:outcome-output o)))))))))
+    (lisp (-> Unit) (sleeper)
+      (cffi:foreign-funcall "kill" :int sleeper :int 9 :int)
+      Unit)
+    results)
+
+  (declare check-a10 (Ctx -> Boolean))
+  (define (check-a10 c)
+    "unshare -Urm fails confined. It must work unconfined first, or the check
+proves nothing."
+    (let unconfined = (lisp (-> Boolean) ()
+                        (cl:eql 0 (sb-ext:process-exit-code
+                                   (sb-ext:run-program "unshare" '("-Urm" "true") :search cl:t
+                                                       :output cl:nil :error cl:nil)))))
+    (if unconfined
+        (check c "A10 unshare -Urm" "unshare -Urm true" (Denied ""))
+        (verdict False "A10 unshare -Urm" "it fails unconfined too, so this check proves nothing"))))
+
+;;; A14 through A18: the policy as text, parsing, symlinks, and rule sets.
+
+(coalton-toplevel
+  (declare default-text (Ctx * List String -> String))
+  (define (default-text c set)
+    "The session policy's text, as A14 expects it, with the set's lines SET."
+    (let p = (.project c))
+    (let h = (.home c))
+    (mconcat
+     (map (fn (line) (<> line (into #\Newline)))
+          (mconcat
+           (make-list
+            (make-list "allow read /"
+                       (<> "allow read,write " p)
+                       "allow write /tmp"
+                       "allow write /dev/null"
+                       "allow write /dev/tty"
+                       (mconcat (make-list "deny read,write " h "/.ssh"))
+                       (mconcat (make-list "deny read,write " h "/.aws"))
+                       (mconcat (make-list "deny read,write " h "/.gnupg"))
+                       (mconcat (make-list "deny read,write " h "/.config/dakusui"))
+                       "deny read,write name:.env")
+            set
+            (make-list (mconcat (make-list "deny write " p "/.dakusui"))))))))
+
+  (declare check-a14 (Ctx * session:Session -> List Boolean))
+  (define (check-a14 c s)
+    "The text lists the rules in force, in order, with paths resolved and no
+trailing slash. The home directory was given through a symlink."
+    (let shown = (session:policy-text s))
+    (let plain = (verdict (== shown (default-text c Nil)) "A14 the session policy as text" shown))
+    (let added = (>>= (policy:parse-rule (<> "allow read " (<> (.homelink c) "/")))
+                      (fn (r) (session:add-rule s r))))
+    (let through-link =
+      (match added
+        ((Err why) (verdict False "A14 a rule given through a symlink" why))
+        ((Ok changed)
+         (let text = (session:policy-text changed))
+         (verdict (== text (default-text c (make-list (<> "allow read " (.home c)))))
+                  "A14 a rule given through a symlink, with a trailing slash" text))))
+    (let restored = (session:replace-rules s Nil))
+    (make-list plain through-link (match restored ((Ok _) True) ((Err _) False))))
+
+  (declare parse-result (String -> String))
+  (define (parse-result text)
+    (match (policy:parse-rule text)
+      ((Ok r) (<> "parsed: " (policy:rule-text r)))
+      ((Err why) (<> "rejected: " why))))
+
+  (declare rejects? (String * String -> Boolean))
+  (define (rejects? text problem)
+    "True if TEXT does not parse, with a message that names PROBLEM."
+    (match (policy:parse-rule text)
+      ((Ok _) False)
+      ((Err why) (string:substring? problem why))))
+
+  (declare check-a15 (Ctx -> List Boolean))
+  (define (check-a15 c)
+    "The agent's parser, then the helper's: a bad pattern sent straight to the
+helper is refused, and the policy in force stays."
+    (let parses = (fn (text) (match (policy:parse-rule text) ((Ok _) True) ((Err _) False))))
+    (let refused = (client::request (.helper c) "{\"op\":\"policy\",\"rules\":[{\"effect\":\"allow\",\"kinds\":[\"read\"],\"pattern\":\"src\"}]}"))
+    (make-list
+     (verdict (parses "deny read,write name:.env") "A15 deny read,write name:.env parses"
+              (parse-result "deny read,write name:.env"))
+     (verdict (rejects? "allow read src" "src") "A15 a relative path" (parse-result "allow read src"))
+     (verdict (rejects? "deny read *.pem" "*.pem") "A15 a glob" (parse-result "deny read *.pem"))
+     (verdict (rejects? "allow exec /" "exec") "A15 an unknown kind" (parse-result "allow exec /"))
+     (verdict (match refused ((Ok _) False) ((Err _) True))
+              "A15 the helper refuses a relative path"
+              (match refused ((Ok _) "accepted") ((Err why) why)))
+     (check c "A15 the policy in force stays" "cat .env" (Denied "Permission denied"))))
+
+  (declare check-a16 (Ctx * session:Session -> List Boolean))
+  (define (check-a16 c s)
+    (let spaced = (<> "deny read " (<> (.project c) "/my\\ dir")))
+    (let parsed = (make-list
+                   (verdict (== (parse-result "allow read /a/") "parsed: allow read /a")
+                            "A16 one trailing slash is ignored" (parse-result "allow read /a/"))
+                   (verdict (rejects? "allow read /a/../b" "..") "A16 a .. component"
+                            (parse-result "allow read /a/../b"))
+                   (verdict (rejects? "allow read /a\\b" "\\") "A16 a stray backslash"
+                            (parse-result "allow read /a\\b"))))
+    (<> parsed
+        (with-rules c s "A16" (make-list spaced)
+          (fn (_)
+            (make-list
+             (check c "A16 an escaped space names \"my dir\"" "cat 'my dir/f'" (Denied "Permission denied"))
+             (check c "A16 and nothing else" "cat src/a.c" (Succeeds "int main")))))))
+
+  (declare check-a17 (Ctx * session:Session -> List Boolean))
+  (define (check-a17 c s)
+    "BASE/s is a symlink to BASE/data/s. A rule for BASE/s/new, which does not
+exist yet, names BASE/data/s/new, and denies it once it exists."
+    (let wanted = (<> "deny read " (in-base c "data/s/new")))
+    (with-rules c s "A17" (make-list (<> "deny read " (in-base c "s/new")))
+      (fn (changed)
+        (let recorded = (map policy:rule-text (session:set-rules changed)))
+        (touch (in-base c "data/s/new"))
+        (make-list
+         (verdict (== recorded (make-list wanted)) "A17 the recorded rule names the real path"
+                  (mconcat (map (fn (line) (<> line "; ")) recorded)))
+         (check c "A17 and the kernel denies it" (<> "cat " (in-base c "s/new"))
+                (Denied "Permission denied"))))))
+
+  (declare check-a18 (Ctx * session:Session -> List Boolean))
+  (define (check-a18 c s)
+    (let key = (<> (.homelink c) "/.ssh/id_ed25519"))
+    (with-rules c s "A18"
+      (make-list (<> "allow read,write " (.project c)) (<> "allow read " (<> (.homelink c) "/.ssh")))
+      (fn (_)
+        (make-list
+         (check c "A18 a set reopens ~/.ssh" (<> "cat " key) (Succeeds "PRIVATE"))
+         (check c "A18 no set reopens .dakusui to writes" "echo x > .dakusui/rules/x"
+                (Denied "Permission denied"))
+         (check c "A18 but .dakusui stays readable" "cat .dakusui/rules/x" (Succeeds "rule")))))))
+
+;;; A6 and A19: the helper ends. These come last.
+
+(coalton-toplevel
+  (declare check-a6 (Ctx -> Boolean))
+  (define (check-a6 c)
     "Stop the helper, our parent, then ask to run a command. Dakusui must
 refuse, and the command must not run. This ends the helper, so it comes last."
-    (let marker = (<> project "/ran"))
+    (let helper = (.helper c))
+    (let marker = (in-project c "ran"))
     (let gone? = (fn () (client:closed? helper)))
     (lisp (-> Unit) (gone?)
       (cffi:foreign-funcall "kill" :int (cffi:foreign-funcall "getppid" :int)
@@ -110,15 +632,14 @@ refuse, and the command must not run. This ends the helper, so it comes last."
                :until (call-coalton-function gone?)
                :do (cl:sleep 0.01))
       Unit)
-    (let ran = (launch:run-command helper project (<> "touch " marker)))
-    (let passed = (and (client:closed? helper)
-                       (match ran
-                         ((Err why) (string:substring? "refused" why))
-                         ((Ok _) False))
-                       (not (readable? marker))))
-    (say (mconcat (make-list (if passed "ok   " "FAIL ") "A6 the helper is stopped: "
-                             (match ran ((Err why) why) ((Ok _) "the command ran")))))
-    passed)
+    (let ran = (launch:run-command helper (.project c) (<> "touch " marker)))
+    (verdict (and (client:closed? helper)
+                  (match ran
+                    ((Err why) (string:substring? "refused" why))
+                    ((Ok _) False))
+                  (not (readable? marker)))
+             "A6 the helper is stopped"
+             (match ran ((Err why) why) ((Ok _) "the command ran"))))
 
   (declare a19-script String)
   (define a19-script
@@ -128,53 +649,34 @@ since every open fails once it is gone, and starts sleep for the same reason.
 Then it waits for the helper to go, tries to read src/a.c, and waits on."
     "exec 5>>a19; sleep 600 & echo \"victim $$ $!\" >&5; while kill -0 \"$1\"; do :; done; if read -r _ < src/a.c; then echo \"a19 read\" >&5; else echo \"a19 denied\" >&5; fi; wait")
 
-  (declare start-a19 (client:Client * String -> Boolean))
-  (define (start-a19 helper project)
+  (declare start-a19 (Ctx -> Boolean))
+  (define (start-a19 c)
     "Start A19's victim through the launcher, before A6 kills the helper, and
 wait until it reports. The command returns once it has put the victim in the
 background, and an exec after the helper is gone fails, so killing the
 helper sooner could stop the victim before it starts."
     (let helper-pid = (lisp (-> I32) () (cffi:foreign-funcall "getppid" :int)))
     (let command =
-      (mconcat (make-list "setsid sh -c '" a19-script "' sh "
-                          (lisp (-> String) (helper-pid) (cl:format cl:nil "~D" helper-pid))
+      (mconcat (make-list "setsid sh -c '" a19-script "' sh " (show-i32 helper-pid)
                           " </dev/null >/dev/null 2>&1 &")))
-    (match (launch:run-command helper project command)
-      ((Err why)
-       (say (<> "FAIL A19 cannot start the victim: " why))
-       False)
+    (match (launch:run-command (.helper c) (.project c) command)
+      ((Err why) (verdict False "A19 cannot start the victim" why))
       ((Ok _)
-       (let report = (<> project "/a19"))
-       (let started =
-         (lisp (-> Boolean) (report)
-           (cl:loop :repeat 500
-                    :when (cl:find-if (cl:lambda (l) (uiop:string-prefix-p "victim " l))
-                                      (coalton (log-lines (lisp (-> String) () report))))
-                      :do (cl:return cl:t)
-                    :do (cl:sleep 0.01)
-                    :finally (cl:return cl:nil))))
-       (if started
+       (let lines = (wait-lines (in-project c "a19") 1))
+       (if (list:any (fn (l) (string:substring? "victim " l)) lines)
            True
-           (progn (say "FAIL A19 the victim never reported") False)))))
+           (verdict False "A19 the victim never reported" "")))))
 
-  (declare check-a19 (String -> Boolean))
-  (define (check-a19 project)
+  (declare check-a19 (Ctx -> Boolean))
+  (define (check-a19 c)
     "The first half of A19: once the helper is gone, the victim's read of
 src/a.c fails. Print the victim's pids, so the second half can check that
 the next start ends them."
-    (let report = (<> project "/a19"))
-    (let lines = (lisp (-> (List String)) (report)
-                   (cl:loop :repeat 300
-                            :for lines := (coalton (log-lines (lisp (-> String) () report)))
-                            :until (cl:find-if (cl:lambda (l) (uiop:string-prefix-p "a19 " l)) lines)
-                            :do (cl:sleep 0.01)
-                            :finally (cl:return lines))))
+    (let lines = (wait-lines (in-project c "a19") 2))
     (let passed = (and (list:member "a19 denied" lines) (not (list:member "a19 read" lines))))
     (let _ = (map (fn (line) (if (string:substring? "victim " line) (say line) Unit)) lines))
-    (say (mconcat (make-list (if passed "ok   " "FAIL ")
-                             "A19 a command that outlives the helper cannot read src/a.c: "
-                             (mconcat (map (fn (line) (<> line "; ")) lines)))))
-    passed)
+    (verdict passed "A19 a command that outlives the helper cannot read src/a.c"
+             (mconcat (map (fn (line) (<> line "; ")) lines))))
 
   (declare pid-gone? (String -> Boolean))
   (define (pid-gone? pid)
@@ -189,16 +691,16 @@ the next start ends them."
                :do (cl:sleep 0.01)
                :finally (cl:return cl:nil))))
 
-  (declare check-next-start (client:Client * String * String -> Boolean))
-  (define (check-next-start helper project victims)
+  (declare check-next-start (Ctx * String -> Boolean))
+  (define (check-next-start c victims)
     "The second half of A19 (T30): this start ended the victims, whose pids
 are VICTIMS. Then, for T31, start a nohup'd command, which the helper's
 normal exit must end, and print its pid and the helper's."
     (let pids = (list:filter (fn (p) (/= p "")) (string:split #\Space victims)))
-    (let ended = (and (not (list:null? pids)) (list:all pid-gone? pids)))
-    (say (mconcat (make-list (if ended "ok   " "FAIL ")
-                             "A19 the next start ended the victim: " victims)))
-    (let nohup = (launch:run-command helper project "nohup sleep 600 </dev/null >/dev/null 2>&1 & echo $!"))
+    (let ended = (verdict (and (not (list:null? pids)) (list:all pid-gone? pids))
+                          "A19 the next start ended the victim" victims))
+    (let nohup = (launch:run-command (.helper c) (.project c)
+                                     "nohup sleep 600 </dev/null >/dev/null 2>&1 & echo $!"))
     (let started =
       (match nohup
         ((Ok o)
@@ -207,64 +709,5 @@ normal exit must end, and print its pid and the helper's."
          (say (<> "nohup " pid))
          (say (<> "helper " (lisp (-> String) () (cl:format cl:nil "~D" (cffi:foreign-funcall "getppid" :int)))))
          (/= pid ""))
-        ((Err why)
-         (say (<> "FAIL T31 cannot start a nohup'd command: " why))
-         False)))
-    (and ended started))
-
-  (declare checks (client:Client * String -> List Boolean))
-  (define (checks helper project)
-    (let run = (fn (label command wanted) (check helper project label command wanted)))
-    (make-list
-     (run "A1 cat .env is denied" "cat .env" (Fails "Permission denied"))
-     (run "A1 cat src/a.c succeeds" "cat src/a.c" (Succeeds "int main"))
-     (run "A2 python opens .env" "python3 -c 'print(open(\".env\").read())'"
-          (Fails "PermissionError"))
-     (run "A2 a grandchild is confined" "sh -c 'sh -c \"cat .env\"'" (Fails "Permission denied"))
-     (run "a command gets PATH" "env" (Succeeds "PATH="))
-     (run "no API key reaches a command" "env | grep -c -e OPENAI_API_KEY -e BASH_ENV"
-          (Fails "0"))))
-
-  (declare run-all (client:Client * String * String -> List Boolean))
-  (define (run-all helper project log-file)
-    "A13 first, so no earlier denial can reach its log. A6 ends the helper, so
-it comes last but for A19, whose victim must outlive the helper."
-    (let a13 = (check-a13 helper project log-file))
-    (let rest = (checks helper project))
-    (let victim = (start-a19 helper project))
-    (let a6 = (check-a6 helper project))
-    (let a19 = (and victim (check-a19 project)))
-    (Cons a13 (<> rest (make-list a6 a19))))
-
-  (declare main (Void -> UFix))
-  (define (main)
-    (let project = (lisp (-> String) () (make-project)))
-    (let home = (lisp (-> String) () (cl:or (sb-ext:posix-getenv "HOME") "")))
-    ;; Beside the project, not in it, and not in the user's own log.
-    (let log-file = (<> project ".denials.log"))
-    (let outcome =
-      (do
-       (agent:harden)
-       (let helper = (client:connect 3 (denials:open-log log-file)))
-       (session:start helper project home)
-       (match (lisp (-> (Optional String)) ()
-                (cl:let ((v (sb-ext:posix-getenv "DAKUSUI_CHECK_VICTIMS")))
-                  (cl:if v (coalton (Some (lisp (-> String) () v))) (coalton None))))
-         ((Some victims) (Ok (make-list (check-next-start helper project victims))))
-         ((None)
-          (if (readable? (<> project "/.env"))
-              (Ok (run-all helper project log-file))
-              (Err "the check agent cannot read its own .env"))))))
-    (lisp (-> Unit) (project log-file)
-      (uiop:delete-directory-tree (cl:pathname (cl:format cl:nil "~A/" project))
-                                  :validate cl:t :if-does-not-exist :ignore)
-      (cl:ignore-errors (cl:delete-file log-file))
-      Unit)
-    (match outcome
-      ((Err why)
-       (say (<> "check-agent: " why))
-       1)
-      ((Ok results)
-       (if (list:all id results)
-           (progn (say "check-agent passed: every check held under the real helper") 0)
-           (progn (say "check-agent: failed") 1))))))
+        ((Err why) (verdict False "T31 cannot start a nohup'd command" why))))
+    (and ended started)))

@@ -1,0 +1,260 @@
+(in-package #:dakusui/check-agent)
+
+;;; T22: random policies. The kernel's verdicts must match the reference
+;;; evaluator's. Each policy reads only system directories, so a path in the
+;;; temp tree can match no rule, and then adds random rules over the tree.
+;;;
+;;; T23: torn walks. The enforcer walks a path from the leaf up, reading each
+;;; dentry's parent and then its name. A rename between the two reads could
+;;; join names that were never one path. Readers open the secret under both
+;;; its denied names while a rename moves it between them; no open may succeed.
+
+(cl:defparameter *tree-names* '("dk0" "dk1"))
+(cl:defparameter *file-names* '("f0" "f1"))
+
+(cl:defun tree-dirs (root)
+  "ROOT and its directories, three levels of dk0 and dk1."
+  (cl:let ((dirs (cl:list root))
+           (level (cl:list root)))
+    (cl:dotimes (i 3)
+      (cl:setf level (cl:loop :for d :in level
+                              :append (cl:loop :for n :in *tree-names*
+                                               :collect (cl:format cl:nil "~A/~A" d n))))
+      (cl:setf dirs (cl:append dirs level)))
+    dirs))
+
+(cl:defun tree-files (root)
+  (cl:loop :for d :in (tree-dirs root)
+           :append (cl:loop :for f :in *file-names* :collect (cl:format cl:nil "~A/~A" d f))))
+
+(cl:defun make-tree (root)
+  (cl:dolist (f (tree-files root))
+    (write-text f "x")))
+
+(cl:defun pick (items)
+  (cl:nth (cl:random (cl:length items)) items))
+
+(cl:defun random-rule (root)
+  "A random rule over ROOT: a directory, a file, a string prefix of a name
+that is not a path prefix, or a name rule."
+  (cl:let ((pattern (cl:case (cl:random 10)
+                      ((0 1 2 3) (pick (tree-dirs root)))
+                      ((4 5) (pick (tree-files root)))
+                      (6 (cl:format cl:nil "~A/dk" (pick (tree-dirs root))))
+                      (cl:t (cl:format cl:nil "name:~A"
+                                       (pick (cl:append *tree-names* *file-names*)))))))
+    (cl:format cl:nil "~A ~A ~A"
+               (pick '("allow" "deny"))
+               (pick '("read" "write" "read,write"))
+               pattern)))
+
+(cl:defun random-rules (root)
+  (cl:loop :repeat (cl:1+ (cl:random 6)) :collect (random-rule root)))
+
+(cl:defparameter *probe-modes* '("<" ">>" "<>")
+  "Shell redirections for read, write, and read-write. >> creates nothing,
+since every probed file exists, and writes nothing.")
+
+(cl:defun probe-script (paths modes)
+  (cl:format cl:nil "~{~A~}"
+             (cl:mapcar (cl:lambda (path mode)
+                          (cl:format cl:nil "( : ~A '~A' ) 2>/dev/null && echo 1 || echo 0; "
+                                     (cl:nth mode *probe-modes*) path))
+                        paths modes)))
+
+(cl:defun probe-bits (output)
+  "The verdicts in OUTPUT, one 0 or 1 per line, as booleans."
+  (cl:loop :for line :in (uiop:split-string output :separator '(#\Newline))
+           :for trimmed := (cl:string-trim " " line)
+           :when (cl:string= trimmed "1") :collect cl:t
+           :when (cl:string= trimmed "0") :collect cl:nil))
+
+(cl:defvar *rename-stop* cl:nil)
+(cl:defvar *renamer* cl:nil)
+(cl:defvar *renames* 0)
+
+(cl:defun start-renamer (a b)
+  "Rename A to B and back until told to stop. Mute denials meanwhile."
+  (cl:setf *rename-stop* cl:nil
+           *renames* 0
+           *muted* cl:t
+           *renamer* (sb-thread:make-thread
+                      (cl:lambda ()
+                        (cl:loop :until *rename-stop*
+                                 :do (cffi:foreign-funcall "rename" :string a :string b :int)
+                                     (cffi:foreign-funcall "rename" :string b :string a :int)
+                                     (cl:incf *renames* 2))))))
+
+(cl:defun unmute ()
+  "Stop muting once the helper has pushed every queued event: when the count
+holds still for 300 ms, or after ten seconds."
+  (cl:loop :repeat 100
+           :for before := *muted-events*
+           :do (cl:sleep 0.3)
+           :until (cl:= before *muted-events*))
+  (cl:setf *muted* cl:nil))
+
+(cl:defun stop-renamer (a b)
+  "Stop, leave the secret under its first name A, and give the count."
+  (cl:setf *rename-stop* cl:t)
+  (sb-thread:join-thread *renamer* :default cl:nil)
+  (unmute)
+  (cl:when (cl:probe-file (cl:format cl:nil "~A/f" b))
+    (cffi:foreign-funcall "rename" :string b :string a :int))
+  *renames*)
+
+(coalton-toplevel
+  (declare system-reads (List String))
+  (define system-reads
+    "Enough for sh to start, and nothing in /tmp."
+    (make-list "allow read /usr" "allow read /bin" "allow read /lib" "allow read /lib64"
+               "allow read /etc" "allow read /dev" "allow read /proc" "allow read /sys"
+               "allow write /dev/null"))
+
+  (declare mode-kinds (UFix -> policy:Kinds))
+  (define (mode-kinds mode)
+    (cond
+      ((== mode 0) (policy:Kinds policy:Read Nil))
+      ((== mode 1) (policy:Kinds policy:Write Nil))
+      (True (policy:Kinds policy:Read (make-list policy:Write)))))
+
+  (declare mode-word (UFix -> String))
+  (define (mode-word mode)
+    (cond
+      ((== mode 0) "read")
+      ((== mode 1) "write")
+      (True "read-write")))
+
+  (declare random-case (Ctx * String * UFix -> Result String UFix))
+  (define (random-case c root probes)
+    "One random policy and PROBES random opens. The number that agree with
+the evaluator, or why the case could not run."
+    (let texts = (lisp (-> (List String)) (root) (random-rules root)))
+    (let paths = (lisp (-> (List String)) (root probes)
+                   (cl:loop :repeat probes :collect (pick (tree-files root)))))
+    (let modes = (lisp (-> (List UFix)) (probes)
+                   (cl:loop :repeat probes :collect (cl:random 3))))
+    (do
+     (rules <- (rules-of (<> system-reads texts)))
+     (let pol = (policy:Policy rules))
+     (client:send-policy (.helper c) pol)
+     (o <- (launch:run-command (.helper c) root
+                               (lisp (-> String) (paths modes) (probe-script paths modes))))
+     (let out = (launch:outcome-output o))
+     (let got = (lisp (-> (List Boolean)) (out) (probe-bits out)))
+     (let wanted = (map (fn (pm) (match pm ((Tuple p m) (policy:allows? pol (mode-kinds m) p))))
+                        (list:zip paths modes)))
+     (if (/= (list:length got) (list:length wanted))
+         (Err (<> "the probe printed no verdict for each open: " out))
+         (pure Unit))
+     (let mismatches = (list:filter (fn (row) (match row ((Tuple (Tuple _ k) (Tuple _ e)) (/= k e))))
+                                    (list:zip (list:zip paths got)
+                                              (list:zip modes wanted))))
+     (let _ = (map (fn (row)
+                     (match row
+                       ((Tuple (Tuple p k) (Tuple m e))
+                        (say (mconcat (make-list "FAIL T22 " (mode-word m) " " p ": kernel "
+                                                 (if k "allows" "denies") ", evaluator "
+                                                 (if e "allows" "denies") ", under:"
+                                                 (into #\Newline)
+                                                 (policy:policy-text pol)))))))
+                   mismatches))
+     (pure (- (list:length wanted) (list:length mismatches)))))
+
+  (declare repeat-cases (Ctx * String * UFix * UFix -> Result String UFix))
+  (define (repeat-cases c root n total)
+    "Run N random cases of 4 opens; TOTAL agreed so far."
+    (if (== n 0)
+        (Ok total)
+        (match (random-case c root 4)
+          ((Err why) (Err why))
+          ((Ok k) (repeat-cases c root (- n 1) (+ total k))))))
+
+  (declare check-random (Ctx * session:Session -> Boolean))
+  (define (check-random c s)
+    "T22: 250 policies of 4 opens each, 1,000 cases. Print the seed, so a
+failure can be run again with DAKUSUI_CHECK_SEED."
+    (let root = (in-base c "r"))
+    (let seed = (lisp (-> UFix) (root)
+                  (make-tree root)
+                  (cl:let ((seed (cl:or (cl:ignore-errors
+                                         (cl:parse-integer (sb-ext:posix-getenv "DAKUSUI_CHECK_SEED")))
+                                        (cl:random 1000000 (cl:make-random-state cl:t)))))
+                    (cl:setf cl:*random-state* (sb-ext:seed-random-state seed))
+                    (cl:setf *muted* cl:t)
+                    seed)))
+    (let outcome = (repeat-cases c root 250 0))
+    (lisp (-> Unit) () (unmute) Unit)
+    (let restored = (client:send-policy (.helper c) (session:current-policy s)))
+    (match outcome
+      ((Err why) (verdict False "T22 random policies" (<> "seed " (<> (show-n seed) (<> ": " why)))))
+      ((Ok agreed)
+       (verdict (and (== agreed 1000) (match restored ((Ok _) True) ((Err _) False)))
+                "T22 random policies: the kernel agrees with the evaluator"
+                (mconcat (make-list (show-n agreed) " of 1000 cases, seed " (show-n seed)))))))
+
+  (declare torn-script String)
+  (define torn-script
+    "Open each path in argv[1:3] until argv[3] seconds pass; count the opens
+that succeed, are denied, or find nothing."
+    "import os, sys, time
+paths = sys.argv[1:3]
+end = time.monotonic() + float(sys.argv[3])
+read = denied = missing = 0
+while time.monotonic() < end:
+    for p in paths:
+        try:
+            os.close(os.open(p, os.O_RDONLY))
+            read += 1
+        except PermissionError:
+            denied += 1
+        except (FileNotFoundError, NotADirectoryError):
+            missing += 1
+print('torn', read, denied, missing)
+")
+
+  (declare check-torn (Ctx * session:Session -> Boolean))
+  (define (check-torn c s)
+    "T23: BASE/t/a/s/f is the secret. The agent, not confined, renames
+BASE/t/a/s to BASE/t/b/t and back as fast as it can. Both names are denied.
+A torn walk would see BASE/t/a/t/f or BASE/t/b/s/f, which no rule denies.
+Four confined readers try for five seconds; none may open the secret."
+    (let a = (in-base c "t/a/s"))
+    (let b = (in-base c "t/b/t"))
+    (let script = (in-base c "torn.py"))
+    (let text = torn-script)
+    (let _ = (lisp (-> Unit) (a b script text)
+               (write-text (cl:format cl:nil "~A/f" a) "SECRET")
+               (cl:ensure-directories-exist (cl:format cl:nil "~A/" (cl:subseq b 0 (cl:position #\/ b :from-end cl:t))))
+               (write-text script text)
+               Unit))
+    (let command = (mconcat (make-list "for i in 1 2 3 4; do python3 " script " " a "/f " b
+                                       "/f 5 & done; wait")))
+    (let results =
+      (with-rules c s "T23" (make-list (<> "deny read,write " a) (<> "deny read,write " b))
+        (fn (_)
+          (lisp (-> Unit) (a b) (start-renamer a b) Unit)
+          (let ran = (launch:run-command (.helper c) (.project c) command))
+          (let renames = (lisp (-> UFix) (a b) (stop-renamer a b)))
+          (let output = (match ran ((Ok o) (launch:outcome-output o)) ((Err why) why)))
+          (let counts = (lisp (-> (List UFix)) (output)
+                          (cl:let ((sums (cl:list 0 0 0))
+                                   (lines 0))
+                            (cl:dolist (line (uiop:split-string output :separator '(#\Newline)))
+                              (cl:let ((words (uiop:split-string line :separator '(#\Space))))
+                                (cl:when (cl:and (cl:= 4 (cl:length words))
+                                                 (cl:string= "torn" (cl:first words)))
+                                  (cl:incf lines)
+                                  (cl:loop :for i :from 0 :below 3
+                                           :do (cl:incf (cl:nth i sums)
+                                                        (cl:parse-integer (cl:nth (cl:1+ i) words)))))))
+                            (cl:if (cl:= lines 4) sums cl:nil))))
+          (make-list
+           (match counts
+             ((Cons read (Cons denied (Cons missing (Nil))))
+              (verdict (and (== read 0) (> denied 0))
+                       "T23 concurrent renames never open a denied file"
+                       (mconcat (make-list (show-n renames) " renames; opens: " (show-n read) " read, "
+                                           (show-n denied) " denied, " (show-n missing) " missing"))))
+             (_ (verdict False "T23 concurrent renames" (<> "the readers did not report: " output))))))))
+    (list:all id results)))

@@ -52,12 +52,16 @@
                (:ct-file "main")))
 
 (defsystem "dakusui/check-agent"
-  :description "A stand-in agent that runs A1 and A2 under the real helper.
+  :description "The acceptance harness: a stand-in agent that runs A1 through
+A19, the random-policy test, and the torn-walk test under the real helper.
 Run it with `make attach-check`."
   :depends-on ("coalton" "cffi" "dakusui/policy" "dakusui/agent")
   :defsystem-depends-on ("coalton-asdf")
   :pathname "test/"
-  :components ((:ct-file "check-agent")))
+  :serial t
+  :components ((:ct-file "check-agent")
+               (:ct-file "check-stress")
+               (:ct-file "check-main")))
 
 (defsystem "dakusui/test"
   :description "Unit tests. Run them with `make test`."

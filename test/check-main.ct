@@ -1,0 +1,76 @@
+(in-package #:dakusui/check-agent)
+
+;;; The order of the run. A13 comes first, so no earlier denial can reach its
+;;; log. A6 ends the helper, so it comes last but for A19, whose victim must
+;;; outlive the helper. A second start of the helper, with
+;;; DAKUSUI_CHECK_VICTIMS set, runs the second half of A19 and T31.
+
+(coalton-toplevel
+  (declare run-all (Ctx * session:Session -> List Boolean))
+  (define (run-all c s)
+    (let a13 = (check-a13 c))
+    (let _ = (note-ancestor-rename c s))
+    (let rest =
+      (mconcat
+       (make-list (check-defaults c)
+                  (check-a3 c s)
+                  (check-a4 c s)
+                  (check-links c s)
+                  (check-a7 c s)
+                  (check-a8 c)
+                  (make-list (check-a10 c))
+                  (check-a12 c s)
+                  (check-a14 c s)
+                  (check-a15 c)
+                  (check-a16 c s)
+                  (check-a17 c s)
+                  (check-a18 c s)
+                  (check-spike c)
+                  (make-list (check-random c s)
+                             (check-torn c s)))))
+    (let victim = (start-a19 c))
+    (let a6 = (check-a6 c))
+    (let a19 = (and victim (check-a19 c)))
+    (Cons a13 (<> rest (make-list a6 a19))))
+
+  (declare on-event ((String -> Unit) * String -> Unit))
+  (define (on-event log line)
+    "Log LINE, or only count it while a stress test runs."
+    (if (lisp (-> Boolean) () (cl:and *muted* (cl:incf *muted-events*) cl:t))
+        Unit
+        (log line)))
+
+  (declare main (Void -> UFix))
+  (define (main)
+    (let base = (lisp (-> String) () (make-base)))
+    (let log-file = (<> base "/denials.log"))
+    (let project = (<> base "/p"))
+    (let outcome =
+      (do
+       (agent:harden)
+       (let log = (denials:open-log log-file))
+       (let helper = (client:connect 3 (fn (line) (on-event log line))))
+       (s <- (session:start helper project (<> base "/homelink")))
+       (let c = (Ctx helper base project (<> base "/home") (<> base "/homelink") log-file))
+       (match (lisp (-> (Optional String)) ()
+                (cl:let ((v (sb-ext:posix-getenv "DAKUSUI_CHECK_VICTIMS")))
+                  (cl:if v (coalton (Some (lisp (-> String) () v))) (coalton None))))
+         ((Some victims) (Ok (make-list (check-next-start c victims))))
+         ((None)
+          (if (readable? (<> project "/.env"))
+              (Ok (run-all c s))
+              (Err "the check agent cannot read its own .env"))))))
+    (lisp (-> Unit) (base)
+      (uiop:delete-directory-tree (cl:pathname (cl:format cl:nil "~A/" base))
+                                  :validate cl:t :if-does-not-exist :ignore)
+      Unit)
+    (match outcome
+      ((Err why)
+       (say (<> "check-agent: " why))
+       1)
+      ((Ok results)
+       (if (list:all id results)
+           (progn (say "check-agent passed: every check held under the real helper") 0)
+           (progn (say (<> "check-agent: failed " (<> (show-n (list:length (list:filter not results)))
+                                                       " checks")))
+                  1))))))

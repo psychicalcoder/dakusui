@@ -42,7 +42,7 @@ build/check/dakusui: build/dakusui
 	mkdir -p build/check
 	cp $< $@
 
-build/check/dakusui-agent: $(SOURCES) test/check-agent.ct
+build/check/dakusui-agent: $(SOURCES) test/check-agent.ct test/check-stress.ct test/check-main.ct
 	$(SBCL) --eval '(build-binary "dakusui/check-agent" "$@")'
 
 # Needs sudo for setcap, and the bpffs at /run/dakusui/<uid> (ADR 0008; see

@@ -172,8 +172,11 @@ only: logging is not enforcement.
   an allowed read. It removes the capabilities after the run. It needs `sudo`,
   and, once pinning lands, the bpffs mount. It then grants them to a copy of
   the real helper in `build/check/`, which starts a check agent built from the
-  agent's code. The check agent runs A13, A1, A2, and A6 through the launcher
-  in a temp project. A19 joins it.
+  agent's code. The check agent is the acceptance harness (T21): one check
+  per case, A1 through A19, through the launcher in a temp tree, plus the
+  spike's other cases, the random-policy test (T22), and the torn-walk test
+  (T23). It counts the denials of the two stress tests instead of logging
+  them.
 
 ## Socket protocol
 
@@ -258,9 +261,20 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
   enter it, since `main` turns it off only when it starts. No such error was
   found that an outside process can trigger: a starved address space ends the
   runtime with exit code 1. An SBCL built without `:sb-ldb` would close this.
-- **Torn walks.** The kernel's own path builder retries when a rename races
-  with it; ours does not. A rename needs write access to both paths, so a
-  confined process cannot move a denied file, but review and test this.
+- **Torn walks.** Found by T23. The kernel's own path builder retries when a
+  rename races with it; ours does not. The walk reads a dentry's parent, then
+  its name, so a rename between the two reads joins names that were never one
+  path. T23 denies `t/a/s` and `t/b/t`, renames one to the other and back, and
+  has four confined readers open the secret under both names for five
+  seconds. Result (2026-11-09): fail. Of about 3.5 million opens during 1.09
+  million renames, 11,402 read the secret. Any concurrent rename can open the
+  hole, even one by an unconfined process. A fix is open (spec Q20).
+- **Moved ancestors.** Found while porting the spike. A rule covers a path,
+  not a file, so renaming an ancestor carries a denied directory out from
+  under its rule. Given `deny read,write /x/anc/sub`, a confined `mv /x/anc
+  /x/anc2` succeeds whenever `/x` is writable, and `/x/anc2/sub` is then
+  readable. The default policy has no such directory, but a rule set can make
+  one (spec Q21).
 - **The unflagged launcher.** From its spawn until the helper flags it, the
   launcher runs unconfined. In that window it runs only `/bin/sh` up to its
   `read`, with an absolute path, and the command is still an argument. The
