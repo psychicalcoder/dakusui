@@ -215,7 +215,7 @@ record is too short. Text the kernel gave us that is not UTF-8 shows as ?."
 (cl:defparameter *reasons*
   #("ok" "too many components" "name too long" "path too long"
     "walk step limit" "internal error" "no matching rule" "denied by rule"
-    "always denied")
+    "always denied" "helper gone")
   "Indexed by the ST_ values in bpf/enforce.h.")
 
 (cl:defun u32-at (bytes offset)

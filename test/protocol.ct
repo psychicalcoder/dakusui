@@ -117,6 +117,8 @@
           (protocol:denial-event (record-bytes 42 0 1 7 "cat" "/etc/hostname"))))
   (is (== (Some "{\"event\":\"denial\",\"pid\":7,\"comm\":\"ln\",\"hook\":\"path_link\",\"kind\":\"none\",\"reason\":\"always denied\",\"path\":\"\"}")
           (protocol:denial-event (record-bytes 7 10 0 8 "ln" ""))))
+  (is (== (Some "{\"event\":\"denial\",\"pid\":9,\"comm\":\"cat\",\"hook\":\"file_open\",\"kind\":\"read\",\"reason\":\"helper gone\",\"path\":\"\"}")
+          (protocol:denial-event (record-bytes 9 0 1 9 "cat" ""))))
   (is (== None (protocol:denial-event (make-list 1 2 3)))))
 
 (define-test serve-answers-every-line-and-survives-garbage ()

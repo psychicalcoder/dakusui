@@ -14,7 +14,8 @@
 
 enum { KIND_READ = 1, KIND_WRITE = 2 };
 
-/* Why a request was denied. Everything but the last two fails closed. */
+/* Why a request was denied. ST_DEEP through ST_ERR fail closed on a walk that
+ * went wrong. Never renumber: the helper names each value. */
 enum {
 	ST_OK,
 	ST_DEEP,
@@ -25,6 +26,7 @@ enum {
 	ST_NOMATCH,
 	ST_DENYRULE,
 	ST_ALWAYS, /* hooks that deny every confined caller */
+	ST_GONE,   /* the helper is gone, so nothing is allowed (ADR 0008) */
 };
 
 enum {

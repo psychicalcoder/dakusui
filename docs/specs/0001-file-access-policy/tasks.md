@@ -93,7 +93,7 @@ a task that can run in parallel with the one before it. The spike code in
   no group or other access. Exit with a message that names the path or the
   setting and the install step. (R9) Done when each failed check makes the
   helper exit non-zero before the agent starts.
-- [ ] T27 [P] Add the reason "helper gone" to the enforcer, the denial event,
+- [x] T27 [P] Add the reason "helper gone" to the enforcer, the denial event,
   and the denial log. (R7) Done when the event and log tests cover it.
 - [ ] T28 Check in every hook that the helper lives: pid, start time, and not
   `PF_EXITING`, as in spike 3. The helper writes its pid and opens a file so

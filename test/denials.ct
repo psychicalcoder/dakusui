@@ -7,9 +7,13 @@
 (coalton-toplevel
   (declare event-line (String * String * String * String -> String))
   (define (event-line comm hook kind path)
+    (event-line-for "denied by rule" comm hook kind path))
+
+  (declare event-line-for (String * String * String * String * String -> String))
+  (define (event-line-for reason comm hook kind path)
     (mconcat (make-list "{\"event\":\"denial\",\"pid\":42,\"comm\":" (quoted-json comm)
                         ",\"hook\":\"" hook "\",\"kind\":\"" kind
-                        "\",\"reason\":\"denied by rule\",\"path\":" (quoted-json path) "}")))
+                        "\",\"reason\":\"" reason "\",\"path\":" (quoted-json path) "}")))
 
   (declare quoted-json (String -> String))
   (define (quoted-json text)
@@ -30,6 +34,8 @@
           (denials:denial-text (event-line "sh" "file_open" "read,write" "/p/x"))))
   (is (== (Some "denied path_link by ln (pid 42): denied by rule")
           (denials:denial-text (event-line "ln" "path_link" "none" ""))))
+  (is (== (Some "denied read by cat (pid 42): helper gone")
+          (denials:denial-text (event-line-for "helper gone" "cat" "file_open" "read" ""))))
   (is (== None (denials:denial-text "{\"ok\":true}")))
   (is (== None (denials:denial-text "{\"event\":\"denial\",\"pid\":\"42\"}")))
   (is (== None (denials:denial-text "not json"))))
