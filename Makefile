@@ -45,7 +45,8 @@ build/check/dakusui: build/dakusui
 build/check/dakusui-agent: $(SOURCES) test/check-agent.ct
 	$(SBCL) --eval '(build-binary "dakusui/check-agent" "$@")'
 
-# Needs sudo for setcap. The checks install any policy they like, so they
+# Needs sudo for setcap, and the bpffs at /run/dakusui/<uid> (ADR 0008; see
+# docs/install.md). The checks install any policy they like, so they
 # hold the capabilities only while they run. The helper gets an API key and
 # BASH_ENV, which no command may see. The check agent kills the helper last
 # (A6), so the helper's exit code says nothing: the agent's last line does.

@@ -1,12 +1,13 @@
 (defpackage #:dakusui/enforcer
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:libbpf #:dakusui/libbpf)
+                    (#:pins #:dakusui/pins)
                     (#:policy #:dakusui/policy)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
   (:export #:open-enforcer #:read-lsm-list #:check-lsm #:start
            #:check-capacity #:install-policy #:flag-process
-           #:helper-bytes #:helper-start #:register-helper))
+           #:helper-bytes #:helper-start #:register-helper #:pin-session))
 (in-package #:dakusui/enforcer)
 
 ;;; The enforcer, embedded in the image. (R11)
@@ -97,18 +98,43 @@ does again once we are gone. (R9, ADR 0008)"
          (Err "the enforcer did not record the helper's start time")
          (Ok Unit))))
 
+  (declare pin-session (libbpf:BpfObject * List (Tuple String I32) -> Result String Unit))
+  (define (pin-session obj links)
+    "Pin the confined map, then each of LINKS by its program's name, in a new
+session directory, so the hooks stay attached when we are gone. The map goes
+first: a session with a link pinned always has its map. If any pin fails,
+unpin the rest. (R9, ADR 0008)"
+    (do
+     (dir <- (pins:make-session-dir))
+     (let pinned =
+       (do
+        (confined <- (find-confined obj))
+        (libbpf:obj-pin (libbpf:map-fd confined) (pins:pin-path dir pins:confined-pin))
+        (traverse (fn ((Tuple name fd)) (libbpf:obj-pin fd (pins:pin-path dir name)))
+                  links)))
+     (match pinned
+       ((Ok _) (Ok Unit))
+       ((Err why)
+        (let _ = (pins:remove-session dir))
+        (Err why)))))
+
+  (declare find-confined (libbpf:BpfObject -> Result String libbpf:BpfMap))
+  (define (find-confined obj)
+    (libbpf:find-map obj "confined"))
+
   (declare start (String -> Result String libbpf:BpfObject))
   (define (start lsm-list)
-    "Check LSM-LIST, then load the enforcer, attach every program, and
-register as the live helper. Each failure is an Err that says which step
-failed. (R9)"
+    "Check LSM-LIST, then load the enforcer, attach every program, register as
+the live helper, and pin the session. Each failure is an Err that says which
+step failed. (R9)"
     (do
      (check-lsm lsm-list)
      (match (do
              (obj <- (open-enforcer))
              (libbpf:load-object obj)
-             (libbpf:attach-all obj)
+             (links <- (libbpf:attach-all obj))
              (register-helper obj)
+             (pin-session obj links)
              (pure obj))
        ((Ok obj) (Ok obj))
        ((Err why) (Err (<> "cannot start the enforcer: " why))))))

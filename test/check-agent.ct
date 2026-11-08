@@ -13,8 +13,9 @@
 ;;; A stand-in for dakusui-agent, built from the agent's own code. make
 ;;; attach-check puts it next to a copy of the real helper, which starts it as
 ;;; it starts the real agent. It builds a temp project, sends the default
-;;; policy, and runs A13, A1, A2, and A6 through the launcher. (T17, T18, R1, R7,
-;;; R11) The agent first reads .env itself, so only the policy can deny it.
+;;; policy, and runs A13, A1, A2, A6, and A19 through the launcher. (T17, T18,
+;;; T29, R1, R7, R9, R11) The agent first reads .env itself, so only the policy
+;;; can deny it.
 
 (cl:defun make-project ()
   "A temp project with .env and src/a.c. The agent is not confined."
@@ -119,6 +120,47 @@ refuse, and the command must not run. This ends the helper, so it comes last."
                              (match ran ((Err why) why) ((Ok _) "the command ran")))))
     passed)
 
+  (declare a19-script String)
+  (define a19-script
+    "A19's victim: a confined command in its own session that outlives the
+helper, whose pid is $1. It opens its report, a19, while the helper lives,
+since every open fails once it is gone, and starts sleep for the same reason.
+Then it waits for the helper to go, tries to read src/a.c, and waits on."
+    "exec 5>>a19; sleep 600 & echo \"victim $$ $!\" >&5; while kill -0 \"$1\"; do :; done; if read -r _ < src/a.c; then echo \"a19 read\" >&5; else echo \"a19 denied\" >&5; fi; wait")
+
+  (declare start-a19 (client:Client * String -> Boolean))
+  (define (start-a19 helper project)
+    "Start A19's victim through the launcher, before A6 kills the helper."
+    (let helper-pid = (lisp (-> I32) () (cffi:foreign-funcall "getppid" :int)))
+    (let command =
+      (mconcat (make-list "setsid sh -c '" a19-script "' sh "
+                          (lisp (-> String) (helper-pid) (cl:format cl:nil "~D" helper-pid))
+                          " </dev/null >/dev/null 2>&1 &")))
+    (match (launch:run-command helper project command)
+      ((Err why)
+       (say (<> "FAIL A19 cannot start the victim: " why))
+       False)
+      ((Ok _) True)))
+
+  (declare check-a19 (String -> Boolean))
+  (define (check-a19 project)
+    "The first half of A19: once the helper is gone, the victim's read of
+src/a.c fails. Print the victim's pids, so the second half can check that
+the next start ends them."
+    (let report = (<> project "/a19"))
+    (let lines = (lisp (-> (List String)) (report)
+                   (cl:loop :repeat 300
+                            :for lines := (coalton (log-lines (lisp (-> String) () report)))
+                            :until (cl:find-if (cl:lambda (l) (uiop:string-prefix-p "a19 " l)) lines)
+                            :do (cl:sleep 0.01)
+                            :finally (cl:return lines))))
+    (let passed = (and (list:member "a19 denied" lines) (not (list:member "a19 read" lines))))
+    (let _ = (map (fn (line) (if (string:substring? "victim " line) (say line) Unit)) lines))
+    (say (mconcat (make-list (if passed "ok   " "FAIL ")
+                             "A19 a command that outlives the helper cannot read src/a.c: "
+                             (mconcat (map (fn (line) (<> line "; ")) lines)))))
+    passed)
+
   (declare checks (client:Client * String -> List Boolean))
   (define (checks helper project)
     (let run = (fn (label command wanted) (check helper project label command wanted)))
@@ -134,11 +176,14 @@ refuse, and the command must not run. This ends the helper, so it comes last."
 
   (declare run-all (client:Client * String * String -> List Boolean))
   (define (run-all helper project log-file)
-    "A13 first, so no earlier denial can reach its log, and A6 last."
+    "A13 first, so no earlier denial can reach its log. A6 ends the helper, so
+it comes last but for A19, whose victim must outlive the helper."
     (let a13 = (check-a13 helper project log-file))
     (let rest = (checks helper project))
+    (let victim = (start-a19 helper project))
     (let a6 = (check-a6 helper project))
-    (Cons a13 (<> rest (make-list a6))))
+    (let a19 = (and victim (check-a19 project)))
+    (Cons a13 (<> rest (make-list a6 a19))))
 
   (declare main (Void -> UFix))
   (define (main)
@@ -165,5 +210,5 @@ refuse, and the command must not run. This ends the helper, so it comes last."
        1)
       ((Ok results)
        (if (list:all id results)
-           (progn (say "check-agent passed: A13, A1, A2, and A6 hold under the real helper") 0)
+           (progn (say "check-agent passed: A13, A1, A2, A6, and A19 hold under the real helper") 0)
            (progn (say "check-agent: failed") 1))))))

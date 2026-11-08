@@ -2,6 +2,7 @@
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:libbpf #:dakusui/libbpf)
                     (#:enforcer #:dakusui/enforcer)
+                    (#:pins #:dakusui/pins)
                     (#:spawn #:dakusui/spawn)
                     (#:serve #:dakusui/serve)
                     (#:string #:coalton/string)
@@ -172,9 +173,12 @@ the reason helper gone. Then point it back at us, and the read succeeds."
 
   (declare check-attached (Void -> Result String libbpf:BpfObject))
   (define (check-attached)
-    "The helper's own startup. It fails unless every program attached."
+    "The helper's own startup. It fails unless every program attached and
+pinned, so it needs the bpffs mount."
     (do
      (lsm-list <- (enforcer:read-lsm-list))
+     (enforcer:check-lsm lsm-list)
+     (pins:check-system-pins)
      (obj <- (enforcer:start lsm-list))
      (let attached = (libbpf:program-names obj))
      (check-names "the enforcer holds" attached)

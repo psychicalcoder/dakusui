@@ -50,3 +50,43 @@
   (is (names? "No such file"
               (pins:check-pin-root base uid (pins:read-dir-status (<> base "/none")))))
   (remove-tree base))
+
+;;; T29: session directories. (R9)
+
+(define-test stat-fields-skip-a-tricky-command-name ()
+  (let line = "42 (a) b (c) R 1 42 42 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 98765 1 2")
+  (is (== (Some "R") (>>= (pins:stat-fields line) (fn (fields) (list:index 0 fields)))))
+  (is (== (Some "98765") (>>= (pins:stat-fields line) (fn (fields) (list:index 19 fields)))))
+  (is (== None (pins:stat-fields "no parenthesis"))))
+
+(define-test session-names-round-trip ()
+  (is (== "42-98765" (pins:session-name 42 "98765")))
+  (is (== (Some (Tuple 42 "98765")) (pins:parse-session-name "42-98765")))
+  (is (== None (pins:parse-session-name "42-")))
+  (is (== None (pins:parse-session-name "-1")))
+  (is (== None (pins:parse-session-name "0-5")))
+  (is (== None (pins:parse-session-name "42-98765-1")))
+  (is (== None (pins:parse-session-name "x42-1")))
+  (is (== None (pins:parse-session-name "99999999999-1"))))
+
+(define-test own-session-dir-names-this-process ()
+  (let pid = (lisp (-> I32) () (sb-posix:getpid)))
+  (is (== True
+          (match (pins:own-session-dir)
+            ((Ok dir)
+             (and (string:substring? (<> (pins:pin-root (pins:real-uid)) "/") dir)
+                  (match (pins:parse-session-name
+                          (with-default "" (list:last (string:split #\/ dir))))
+                    ((Some (Tuple p _)) (== p pid))
+                    ((None) False))))
+            ((Err _) False))))
+  (is (== (pins:own-session-dir) (pins:own-session-dir))))
+
+(define-test remove-session-unpins-and-tolerates-what-is-gone ()
+  (let base = (temp-tree (make-list "s") (make-list "s/confined" "s/e_file_open") Nil))
+  (is (== (Ok (make-list "confined" "e_file_open"))
+          (map (fn (names) (list:sort names)) (pins:session-entries (<> base "/s")))))
+  (is (== (Ok Unit) (pins:remove-session (<> base "/s"))))
+  (is (== (Ok Unit) (pins:remove-session (<> base "/s"))))
+  (is (names? "cannot list" (map (const Unit) (pins:session-entries (<> base "/s")))))
+  (remove-tree base))

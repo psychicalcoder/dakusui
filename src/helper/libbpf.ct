@@ -10,6 +10,9 @@
    #:attach-all
    #:BpfMap
    #:find-map
+   #:map-fd
+   #:obj-pin
+   #:obj-get
    #:map-capacity
    #:create-hash-map-like
    #:map-update
@@ -50,6 +53,12 @@
   (prog :pointer))
 (cffi:defcfun ("bpf_program__attach" %attach) :pointer
   (prog :pointer))
+(cffi:defcfun ("bpf_link__fd" %link-fd) :int
+  (link :pointer))
+(cffi:defcfun ("bpf_obj_pin" %obj-pin) :int
+  (fd :int) (path :string))
+(cffi:defcfun ("bpf_obj_get" %obj-get) :int
+  (path :string))
 (cffi:defcfun ("bpf_object__find_map_by_name" %find-map) :pointer
   (obj :pointer) (name :string))
 (cffi:defcfun ("bpf_map__fd" %map-fd) :int
@@ -187,17 +196,35 @@ no open from a path, so the helper reads no object from disk. (R11)"
   (define (program-names obj)
     (map program-name (programs obj)))
 
-  (declare attach-program (Pointer -> Result String String))
+  (declare attach-program (Pointer -> Result String (Tuple String I32)))
   (define (attach-program prog)
     (let name = (program-name prog))
-    (let link = (lisp (-> Pointer) (prog) (%attach prog)))
-    (map (const name) (check-pointer (<> "bpf_program__attach " name) link)))
+    (let call = (<> "bpf_program__attach " name))
+    (let attached = (lisp (-> Pointer) (prog) (%attach prog)))
+    (do
+     (link <- (check-pointer call attached))
+     (fd <- (check-status (<> "bpf_link__fd " name) (lisp (-> I32) (link) (%link-fd link))))
+     (pure (Tuple name fd))))
 
-  (declare attach-all (BpfObject -> Result String (List String)))
+  (declare attach-all (BpfObject -> Result String (List (Tuple String I32))))
   (define (attach-all obj)
-    "Attach every program and return their names. We keep no links, so each
-program stays attached until the process exits."
+    "Attach every program and return each name with its link descriptor. A
+program stays attached while its link is open or pinned."
     (traverse attach-program (programs obj)))
+
+  (declare obj-pin (I32 * String -> Result String Unit))
+  (define (obj-pin fd path)
+    "Pin the map or link FD at PATH in a bpffs, so it outlives every descriptor."
+    (map (const Unit)
+         (check-status (<> "bpf_obj_pin " path)
+                       (lisp (-> I32) (fd path) (%obj-pin fd path)))))
+
+  (declare obj-get (String -> Result String I32))
+  (define (obj-get path)
+    "A new descriptor for the object pinned at PATH. This needs CAP_BPF while
+kernel.unprivileged_bpf_disabled is set."
+    (check-status (<> "bpf_obj_get " path)
+                  (lisp (-> I32) (path) (%obj-get path))))
 
   (declare find-map (BpfObject * String -> Result String BpfMap))
   (define (find-map (BpfObject obj) name)
@@ -210,6 +237,10 @@ program stays attached until the process exits."
                    (lisp (-> UFix) (m) (%key-size m))
                    (lisp (-> UFix) (m) (%value-size m))
                    (lisp (-> UFix) (m) (%max-entries m))))))
+
+  (declare map-fd (BpfMap -> I32))
+  (define (map-fd m)
+    (.fd m))
 
   (declare map-capacity (BpfMap -> UFix))
   (define (map-capacity m)
