@@ -4,6 +4,7 @@
                     (#:client #:dakusui/client)
                     (#:session #:dakusui/session)
                     (#:launch #:dakusui/launch)
+                    (#:denials #:dakusui/denials)
                     (#:string #:coalton/string)
                     (#:list #:coalton/list))
   (:export #:main))
@@ -12,8 +13,8 @@
 ;;; A stand-in for dakusui-agent, built from the agent's own code. make
 ;;; attach-check puts it next to a copy of the real helper, which starts it as
 ;;; it starts the real agent. It builds a temp project, sends the default
-;;; policy, and runs A1 and A2 through the launcher. (T17, R1, R11) The
-;;; agent first reads .env itself, so only the policy can deny it.
+;;; policy, and runs A13, A1, and A2 through the launcher. (T17, T18, R1, R7,
+;;; R11) The agent first reads .env itself, so only the policy can deny it.
 
 (cl:defun make-project ()
   "A temp project with .env and src/a.c. The agent is not confined."
@@ -65,6 +66,36 @@ code 0 and the text in its output, or with another code and the text."
                                 output)))
        passed)))
 
+  (declare log-lines (String -> List String))
+  (define (log-lines path)
+    (lisp (-> (List String)) (path)
+      (cl:with-open-file (in path :if-does-not-exist cl:nil)
+        (cl:if in
+               (cl:loop :for line := (cl:read-line in cl:nil) :while line :collect line)
+               cl:nil))))
+
+  (declare check-a13 (client:Client * String * String -> Boolean))
+  (define (check-a13 helper project log-file)
+    "A denied cat gives one log line naming the process, path, and kind. The
+event comes on the reader thread, so wait for it, then a little more, in case
+a second line follows."
+    (let before = (list:length (log-lines log-file)))
+    (let ran = (launch:run-command helper project "cat .env"))
+    (lisp (-> Unit) (log-file before)
+      (cl:loop :repeat 200
+               :until (cl:> (cl:length (coalton (log-lines (lisp (-> String) () log-file)))) before)
+               :do (cl:sleep 0.01))
+      (cl:sleep 0.3)
+      Unit)
+    (let new = (list:drop before (log-lines log-file)))
+    (let wanted = (mconcat (make-list "denied read of " project "/.env by cat (pid ")))
+    (let passed = (and (== 1 (list:length new))
+                       (string:substring? wanted (with-default "" (list:head new)))
+                       (match ran ((Ok o) (/= 0 (launch:outcome-code o))) ((Err _) False))))
+    (say (mconcat (make-list (if passed "ok   " "FAIL ") "A13 one log line for a denied cat: "
+                             (mconcat (map (fn (line) (<> line "; ")) new)))))
+    passed)
+
   (declare checks (client:Client * String -> List Boolean))
   (define (checks helper project)
     (let run = (fn (label command wanted) (check helper project label command wanted)))
@@ -82,17 +113,20 @@ code 0 and the text in its output, or with another code and the text."
   (define (main)
     (let project = (lisp (-> String) () (make-project)))
     (let home = (lisp (-> String) () (cl:or (sb-ext:posix-getenv "HOME") "")))
+    ;; Beside the project, not in it, and not in the user's own log.
+    (let log-file = (<> project ".denials.log"))
     (let outcome =
       (do
        (agent:harden)
-       (let helper = (client:connect 3 (fn (line) (say (<> "event " line)))))
+       (let helper = (client:connect 3 (denials:open-log log-file)))
        (session:start helper project home)
        (if (readable? (<> project "/.env"))
-           (Ok (checks helper project))
+           (Ok (Cons (check-a13 helper project log-file) (checks helper project)))
            (Err "the check agent cannot read its own .env"))))
-    (lisp (-> Unit) (project)
+    (lisp (-> Unit) (project log-file)
       (uiop:delete-directory-tree (cl:pathname (cl:format cl:nil "~A/" project))
                                   :validate cl:t :if-does-not-exist :ignore)
+      (cl:ignore-errors (cl:delete-file log-file))
       Unit)
     (match outcome
       ((Err why)
@@ -100,5 +134,5 @@ code 0 and the text in its output, or with another code and the text."
        1)
       ((Ok results)
        (if (list:all id results)
-           (progn (say "T17 passed: A1 and A2 hold under the real helper") 0)
+           (progn (say "check-agent passed: A13, A1, and A2 hold under the real helper") 0)
            (progn (say "check-agent: failed") 1))))))

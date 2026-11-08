@@ -1,7 +1,8 @@
 (defpackage #:dakusui/agent
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:client #:dakusui/client)
-                    (#:session #:dakusui/session))
+                    (#:session #:dakusui/session)
+                    (#:denials #:dakusui/denials))
   (:export #:main #:harden))
 (in-package #:dakusui/agent)
 
@@ -51,16 +52,11 @@ memory through /proc. Then keep the helper socket on fd 3 from commands."
     (lisp (-> String) ()
       (cl:or (sb-ext:posix-getenv "HOME") "")))
 
-  (declare show-event (String -> Unit))
-  (define (show-event line)
-    "Until T18 logs denials, show each event as the helper sent it."
-    (complain line))
-
   (declare main (Void -> UFix))
   (define (main)
     (match (do
             (harden)
-            (let helper = (client:connect 3 show-event))
+            (let helper = (client:connect 3 (denials:open-log (denials:log-path))))
             (session:start helper (project-directory) (home-directory)))
       ((Err why)
        (complain why)

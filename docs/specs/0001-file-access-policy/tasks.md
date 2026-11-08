@@ -77,7 +77,7 @@ a task that can run in parallel with the one before it. The spike code in
   it, release it, and pass a scrubbed environment with no API keys. (R1, R11)
   Done when A1 and A2 pass through the real helper binary and a check agent
   built from the agent's code (`make attach-check`).
-- [ ] T18 Log each denial event with the process, path, and access kind. (R7)
+- [x] T18 Log each denial event with the process, path, and access kind. (R7)
   Done when A13 passes: a denied `cat` produces one log line naming the
   process, path, and kind.
 - [ ] T19 Expose the current policy as text for a tool and for the judge.

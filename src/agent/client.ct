@@ -8,8 +8,19 @@
 
 ;;; The agent's end of the socket protocol of spec 0001. (R4, R7)
 ;;;
-;;; Each request waits for its reply. A denial event can come first, so the
-;;; client passes each event line to a handler and keeps reading.
+;;; A reader thread owns the input. It passes each event line to a handler as
+;;; it comes, even while no request is pending, and hands each reply to the
+;;; request that waits for it. Requests take turns, so replies match them in
+;;; order. An SBCL stream is not safe to read and write from two threads at
+;;; once, so the writer has its own stream, on a duplicate of the socket.
+
+(cl:defstruct (conn (:constructor %make-conn))
+  socket input output thread
+  (lock (sb-thread:make-mutex :name "helper replies"))
+  (turn (sb-thread:make-mutex :name "helper requests"))
+  (arrived (sb-thread:make-waitqueue))
+  (replies cl:nil)
+  (closed cl:nil))
 
 (cl:defun reply-of (line)
   "Classify one line from the helper: (:event), (:ok), or (:error text)."
@@ -23,63 +34,99 @@
         ((cl:stringp (get "error")) (cl:list :error (get "error")))
         (cl:t (cl:list :error "the helper sent a reply without \"ok\""))))))
 
-(cl:defun exchange (stream line on-event)
-  "Send LINE on STREAM and read until the reply. Return NIL on success or a
-string that names the problem."
-  (cl:handler-case
-      (cl:progn
-        (cl:write-line line stream)
-        (cl:finish-output stream)
-        (cl:loop
-          (cl:let ((answer (cl:read-line stream cl:nil)))
-            (cl:unless answer
-              (cl:return "the helper closed the socket"))
-            (cl:destructuring-bind (kind cl:&optional why) (reply-of answer)
-              (cl:case kind
-                (:event (cl:funcall on-event answer))
-                (:ok (cl:return cl:nil))
-                (cl:t (cl:return (cl:format cl:nil "the helper refused: ~A" why))))))))
-    (cl:error (e)
-      (cl:let ((cl:*print-pretty* cl:nil))
-        (cl:format cl:nil "the helper socket failed: ~A" e)))))
+(cl:defun read-replies (c on-event)
+  "The reader thread: run until the helper closes its end or the read fails."
+  (cl:loop
+    (cl:let ((line (cl:handler-case (cl:read-line (conn-input c) cl:nil)
+                     (cl:error () cl:nil))))
+      (cl:unless line
+        (sb-thread:with-mutex ((conn-lock c))
+          (cl:setf (conn-closed c) cl:t)
+          (sb-thread:condition-broadcast (conn-arrived c)))
+        (cl:return))
+      (cl:let ((reply (reply-of line)))
+        (cl:if (cl:eq (cl:first reply) :event)
+               ;; A handler error must not stop the replies.
+               (cl:ignore-errors (cl:funcall on-event line))
+               (sb-thread:with-mutex ((conn-lock c))
+                 (cl:setf (conn-replies c) (cl:append (conn-replies c) (cl:list reply)))
+                 (sb-thread:condition-broadcast (conn-arrived c))))))))
+
+(cl:defun make-conn (fd on-event)
+  ;; F_DUPFD_CLOEXEC (1030): the copy stays out of commands too.
+  (cl:let* ((copy (cffi:foreign-funcall "fcntl" :int fd :int 1030 :int 3 :int))
+            (c (%make-conn
+                :socket fd
+                :input (sb-sys:make-fd-stream fd :input cl:t :external-format :utf-8
+                                                 :buffering :full)
+                :output (cl:and (cl:>= copy 0)
+                                (sb-sys:make-fd-stream copy :output cl:t
+                                                            :external-format :utf-8
+                                                            :buffering :full)))))
+    (cl:setf (conn-thread c)
+             (sb-thread:make-thread (cl:lambda () (read-replies c on-event))
+                                    :name "helper reader"))
+    c))
+
+(cl:defun exchange (c line)
+  "Send LINE and wait for its reply. Return NIL on success or a string that
+names the problem."
+  (sb-thread:with-mutex ((conn-turn c))
+    (cl:cond
+      ((cl:null (conn-output c)) "the helper socket failed: cannot duplicate it")
+      ((sb-thread:with-mutex ((conn-lock c)) (conn-closed c)) "the helper closed the socket")
+      (cl:t
+       (cl:or
+        (cl:handler-case
+            (cl:progn
+              (cl:write-line line (conn-output c))
+              (cl:finish-output (conn-output c))
+              cl:nil)
+          (cl:error (e)
+            (cl:let ((cl:*print-pretty* cl:nil))
+              (cl:format cl:nil "the helper socket failed: ~A" e))))
+        (sb-thread:with-mutex ((conn-lock c))
+          (cl:loop :until (cl:or (conn-replies c) (conn-closed c))
+                   :do (sb-thread:condition-wait (conn-arrived c) (conn-lock c)))
+          (cl:if (conn-replies c)
+                 (cl:destructuring-bind (kind cl:&optional why) (cl:pop (conn-replies c))
+                   (cl:if (cl:eq kind :ok)
+                          cl:nil
+                          (cl:format cl:nil "the helper refused: ~A" why)))
+                 "the helper closed the socket")))))))
+
+(cl:defun close-conn (c)
+  "Shut the socket, which ends the reader thread, then close both streams."
+  ;; SHUT_RDWR (2).
+  (cffi:foreign-funcall "shutdown" :int (conn-socket c) :int 2 :int)
+  (sb-thread:join-thread (conn-thread c) :default cl:nil)
+  (cl:ignore-errors (cl:close (conn-input c)))
+  (cl:when (conn-output c)
+    (cl:ignore-errors (cl:close (conn-output c)))))
 
 (coalton-toplevel
-  (repr :native cl:stream)
-  (define-type Stream)
-
-  (define-struct Client
-    "The helper socket, and what to do with each denial event line."
-    (stream Stream)
-    (on-event (String -> Unit)))
+  (repr :native conn)
+  (define-type Client
+    "The helper socket and its reader thread.")
 
   (declare connect (I32 * (String -> Unit) -> Client))
   (define (connect fd on-event)
-    "A client on the socket FD. It owns FD from now on."
-    ;; Without :dual-channel-p, SBCL treats FD as a file, and a write drops
-    ;; the lines it has read ahead, such as a reply or a denial event.
-    (Client (lisp (-> Stream) (fd)
-              (sb-sys:make-fd-stream fd :input cl:t :output cl:t
-                                        :dual-channel-p cl:t
-                                        :external-format :utf-8
-                                        :buffering :full :auto-close cl:t))
-            on-event))
+    "A client on the socket FD, which it owns from now on. ON-EVENT gets each
+event line on the reader thread."
+    (lisp (-> Client) (fd on-event)
+      (make-conn fd (cl:lambda (line) (call-coalton-function on-event line)))))
 
   (declare disconnect (Client -> Unit))
   (define (disconnect c)
-    (let stream = (.stream c))
-    (lisp (-> Unit) (stream)
-      (cl:ignore-errors (cl:close stream))
+    (lisp (-> Unit) (c)
+      (close-conn c)
       Unit))
 
   (declare request (Client * String -> Result String Unit))
   (define (request c line)
-    (let stream = (.stream c))
-    (let on-event = (.on-event c))
     (let outcome =
-      (lisp (-> (Optional String)) (stream line on-event)
-        (cl:let ((why (exchange stream line
-                                (cl:lambda (event)
-                                  (call-coalton-function on-event event)))))
+      (lisp (-> (Optional String)) (c line)
+        (cl:let ((why (exchange c line)))
           (cl:if why
                  (coalton (Some (lisp (-> String) () why)))
                  (coalton None)))))

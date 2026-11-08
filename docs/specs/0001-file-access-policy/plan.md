@@ -78,9 +78,20 @@ replaces the rules of the session's set, resolving each path rule as it comes.
 It records a change only after the helper accepts it, so the policy it shows is
 the one in force.
 
-The client reads the socket only while it waits for a reply, and passes each
-event it reads on the way. T18 must also read events while no request is
-pending.
+A reader thread owns the socket's input. It passes each event to the denial
+log as it comes, and hands each reply to the request waiting for it. Requests
+take turns, so replies match them in order. The writer uses a duplicate of
+fd 3, since an SBCL stream is not safe to read and write from two threads.
+
+The agent logs each denial as one line, on stderr and appended with the time
+to `$XDG_STATE_HOME/dakusui/denials.log` (default `~/.local/state`), where no
+command may write (R7):
+
+    denied read of /p/.env by cat (pid 42): denied by rule
+
+Control characters in the process name or path print as `\xNN`, so a command
+cannot forge a line. If the file cannot be opened, the agent logs to stderr
+only: logging is not enforcement.
 
 ## Build and test
 
@@ -107,8 +118,8 @@ pending.
   binary, loads `enforce.bpf.o`, attaches every program, and runs a denied and
   an allowed read. It removes the capabilities after the run. It needs `sudo`.
   It then grants them to a copy of the real helper in `build/check/`, which
-  starts a check agent built from the agent's code. The check agent runs A1
-  and A2 through the launcher in a temp project.
+  starts a check agent built from the agent's code. The check agent runs A13,
+  A1, and A2 through the launcher in a temp project.
 
 ## Socket protocol
 

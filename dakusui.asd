@@ -44,6 +44,7 @@
   :pathname "src/agent/"
   :serial t
   :components ((:ct-file "client")
+               (:ct-file "denials")
                (:ct-file "session")
                (:ct-file "launch")
                (:ct-file "main")))
@@ -73,4 +74,5 @@ Run it with `make attach-check`."
                (:ct-file "spawn")
                (:ct-file "protocol")
                (:ct-file "session")
-               (:ct-file "launch")))
+               (:ct-file "launch")
+               (:ct-file "denials")))
