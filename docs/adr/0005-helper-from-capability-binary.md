@@ -39,3 +39,8 @@ itself. (Added 2026-11-07, T13.)
 `nosuid` mount. The helper lives and dies with the Dakusui session, so the
 policy does too. The spike showed the two capabilities are enough to load and
 attach every program without `sudo` (`bpfstudy/`).
+
+The helper no longer takes enforcement with it: ADR 0008 pins the enforcer, so
+confined processes stay confined, and are denied everything, after the helper
+ends. `setcap` stays the only `sudo` for running Dakusui; install also adds a
+bpffs mount. (Added 2026-11-08, ADR 0008.)

@@ -149,6 +149,8 @@ enforces the policy, and the user can change it while commands run.
   namespace. No chroot, no private mounts.
 - A bpffs that the user owns is mounted at boot, for the pins of R9. Making it
   needs root once, at install, like the `setcap` of the binary.
+- `kernel.unprivileged_bpf_disabled` is nonzero, so only a process with CAP_BPF
+  can open those pins.
 
 ## Non-goals
 

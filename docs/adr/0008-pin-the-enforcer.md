@@ -22,6 +22,11 @@ can own a bpffs mount (`uid=`, `gid=`, `mode=`). CAP_BPF and CAP_PERFMON
 suffice to pin links and maps there. A hook can see the loader gone through
 `bpf_task_from_pid`, its start time, and `PF_EXITING`.
 
+The pins sit in a directory the user owns, so file permissions do not keep a
+confined command from them. The `bpf()` syscall does: with
+`kernel.unprivileged_bpf_disabled` nonzero, opening a pin needs CAP_BPF, which
+no command holds. It is 1 on the development machine.
+
 ## Decision
 
 We will pin the enforcer in a bpffs that the user owns.
@@ -29,6 +34,8 @@ We will pin the enforcer in a bpffs that the user owns.
 - **Install.** Root adds one mount, made at boot, such as
   `bpffs /run/dakusui/<uid> bpf uid=<uid>,gid=<gid>,mode=0700`. This joins the
   `setcap` step of ADR 0005. Running Dakusui needs no `sudo`.
+- **Unprivileged BPF.** At start, the helper checks that
+  `kernel.unprivileged_bpf_disabled` is nonzero, and exits otherwise (R9).
 - **Each session.** The helper pins its links and maps in a directory of its
   own in that mount, named for its pid and start time. With no such mount, it
   exits before any command runs (R9).
@@ -61,5 +68,7 @@ We will pin the enforcer in a bpffs that the user owns.
   opened before, as R4 allows.
 - Every hook call of a confined process looks the helper up. The cost is a pid
   lookup per call; measure it with the other matching costs.
+- Dakusui requires unprivileged BPF to be disabled. Most distributions
+  default to that, but a user who enabled it cannot run Dakusui.
 - ADR 0005 calls `setcap` the only use of `sudo`. That now holds for running
   Dakusui, not for installing it.

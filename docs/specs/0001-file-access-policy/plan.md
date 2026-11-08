@@ -65,7 +65,8 @@ compiles a policy into map entries.
 
 At start, in this order:
 
-1. Check that `bpf` is in the LSM list, and that the mount below is usable.
+1. Check that `bpf` is in the LSM list, that `kernel.unprivileged_bpf_disabled`
+   is nonzero (ADR 0008), and that the mount below is usable.
 2. Clear stale sessions (below).
 3. Load and attach the programs.
 4. Write the helper's pid to the liveness map, and open a file, so the hook
