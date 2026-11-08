@@ -8,6 +8,7 @@
                     (#:serve #:dakusui/serve)
                     (#:client #:dakusui/client)
                     (#:session #:dakusui/session)
+                    (#:launch #:dakusui/launch)
                     (#:cell #:coalton/cell)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))

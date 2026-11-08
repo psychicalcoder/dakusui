@@ -1,0 +1,95 @@
+(in-package #:dakusui/test)
+
+;;; T17: the launcher. (R1, R11) These run against a fake helper, so nothing
+;;; is confined. They show the order of the steps and what a command inherits.
+;;; make attach-check runs A1 and A2 under the real helper.
+
+(coalton-toplevel
+  (declare set-variable (String * String -> Unit))
+  (define (set-variable name value)
+    (lisp (-> Unit) (name value)
+      (cffi:foreign-funcall "setenv" :string name :string value :int 1 :int)
+      Unit))
+
+  (declare unset-variable (String -> Unit))
+  (define (unset-variable name)
+    (lisp (-> Unit) (name)
+      (cffi:foreign-funcall "unsetenv" :string name :int)
+      Unit))
+
+  (declare exists? (String -> Boolean))
+  (define (exists? path)
+    (lisp (-> Boolean) (path) (cl:and (cl:probe-file path) cl:t)))
+
+  (declare run-with (List String * String * String -> Tuple (Result String launch:Outcome)
+                                                             (List String)))
+  (define (run-with replies directory command)
+    "Run COMMAND against a fake helper that sends REPLIES, then closes when
+there are none. Return the outcome and the requests the helper got."
+    (let fake = (fake-helper replies (list:null? replies)))
+    (let c = (client:connect (.agent fake) ignore-event))
+    (let outcome = (launch:run-command c directory command))
+    (Tuple outcome (requests-of fake c)))
+
+  (declare outcome-or (Result String launch:Outcome -> Tuple I32 String))
+  (define (outcome-or result)
+    (match result
+      ((Ok o) (Tuple (launch:outcome-code o) (launch:outcome-output o)))
+      ((Err why) (Tuple -1 why)))))
+
+(define-test scrub-environment-keeps-only-the-allowlist ()
+  (is (== (make-list "PATH=/bin" "HOME=/h" "LC_ALL=C" "LANG=C.UTF-8" "TERM=xterm")
+          (launch:scrub-environment
+           (make-list "PATH=/bin" "OPENAI_API_KEY=sk-1" "HOME=/h" "LD_PRELOAD=/x.so"
+                      "LC_ALL=C" "BASH_ENV=/x" "ENV=/x" "LANG=C.UTF-8" "MY_TOKEN=t"
+                      "TERM=xterm" "PATHX=/y" "LC" "noequals")))))
+
+(define-test run-command-flags-the-launcher-before-it-runs ()
+  (match (run-with (ok-replies 1) "/" "echo hi; exit 3")
+    ((Tuple (Ok o) requests)
+     (is (== 3 (launch:outcome-code o)))
+     (is (== "hi
+" (launch:outcome-output o)))
+     (is (== (make-list (Ok (protocol:FlagRequest (launch:outcome-pid o))))
+             (policies-of requests))))
+    ((Tuple (Err why) _) (is (== "" why)))))
+
+(define-test run-command-runs-nothing-when-the-flag-fails ()
+  (let base = (temp-tree Nil Nil Nil))
+  (let marker = (<> base "/ran"))
+  (match (run-with (make-list "{\"ok\":false,\"error\":\"no such process\"}") "/"
+                   (<> "touch " marker))
+    ((Tuple result _)
+     (is (== (Err "the command did not run, since it could not be confined: the helper refused: no such process")
+             (map (fn (_) Unit) result)))))
+  (match (run-with Nil "/" (<> "touch " marker))
+    ((Tuple result _)
+     (is (== (Err "the command did not run, since it could not be confined: the helper closed the socket")
+             (map (fn (_) Unit) result)))))
+  (is (not (exists? marker)))
+  (remove-tree base))
+
+(define-test run-command-starts-in-the-directory ()
+  (let base = (temp-tree Nil Nil Nil))
+  (is (== (Tuple 0 (<> base "
+")) (outcome-or (fst (run-with (ok-replies 1) base "pwd")))))
+  (remove-tree base))
+
+(define-test run-command-passes-a-clean-process ()
+  (set-variable "DAKUSUI_TEST_API_KEY" "sk-secret")
+  (set-variable "BASH_ENV" "/nonexistent")
+  (let report = (snd (outcome-or (fst (run-with (ok-replies 1) "/"
+                                                 "grep -E '^Sig(Ign|Blk):' /proc/self/status; ls /proc/self/fd; env")))))
+  (unset-variable "DAKUSUI_TEST_API_KEY")
+  (unset-variable "BASH_ENV")
+  (is (has? report (<> "SigIgn:" (<> tab "0000000000000000"))))
+  (is (has? report (<> "SigBlk:" (<> tab "0000000000000000"))))
+  ;; ls sees 0, 1, 2, and its own directory on 3: not the gate or the socket.
+  (is (== (make-list "0" "1" "2" "3")
+          (list:filter (fn (line) (lisp (-> Boolean) (line)
+                                    (cl:and (cl:plusp (cl:length line))
+                                            (cl:every #'cl:digit-char-p line))))
+                       (string:split #\Newline report))))
+  (is (has? report "PATH="))
+  (is (not (has? report "sk-secret")))
+  (is (not (has? report "BASH_ENV"))))

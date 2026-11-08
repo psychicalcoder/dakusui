@@ -73,9 +73,10 @@ a task that can run in parallel with the one before it. The spike code in
   with an empty set until spec 0004 supplies one, and send it at startup. Resolve
   symlinks in each added rule before recording it. (R4, R13, R14) Done when the
   agent can replace the policy at run time and A17 passes.
-- [ ] T17 Write the launcher: `posix_spawn` a shell that blocks on fd 3, flag
+- [x] T17 Write the launcher: `posix_spawn` a shell that blocks on fd 3, flag
   it, release it, and pass a scrubbed environment with no API keys. (R1, R11)
-  Done when A1 and A2 pass through the real binaries.
+  Done when A1 and A2 pass through the real helper binary and a check agent
+  built from the agent's code (`make attach-check`).
 - [ ] T18 Log each denial event with the process, path, and access kind. (R7)
   Done when A13 passes: a denied `cat` produces one log line naming the
   process, path, and kind.

@@ -72,8 +72,9 @@ enforces the policy, and the user can change it while commands run.
   fails with a permission error. Reading `src/a.c` succeeds.
 - A11 (R3): Given the default policy, when a command reads `/etc/hostname`, then
   it succeeds. Reading `~/.ssh/id_ed25519` or writing `/etc/hostname` fails.
-- A2 (R1): Given a Python script that opens `/etc/shadow`, when the agent runs
-  it, then the open fails.
+- A2 (R1): Given the default policy and a Python script that opens the
+  project's `.env`, which the user can read, when the agent runs it, then the
+  open fails.
 - A3 (R2): Given `allow read /p/a/x` then `deny read /p/a`, when a command opens
   `/p/a/x`, then it fails.
 - A4 (R4): Given a running command, when the user adds an allow rule, then the

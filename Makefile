@@ -36,12 +36,25 @@ build/attach-check: $(SOURCES) test/attach-check.ct build/enforce.bpf.o
 options-check: build
 	sh test/options-check.sh
 
-# Needs sudo for setcap. The check installs any policy it likes, so it holds
-# the capabilities only while it runs.
-attach-check: build/attach-check
+# A copy of the real helper starts the check agent next to it, as it starts
+# dakusui-agent (T17).
+build/check/dakusui: build/dakusui
+	mkdir -p build/check
+	cp $< $@
+
+build/check/dakusui-agent: $(SOURCES) test/check-agent.ct
+	$(SBCL) --eval '(build-binary "dakusui/check-agent" "$@")'
+
+# Needs sudo for setcap. The checks install any policy they like, so they
+# hold the capabilities only while they run. The helper gets an API key and
+# BASH_ENV, which no command may see.
+attach-check: build/attach-check build/check/dakusui build/check/dakusui-agent
 	sudo setcap cap_bpf,cap_perfmon=ep build/attach-check
-	build/attach-check; \
-	status=$$?; sudo setcap -r build/attach-check; exit $$status
+	sudo setcap cap_bpf,cap_perfmon=ep build/check/dakusui
+	build/attach-check && \
+	env OPENAI_API_KEY=attach-check BASH_ENV=/nonexistent build/check/dakusui; \
+	status=$$?; sudo setcap -r build/attach-check; sudo setcap -r build/check/dakusui; \
+	exit $$status
 
 clean:
 	rm -rf build

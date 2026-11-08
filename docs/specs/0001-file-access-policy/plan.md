@@ -106,6 +106,9 @@ pending.
 - **Kernel check.** `make attach-check` grants the capabilities to a check
   binary, loads `enforce.bpf.o`, attaches every program, and runs a denied and
   an allowed read. It removes the capabilities after the run. It needs `sudo`.
+  It then grants them to a copy of the real helper in `build/check/`, which
+  starts a check agent built from the agent's code. The check agent runs A1
+  and A2 through the launcher in a temp project.
 
 ## Socket protocol
 
@@ -142,7 +145,15 @@ launcher with `posix_spawn`:
 3. The agent writes to the pipe. The launcher runs the command, already flagged.
 
 The agent passes the launcher a scrubbed environment, with no API keys. The
-default policy also denies `~/.config/dakusui`, where those keys live.
+default policy also denies `~/.config/dakusui`, where those keys live. The
+environment is an allowlist: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`,
+`TERM`, `LANG`, `LC_*`, `TZ`, and `TMPDIR`.
+
+The launcher starts in the project directory, with stdin from `/dev/null` and
+stdout and stderr on one pipe that the agent reads. Every descriptor from 4 up
+closes, and every signal starts at its default, since SBCL ignores SIGPIPE and
+exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
+3 unwritten, so the launcher's `read` fails and the command never runs.
 
 ## Requirement coverage
 
@@ -182,6 +193,15 @@ default policy also denies `~/.config/dakusui`, where those keys live.
 - **Torn walks.** The kernel's own path builder retries when a rename races
   with it; ours does not. A rename needs write access to both paths, so a
   confined process cannot move a denied file, but review and test this.
+- **The unflagged launcher.** From its spawn until the helper flags it, the
+  launcher runs unconfined. In that window it runs only `/bin/sh` up to its
+  `read`, with an absolute path, and the command is still an argument. The
+  agent and the helper are trusted: whoever controls the agent can change the
+  policy anyway. What the window reads must stay out of a confined command's
+  reach: the environment is an allowlist with no `LD_*`, `ENV`, or `BASH_ENV`,
+  and the loader, libc, and `/bin/sh` are root-owned. A rule that allows writes
+  where the launcher reads, such as `allow write /bin`, reopens the window.
+  Accepted for v0. A fork server, flagged once, would close it.
 - **Known gaps.** Unix sockets (D-Bus, ssh-agent) and other same-user services
   stay reachable. The spec lists network and process limits as non-goals; a
   later spec should cover sockets.

@@ -1,0 +1,104 @@
+(defpackage #:dakusui/check-agent
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:agent #:dakusui/agent)
+                    (#:client #:dakusui/client)
+                    (#:session #:dakusui/session)
+                    (#:launch #:dakusui/launch)
+                    (#:string #:coalton/string)
+                    (#:list #:coalton/list))
+  (:export #:main))
+(in-package #:dakusui/check-agent)
+
+;;; A stand-in for dakusui-agent, built from the agent's own code. make
+;;; attach-check puts it next to a copy of the real helper, which starts it as
+;;; it starts the real agent. It builds a temp project, sends the default
+;;; policy, and runs A1 and A2 through the launcher. (T17, R1, R11) The
+;;; agent first reads .env itself, so only the policy can deny it.
+
+(cl:defun make-project ()
+  "A temp project with .env and src/a.c. The agent is not confined."
+  (cl:let ((base (cffi:with-foreign-string (template "/tmp/dakusui-check-XXXXXX")
+                   (cffi:foreign-string-to-lisp
+                    (cffi:foreign-funcall "mkdtemp" :pointer template :pointer)))))
+    (cl:ensure-directories-exist (cl:format cl:nil "~A/src/" base))
+    (cl:with-open-file (out (cl:format cl:nil "~A/.env" base) :direction :output)
+      (cl:write-line "SECRET=check" out))
+    (cl:with-open-file (out (cl:format cl:nil "~A/src/a.c" base) :direction :output)
+      (cl:write-line "int main(void) { return 0; }" out))
+    base))
+
+(coalton-toplevel
+  (declare say (String -> Unit))
+  (define (say text)
+    (lisp (-> Unit) (text)
+      (cl:write-line text)
+      (cl:finish-output)
+      Unit))
+
+  (declare readable? (String -> Boolean))
+  (define (readable? path)
+    "True if this unconfined process can read PATH."
+    (lisp (-> Boolean) (path)
+      (cl:and (cl:ignore-errors (cl:with-open-file (in path) (cl:read-line in cl:nil ""))) cl:t)))
+
+  (define-type Wanted
+    (Succeeds String)
+    (Fails String))
+
+  (declare check (client:Client * String * String * String * Wanted -> Boolean))
+  (define (check helper project label command wanted)
+    "Run COMMAND in PROJECT, and report whether it ended as WANTED says: with
+code 0 and the text in its output, or with another code and the text."
+    (match (launch:run-command helper project command)
+      ((Err why)
+       (say (mconcat (make-list "FAIL " label ": " why)))
+       False)
+      ((Ok o)
+       (let code = (launch:outcome-code o))
+       (let output = (launch:outcome-output o))
+       (let passed =
+         (match wanted
+           ((Succeeds text) (and (== code 0) (string:substring? text output)))
+           ((Fails text) (and (/= code 0) (string:substring? text output)))))
+       (say (mconcat (make-list (if passed "ok   " "FAIL ") label
+                                (lisp (-> String) (code) (cl:format cl:nil " (exit ~D): " code))
+                                output)))
+       passed)))
+
+  (declare checks (client:Client * String -> List Boolean))
+  (define (checks helper project)
+    (let run = (fn (label command wanted) (check helper project label command wanted)))
+    (make-list
+     (run "A1 cat .env is denied" "cat .env" (Fails "Permission denied"))
+     (run "A1 cat src/a.c succeeds" "cat src/a.c" (Succeeds "int main"))
+     (run "A2 python opens .env" "python3 -c 'print(open(\".env\").read())'"
+          (Fails "PermissionError"))
+     (run "A2 a grandchild is confined" "sh -c 'sh -c \"cat .env\"'" (Fails "Permission denied"))
+     (run "a command gets PATH" "env" (Succeeds "PATH="))
+     (run "no API key reaches a command" "env | grep -c -e OPENAI_API_KEY -e BASH_ENV"
+          (Fails "0"))))
+
+  (declare main (Void -> UFix))
+  (define (main)
+    (let project = (lisp (-> String) () (make-project)))
+    (let home = (lisp (-> String) () (cl:or (sb-ext:posix-getenv "HOME") "")))
+    (let outcome =
+      (do
+       (agent:harden)
+       (let helper = (client:connect 3 (fn (line) (say (<> "event " line)))))
+       (session:start helper project home)
+       (if (readable? (<> project "/.env"))
+           (Ok (checks helper project))
+           (Err "the check agent cannot read its own .env"))))
+    (lisp (-> Unit) (project)
+      (uiop:delete-directory-tree (cl:pathname (cl:format cl:nil "~A/" project))
+                                  :validate cl:t :if-does-not-exist :ignore)
+      Unit)
+    (match outcome
+      ((Err why)
+       (say (<> "check-agent: " why))
+       1)
+      ((Ok results)
+       (if (list:all id results)
+           (progn (say "T17 passed: A1 and A2 hold under the real helper") 0)
+           (progn (say "check-agent: failed") 1))))))

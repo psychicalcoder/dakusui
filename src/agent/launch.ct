@@ -1,0 +1,229 @@
+(defpackage #:dakusui/launch
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:client #:dakusui/client)
+                    (#:list #:coalton/list)
+                    (#:string #:coalton/string))
+  (:export #:Outcome #:outcome-pid #:outcome-code #:outcome-output
+           #:run-command #:scrub-environment #:launcher-script))
+(in-package #:dakusui/launch)
+
+;;; Run a command confined. (R1, R11, plan "Launching a command")
+;;;
+;;; Forking SBCL is unsafe, so posix_spawn a launcher shell that waits on a
+;;; pipe on fd 3. Once the helper has flagged it, write to the pipe, and the
+;;; launcher execs the command. If anything fails first, close the pipe
+;;; unwritten: the launcher's read fails and the command never runs. (R9)
+
+(cl:defconstant +o-cloexec+ #o2000000)
+(cl:defconstant +posix-spawn-setsigdef+ #x04)
+(cl:defconstant +posix-spawn-setsigmask+ #x08)
+
+(cl:defun close-fd (fd)
+  (cffi:foreign-funcall "close" :int fd :int))
+
+(cl:defun make-pipe ()
+  "A close-on-exec pipe as (read write), or NIL."
+  (cffi:with-foreign-object (fds :int 2)
+    (cl:when (cl:zerop (cffi:foreign-funcall "pipe2" :pointer fds :int +o-cloexec+ :int))
+      (cl:list (cffi:mem-aref fds :int 0) (cffi:mem-aref fds :int 1)))))
+
+(cl:defmacro check-zero (what form)
+  `(cl:let ((code ,form))
+     (cl:unless (cl:zerop code)
+       (cl:error "~A: ~A" ,what (sb-int:strerror code)))))
+
+(cl:defun spawn-launcher (directory script command environment)
+  "Spawn /bin/sh running SCRIPT with COMMAND as $1, in DIRECTORY, with only
+ENVIRONMENT. Its fd 3 reads the gate, stdin is /dev/null, and stdout and
+stderr go to one pipe. Every other descriptor closes, and every signal starts
+at its default: SBCL ignores SIGPIPE, and exec would keep that.
+Return (pid gate-write output-read), or a string that names the problem."
+  (cl:let ((gate (make-pipe))
+           (output (make-pipe))
+           (strings cl:nil))
+    (cl:flet ((give-up (why)
+                (cl:dolist (fd (cl:append gate output)) (close-fd fd))
+                (cl:return-from spawn-launcher why))
+              (foreign (s)
+                (cl:let ((p (cffi:foreign-string-alloc s :encoding :utf-8)))
+                  (cl:push p strings)
+                  p)))
+      (cl:unless (cl:and gate output)
+        (give-up (cl:format cl:nil "pipe2: ~A" (sb-int:strerror (sb-alien:get-errno)))))
+      ;; Sizes are glibc's (80, 336, 128 bytes), with room to spare.
+      (cffi:with-foreign-objects ((actions :uint8 512) (attr :uint8 1024)
+                                  (signals :uint8 256) (pid :int))
+        (cl:unwind-protect
+             (cl:handler-case
+                 (cl:let* ((argv-list (cl:list "/bin/sh" "-c" script "sh" command))
+                           (argv (cffi:foreign-alloc :pointer :count (cl:1+ (cl:length argv-list))
+                                                              :initial-element (cffi:null-pointer)))
+                           (envp (cffi:foreign-alloc :pointer :count (cl:1+ (cl:length environment))
+                                                              :initial-element (cffi:null-pointer))))
+                   (cl:push argv strings)
+                   (cl:push envp strings)
+                   (cl:loop :for s :in argv-list :for i :from 0
+                            :do (cl:setf (cffi:mem-aref argv :pointer i) (foreign s)))
+                   (cl:loop :for s :in environment :for i :from 0
+                            :do (cl:setf (cffi:mem-aref envp :pointer i) (foreign s)))
+                   (check-zero "posix_spawn_file_actions_init"
+                               (cffi:foreign-funcall "posix_spawn_file_actions_init" :pointer actions :int))
+                   (check-zero "posix_spawnattr_init"
+                               (cffi:foreign-funcall "posix_spawnattr_init" :pointer attr :int))
+                   (cl:unwind-protect
+                        (cl:progn
+                          ;; glibc clears close-on-exec when the two fds match.
+                          (check-zero "adddup2 gate"
+                                      (cffi:foreign-funcall "posix_spawn_file_actions_adddup2"
+                                                            :pointer actions :int (cl:first gate) :int 3 :int))
+                          (check-zero "addopen /dev/null"
+                                      (cffi:foreign-funcall "posix_spawn_file_actions_addopen"
+                                                            :pointer actions :int 0 :pointer (foreign "/dev/null")
+                                                            :int 0 :unsigned-int 0 :int))
+                          (check-zero "adddup2 stdout"
+                                      (cffi:foreign-funcall "posix_spawn_file_actions_adddup2"
+                                                            :pointer actions :int (cl:second output) :int 1 :int))
+                          (check-zero "adddup2 stderr"
+                                      (cffi:foreign-funcall "posix_spawn_file_actions_adddup2"
+                                                            :pointer actions :int (cl:second output) :int 2 :int))
+                          (check-zero "addclosefrom_np"
+                                      (cffi:foreign-funcall "posix_spawn_file_actions_addclosefrom_np"
+                                                            :pointer actions :int 4 :int))
+                          (check-zero "addchdir_np"
+                                      (cffi:foreign-funcall "posix_spawn_file_actions_addchdir_np"
+                                                            :pointer actions :pointer (foreign directory) :int))
+                          (cffi:foreign-funcall "sigemptyset" :pointer signals :int)
+                          (check-zero "setsigmask"
+                                      (cffi:foreign-funcall "posix_spawnattr_setsigmask"
+                                                            :pointer attr :pointer signals :int))
+                          (cffi:foreign-funcall "sigfillset" :pointer signals :int)
+                          (check-zero "setsigdefault"
+                                      (cffi:foreign-funcall "posix_spawnattr_setsigdefault"
+                                                            :pointer attr :pointer signals :int))
+                          (check-zero "setflags"
+                                      (cffi:foreign-funcall "posix_spawnattr_setflags"
+                                                            :pointer attr
+                                                            :short (cl:logior +posix-spawn-setsigdef+
+                                                                              +posix-spawn-setsigmask+)
+                                                            :int))
+                          (check-zero "posix_spawn /bin/sh"
+                                      (cffi:foreign-funcall "posix_spawn" :pointer pid :string "/bin/sh"
+                                                            :pointer actions :pointer attr
+                                                            :pointer argv :pointer envp :int)))
+                     (cffi:foreign-funcall "posix_spawn_file_actions_destroy" :pointer actions :int)
+                     (cffi:foreign-funcall "posix_spawnattr_destroy" :pointer attr :int))
+                   (close-fd (cl:first gate))
+                   (close-fd (cl:second output))
+                   (cl:list (cffi:mem-ref pid :int) (cl:second gate) (cl:first output)))
+               (cl:error (e)
+                 (give-up (cl:let ((cl:*print-pretty* cl:nil)) (cl:princ-to-string e)))))
+          (cl:dolist (p strings) (cffi:foreign-free p)))))))
+
+(cl:defun open-gate (fd release)
+  "With RELEASE, let the launcher run its command. Either way, close FD."
+  (cl:when release
+    (cffi:with-foreign-string (line (cl:string #\Newline))
+      (cffi:foreign-funcall "write" :int fd :pointer line :size 1 :long)))
+  (close-fd fd))
+
+(cl:defun collect (fd pid)
+  "Read FD to its end, close it, and wait for PID. Return (code text)."
+  (cl:let ((bytes (cl:make-array 0 :element-type '(cl:unsigned-byte 8)
+                                   :adjustable cl:t :fill-pointer 0))
+           (chunk (cl:make-array 65536 :element-type '(cl:unsigned-byte 8))))
+    (cl:loop
+      (cl:let ((n (cffi:with-pointer-to-vector-data (p chunk)
+                    (cffi:foreign-funcall "read" :int fd :pointer p :size 65536 :long))))
+        (cl:cond
+          ((cl:> n 0) (cl:loop :for i :below n :do (cl:vector-push-extend (cl:aref chunk i) bytes)))
+          ((cl:and (cl:< n 0) (cl:= (sb-alien:get-errno) sb-unix:eintr)))
+          (cl:t (cl:return)))))
+    (close-fd fd)
+    (cl:let ((status (cffi:with-foreign-object (s :int)
+                       (cl:loop :for r := (cffi:foreign-funcall "waitpid" :int pid :pointer s :int 0 :int)
+                                :while (cl:and (cl:< r 0) (cl:= (sb-alien:get-errno) sb-unix:eintr)))
+                       (cffi:mem-ref s :int))))
+      (cl:list (cl:if (cl:zerop (cl:logand status #x7f))
+                      (cl:ldb (cl:byte 8 8) status)
+                      (cl:+ 128 (cl:logand status #x7f)))
+               (sb-ext:octets-to-string (cl:coerce bytes '(cl:vector (cl:unsigned-byte 8)))
+                                        :external-format '(:utf-8 :replacement #\?))))))
+
+(coalton-toplevel
+  (define-struct Outcome
+    "How a command ended: its pid, exit code (128 plus the signal that killed
+it), and its stdout and stderr together."
+    (pid I32)
+    (code I32)
+    (output String))
+
+  (declare outcome-pid (Outcome -> I32))
+  (define (outcome-pid o) (.pid o))
+
+  (declare outcome-code (Outcome -> I32))
+  (define (outcome-code o) (.code o))
+
+  (declare outcome-output (Outcome -> String))
+  (define (outcome-output o) (.output o))
+
+  (declare launcher-script String)
+  (define launcher-script
+    "Wait for one line on fd 3, then run $1 without fd 3. If the line never
+comes, read fails and the command does not run."
+    "read _ <&3 && exec sh -c \"$1\" 3<&-")
+
+  (declare allowed-names (List String))
+  (define allowed-names
+    (make-list "PATH" "HOME" "USER" "LOGNAME" "SHELL" "TERM" "LANG" "TZ" "TMPDIR"))
+
+  (declare scrub-environment (List String -> List String))
+  (define (scrub-environment entries)
+    "Keep only the variables a command needs, so no API key reaches it. An
+allowlist, so a key under any name stays out, and so do LD_*, ENV, and
+BASH_ENV, which would run code before the flag. (R11)"
+    (let allowed? =
+      (fn (entry)
+        (match (string:split #\= entry)
+          ((Cons name (Cons _ _))
+           (or (list:member name allowed-names)
+               (match (string:strip-prefix "LC_" name)
+                 ((Some _) True)
+                 ((None) False))))
+          (_ False))))
+    (list:filter allowed? entries))
+
+  (declare environment (Void -> List String))
+  (define (environment)
+    (lisp (-> (List String)) ()
+      (cl:mapcar (cl:lambda (s) (cl:coerce s '(cl:simple-array cl:character (cl:*))))
+                 (sb-ext:posix-environ))))
+
+  (declare run-command (client:Client * String * String -> Result String Outcome))
+  (define (run-command helper directory command)
+    "Run COMMAND with sh in DIRECTORY, confined by the helper. Return how it
+ended, or an error if it could not be confined, in which case it did not run."
+    (let env = (scrub-environment (environment)))
+    (let spawned =
+      (lisp (-> (Result String (Tuple3 I32 I32 I32))) (directory command env launcher-script)
+        (cl:let ((r (spawn-launcher directory launcher-script command env)))
+          (cl:if (cl:stringp r)
+                 (coalton (Err (lisp (-> String) () (cl:format cl:nil "cannot start the launcher: ~A" r))))
+                 (cl:destructuring-bind (pid gate out) r
+                   (coalton (Ok (Tuple3 (lisp (-> I32) () pid)
+                                        (lisp (-> I32) () gate)
+                                        (lisp (-> I32) () out)))))))))
+    (match spawned
+      ((Err why) (Err why))
+      ((Ok (Tuple3 pid gate out))
+       (let flagged = (client:send-flag helper pid))
+       (let release = (match flagged ((Ok _) True) ((Err _) False)))
+       (lisp (-> Unit) (gate release) (open-gate gate release) Unit)
+       (let ended = (lisp (-> (Tuple I32 String)) (out pid)
+                      (cl:destructuring-bind (code text) (collect out pid)
+                        (coalton (Tuple (lisp (-> I32) () code)
+                                        (lisp (-> String) () text))))))
+       (match flagged
+         ((Err why) (Err (<> "the command did not run, since it could not be confined: " why)))
+         ((Ok _)
+          (match ended
+            ((Tuple code text) (Ok (Outcome pid code text))))))))))

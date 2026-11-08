@@ -45,7 +45,16 @@
   :serial t
   :components ((:ct-file "client")
                (:ct-file "session")
+               (:ct-file "launch")
                (:ct-file "main")))
+
+(defsystem "dakusui/check-agent"
+  :description "A stand-in agent that runs A1 and A2 under the real helper.
+Run it with `make attach-check`."
+  :depends-on ("coalton" "cffi" "dakusui/policy" "dakusui/agent")
+  :defsystem-depends-on ("coalton-asdf")
+  :pathname "test/"
+  :components ((:ct-file "check-agent")))
 
 (defsystem "dakusui/test"
   :description "Unit tests. Run them with `make test`."
@@ -63,4 +72,5 @@
                (:ct-file "libbpf")
                (:ct-file "spawn")
                (:ct-file "protocol")
-               (:ct-file "session")))
+               (:ct-file "session")
+               (:ct-file "launch")))
