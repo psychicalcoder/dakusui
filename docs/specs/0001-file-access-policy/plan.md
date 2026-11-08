@@ -213,6 +213,20 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
   and the loader, libc, and `/bin/sh` are root-owned. A rule that allows writes
   where the launcher reads, such as `allow write /bin`, reopens the window.
   Accepted for v0. A fork server, flagged once, would close it.
+- **A late denial line.** The reader thread logs a denial when its event
+  comes, so a command can end before its line appears. To tell the model which
+  access failed (spec 0003), the agent needs a barrier. The kernel submits the
+  record before the command sees `-EACCES`, and the helper drains the ring
+  buffer before it reads a request, so any request after the command ends
+  should get its reply after the event. Untested: it depends on the ring
+  buffer waking the helper in time.
+- **Mixed terminal output.** The reader thread writes denials to stderr. Once
+  the terminal UI (spec 0002) prints from another thread, lines can mix, since
+  SBCL streams are not thread-safe. All terminal output should go through one
+  place.
+- **A shared log file.** Two sessions append to the same `denials.log`. We
+  assume SBCL opens it with `O_APPEND` and writes each line in one call, which
+  keeps lines whole on Linux. Unchecked.
 - **Known gaps.** Unix sockets (D-Bus, ssh-agent) and other same-user services
   stay reachable. The spec lists network and process limits as non-goals; a
   later spec should cover sockets.
