@@ -4,6 +4,7 @@
                     (#:libbpf #:dakusui/libbpf)
                     (#:enforcer #:dakusui/enforcer)
                     (#:pins #:dakusui/pins)
+                    (#:cleanup #:dakusui/cleanup)
                     (#:spawn #:dakusui/spawn)
                     (#:protocol #:dakusui/protocol)
                     (#:serve #:dakusui/serve)

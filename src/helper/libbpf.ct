@@ -13,6 +13,7 @@
    #:map-fd
    #:obj-pin
    #:obj-get
+   #:obj-get-if-pinned
    #:map-capacity
    #:create-hash-map-like
    #:map-update
@@ -237,6 +238,16 @@ kernel.unprivileged_bpf_disabled is set."
                    (lisp (-> UFix) (m) (%key-size m))
                    (lisp (-> UFix) (m) (%value-size m))
                    (lisp (-> UFix) (m) (%max-entries m))))))
+
+  (declare obj-get-if-pinned (String -> Result String (Optional I32)))
+  (define (obj-get-if-pinned path)
+    "obj-get, or None if nothing is pinned at PATH."
+    (let enoent = 2)
+    (let status = (lisp (-> I32) (path) (%obj-get path)))
+    (cond
+      ((== status (negate enoent)) (Ok None))
+      ((< status 0) (failure (<> "bpf_obj_get " path) (negate status)))
+      (True (Ok (Some status)))))
 
   (declare map-fd (BpfMap -> I32))
   (define (map-fd m)

@@ -33,6 +33,7 @@
   :components ((:ct-file "libbpf")
                (:ct-file "pins")
                (:ct-file "enforcer")
+               (:ct-file "cleanup")
                (:ct-file "spawn")
                (:ct-file "protocol")
                (:ct-file "serve")

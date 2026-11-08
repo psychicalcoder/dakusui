@@ -90,3 +90,43 @@
   (is (== (Ok Unit) (pins:remove-session (<> base "/s"))))
   (is (names? "cannot list" (map (const Unit) (pins:session-entries (<> base "/s")))))
   (remove-tree base))
+
+;;; T30: clearing stale sessions, on the paths that need no kernel. make
+;;; attach-check covers zombies, forking, and two helpers at once. (R9)
+
+(coalton-toplevel
+  (declare own-pid (Void -> I32))
+  (define (own-pid)
+    (lisp (-> I32) () (sb-posix:getpid)))
+
+  (declare own-start (Void -> String))
+  (define (own-start)
+    (match (pins:proc-stat-fields "/proc/self/stat")
+      ((Ok fields) (with-default "" (list:index 19 fields)))
+      ((Err _) ""))))
+
+(define-test session-live-only-for-the-same-process ()
+  (is (== True (cleanup:session-live? (own-pid) (own-start))))
+  (is (== False (cleanup:session-live? (own-pid) "0")))
+  (is (== False (cleanup:session-live? 2147483647 (own-start)))))
+
+(define-test clear-session-unpins-a-session-without-its-map ()
+  (let base = (temp-tree (make-list "s") (make-list "s/e_file_open") Nil))
+  (is (== (Ok Unit) (cleanup:clear-session (<> base "/s"))))
+  (is (names? "cannot list" (map (const Unit) (pins:session-entries (<> base "/s")))))
+  (remove-tree base))
+
+(define-test clear-session-keeps-a-map-it-cannot-open ()
+  (let base = (temp-tree (make-list "s") (make-list "s/confined" "s/e_file_open") Nil))
+  (is (names? "bpf_obj_get" (cleanup:clear-session (<> base "/s"))))
+  (is (== (Ok 2) (map list:length (pins:session-entries (<> base "/s")))))
+  (remove-tree base))
+
+(define-test clear-stale-sessions-leaves-live-and-foreign-names ()
+  (let live = (pins:session-name (own-pid) (own-start)))
+  (let stale = (pins:session-name (own-pid) "0"))
+  (let base = (temp-tree (make-list live stale "notes") (make-list (<> stale "/e_file_open")) Nil))
+  (cleanup:clear-stale-sessions base)
+  (is (== (Ok (list:sort (make-list live "notes")))
+          (map list:sort (pins:session-entries base))))
+  (remove-tree base))

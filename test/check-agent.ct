@@ -161,6 +161,42 @@ the next start ends them."
                              (mconcat (map (fn (line) (<> line "; ")) lines)))))
     passed)
 
+  (declare pid-gone? (String -> Boolean))
+  (define (pid-gone? pid)
+    "True once process PID has no task, or only a zombie, within a second."
+    (lisp (-> Boolean) (pid)
+      (cl:loop :repeat 100
+               :for text := (cl:ignore-errors (uiop:read-file-string (cl:format cl:nil "/proc/~A/stat" pid)))
+               :for close := (cl:and text (cl:position #\) text :from-end cl:t))
+               :when (cl:or (cl:null close)
+                            (cl:member (cl:char text (cl:+ 2 close)) '(#\Z #\X)))
+                 :do (cl:return cl:t)
+               :do (cl:sleep 0.01)
+               :finally (cl:return cl:nil))))
+
+  (declare check-next-start (client:Client * String * String -> Boolean))
+  (define (check-next-start helper project victims)
+    "The second half of A19 (T30): this start ended the victims, whose pids
+are VICTIMS. Then, for T31, start a nohup'd command, which the helper's
+normal exit must end, and print its pid and the helper's."
+    (let pids = (list:filter (fn (p) (/= p "")) (string:split #\Space victims)))
+    (let ended = (and (not (list:null? pids)) (list:all pid-gone? pids)))
+    (say (mconcat (make-list (if ended "ok   " "FAIL ")
+                             "A19 the next start ended the victim: " victims)))
+    (let nohup = (launch:run-command helper project "nohup sleep 600 </dev/null >/dev/null 2>&1 & echo $!"))
+    (let started =
+      (match nohup
+        ((Ok o)
+         (let output = (launch:outcome-output o))
+         (let pid = (lisp (-> String) (output) (cl:string-trim '(#\Newline #\Space) output)))
+         (say (<> "nohup " pid))
+         (say (<> "helper " (lisp (-> String) () (cl:format cl:nil "~D" (cffi:foreign-funcall "getppid" :int)))))
+         (/= pid ""))
+        ((Err why)
+         (say (<> "FAIL T31 cannot start a nohup'd command: " why))
+         False)))
+    (and ended started))
+
   (declare checks (client:Client * String -> List Boolean))
   (define (checks helper project)
     (let run = (fn (label command wanted) (check helper project label command wanted)))
@@ -196,9 +232,14 @@ it comes last but for A19, whose victim must outlive the helper."
        (agent:harden)
        (let helper = (client:connect 3 (denials:open-log log-file)))
        (session:start helper project home)
-       (if (readable? (<> project "/.env"))
-           (Ok (run-all helper project log-file))
-           (Err "the check agent cannot read its own .env"))))
+       (match (lisp (-> (Optional String)) ()
+                (cl:let ((v (sb-ext:posix-getenv "DAKUSUI_CHECK_VICTIMS")))
+                  (cl:if v (coalton (Some (lisp (-> String) () v))) (coalton None))))
+         ((Some victims) (Ok (make-list (check-next-start helper project victims))))
+         ((None)
+          (if (readable? (<> project "/.env"))
+              (Ok (run-all helper project log-file))
+              (Err "the check agent cannot read its own .env"))))))
     (lisp (-> Unit) (project log-file)
       (uiop:delete-directory-tree (cl:pathname (cl:format cl:nil "~A/" project))
                                   :validate cl:t :if-does-not-exist :ignore)
@@ -210,5 +251,5 @@ it comes last but for A19, whose victim must outlive the helper."
        1)
       ((Ok results)
        (if (list:all id results)
-           (progn (say "check-agent passed: A13, A1, A2, A6, and A19 hold under the real helper") 0)
+           (progn (say "check-agent passed: every check held under the real helper") 0)
            (progn (say "check-agent: failed") 1))))))

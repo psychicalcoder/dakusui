@@ -46,17 +46,12 @@ build/check/dakusui-agent: $(SOURCES) test/check-agent.ct
 	$(SBCL) --eval '(build-binary "dakusui/check-agent" "$@")'
 
 # Needs sudo for setcap, and the bpffs at /run/dakusui/<uid> (ADR 0008; see
-# docs/install.md). The checks install any policy they like, so they
-# hold the capabilities only while they run. The helper gets an API key and
-# BASH_ENV, which no command may see. The check agent kills the helper last
-# (A6), so the helper's exit code says nothing: the agent's last line does.
+# docs/install.md). The checks install any policy they like, so they hold
+# the capabilities only while they run. test/attach-check.sh says what runs.
 attach-check: build/attach-check build/check/dakusui build/check/dakusui-agent
 	sudo setcap cap_bpf,cap_perfmon=ep build/attach-check
 	sudo setcap cap_bpf,cap_perfmon=ep build/check/dakusui
-	build/attach-check && \
-	{ env OPENAI_API_KEY=attach-check BASH_ENV=/nonexistent build/check/dakusui; true; } \
-	  | tee build/check/report && \
-	grep -q '^check-agent passed' build/check/report; \
+	sh test/attach-check.sh; \
 	status=$$?; sudo setcap -r build/attach-check; sudo setcap -r build/check/dakusui; \
 	exit $$status
 

@@ -3,6 +3,7 @@
   (:local-nicknames (#:libbpf #:dakusui/libbpf)
                     (#:enforcer #:dakusui/enforcer)
                     (#:pins #:dakusui/pins)
+                    (#:cleanup #:dakusui/cleanup)
                     (#:spawn #:dakusui/spawn)
                     (#:serve #:dakusui/serve)
                     (#:string #:coalton/string)
@@ -12,7 +13,7 @@
   (:export #:main))
 (in-package #:dakusui/attach-check)
 
-;;; The check for T8 through T14, and T28. Start the enforcer embedded in this image, then
+;;; The check for T8 through T14, and T28 through T31. Start the enforcer embedded in this image, then
 ;;; run commands confined to show that policies, live swaps (A4), and denial
 ;;; records work. Then start stand-in agents to show the agent holds nothing and
 ;;; the helper serves it. It needs CAP_BPF and CAP_PERFMON, so it runs through
@@ -171,6 +172,112 @@ the reason helper gone. Then point it back at us, and the read succeeds."
         (Err "T28: a confined read failed once the helper map named us again"))
        (True (Ok (say "T28 passed: with the helper gone, a confined read was denied"))))))
 
+  (declare pid-of (Process -> I32))
+  (define (pid-of process)
+    (lisp (-> I32) (process) (sb-ext:process-pid process)))
+
+  (declare gone? (I32 -> Boolean))
+  (define (gone? pid)
+    "True once PID has no task, or only a zombie, within a second."
+    (lisp (-> Boolean) (pid)
+      (cl:loop :repeat 100
+               :for state := (dakusui/cleanup::task-state (cl:format cl:nil "/proc/~D/stat" pid))
+               :when (cl:or (cl:null state) (cl:member state '(#\Z #\X)))
+                 :do (cl:return cl:t)
+               :do (cl:sleep 0.01)
+               :finally (cl:return cl:nil))))
+
+  (declare entries (String -> List String))
+  (define (entries dir)
+    (match (pins:session-entries dir)
+      ((Ok names) names)
+      ((Err _) Nil)))
+
+  (declare fake-session (String * String * List (Tuple String I32) -> Result String String))
+  (define (fake-session root start pinned)
+    "A session named for our pid but START, so it looks stale: its helper is
+gone. Pin each descriptor in PINNED under its name."
+    (let pid = (lisp (-> I32) () (sb-posix:getpid)))
+    (let dir = (pins:pin-path root (pins:session-name pid start)))
+    (do
+     (lisp (-> (Result String Unit)) (dir)
+       (cl:handler-case (cl:progn (sb-posix:mkdir dir #o700) (coalton (Ok Unit)))
+         (cl:error (e)
+           (cl:let ((why (cl:princ-to-string e)))
+             (coalton (Err (lisp (-> String) () why)))))))
+     (traverse (fn ((Tuple name fd)) (libbpf:obj-pin fd (pins:pin-path dir name))) pinned)
+     (pure dir)))
+
+  (declare in-threads (List (Void -> Result String Unit) -> List (Result String Unit)))
+  (define (in-threads thunks)
+    "Run each thunk in its own thread at once, and wait for them all."
+    (lisp (-> (List (Result String Unit))) (thunks)
+      (cl:mapcar #'sb-thread:join-thread
+                 (cl:mapcar (cl:lambda (thunk)
+                              (sb-thread:make-thread
+                               (cl:lambda () (call-coalton-function thunk))))
+                            thunks))))
+
+  (declare check-cleanup (libbpf:BpfObject -> Result String Unit))
+  (define (check-cleanup obj)
+    "T30 (R9): stale sessions are cleared. A fake session pins our own
+confined map, which flags a zombie whose unconfined parent never reaps it,
+and a shell that keeps forking. Two threads clear it at once, as two helpers
+starting together would. Two partial sessions, one with only a stand-in link
+and one empty, go too."
+    (let root = (pins:pin-root (pins:real-uid)))
+    (let zombie-parent =
+      (start-shell "d=$(mktemp -d); mkfifo \"$d/z\"; (read _ < \"$d/z\"; exit 0) & echo $!; echo \"$d\"; exec sleep 600" ""))
+    (do
+     (confined <- (libbpf:find-map obj "confined"))
+     (denials <- (libbpf:find-map obj "denials"))
+     ;; The zombie: flag the child, then let it exit unreaped.
+     (let child = (lisp (-> I32) (zombie-parent)
+                    (cl:or (cl:parse-integer (coalton (read-reply (lisp (-> Process) () zombie-parent)))
+                                             :junk-allowed cl:t)
+                           0)))
+     (let fifo-dir = (read-reply zombie-parent))
+     (enforcer:flag-process obj child)
+     (let _ = (lisp (-> Unit) (fifo-dir)
+                (cl:ignore-errors
+                 (cl:with-open-file (out (cl:format cl:nil "~A/z" fifo-dir)
+                                         :direction :output :if-exists :append)
+                   (cl:write-line "go" out)))
+                (uiop:run-program (cl:list "rm" "-rf" "--" fifo-dir) :ignore-error-status cl:t)
+                Unit))
+     (let forker = (start-shell "read _ && while :; do sleep 100 & sleep 0.01; done" ""))
+     (flag obj forker)
+     (let _ = (send-line forker))
+     (let _ = (lisp (-> Unit) () (cl:sleep 0.2) Unit))
+     (let zombie-ready = (lisp (-> Boolean) (child)
+                           (cl:eql #\Z (dakusui/cleanup::task-state
+                                         (cl:format cl:nil "/proc/~D/stat" child)))))
+     (stale <- (fake-session root "0" (make-list (Tuple pins:confined-pin (libbpf:map-fd confined)))))
+     (partial <- (fake-session root "1" (make-list (Tuple "e_file_open" (libbpf:map-fd denials)))))
+     (empty <- (fake-session root "2" Nil))
+     (let cleared = (in-threads (make-list (fn () (cleanup:clear-session stale))
+                                           (fn () (cleanup:clear-session stale)))))
+     (let _ = (cleanup:clear-stale-sessions root))
+     (let left = (entries root))
+     (let gone = (fn (dir) (not (list:any (fn (name) (string:substring? name dir)) left))))
+     (let forker-gone = (gone? (pid-of forker)))
+     (let _ = (lisp (-> Unit) (zombie-parent forker)
+                (sb-ext:process-kill zombie-parent 9)
+                (sb-ext:process-wait zombie-parent)
+                (sb-ext:process-wait forker)
+                Unit))
+     (cond
+       ((not (list:all (fn (r) (== r (Ok Unit))) cleared))
+        (Err (<> "T30: a clearing thread failed: "
+                 (mconcat (map (fn (r) (match r ((Ok _) "ok; ") ((Err why) (<> why "; ")))) cleared)))))
+       ((not zombie-ready)
+        (Err "T30: the flagged child was no zombie before cleanup, so the check proves nothing"))
+       ((not forker-gone)
+        (Err "T30: the forking shell outlived cleanup"))
+       ((not (list:all gone (make-list stale partial empty)))
+        (Err (<> "T30: a stale session is still pinned: " (mconcat (map (fn (n) (<> n " ")) left)))))
+       (True (Ok (say "T30 passed: stale sessions were cleared, with a zombie, a forker, and two clearers"))))))
+
   (declare check-attached (Void -> Result String libbpf:BpfObject))
   (define (check-attached)
     "The helper's own startup. It fails unless every program attached and
@@ -179,6 +286,7 @@ pinned, so it needs the bpffs mount."
      (lsm-list <- (enforcer:read-lsm-list))
      (enforcer:check-lsm lsm-list)
      (pins:check-system-pins)
+     (let _ = (cleanup:clear-stale-sessions (pins:pin-root (pins:real-uid))))
      (obj <- (enforcer:start lsm-list))
      (let attached = (libbpf:program-names obj))
      (check-names "the enforcer holds" attached)
@@ -321,8 +429,11 @@ garbage, a policy, and a flag for its child, which a denial event then reports."
       (do
        (obj <- (check-attached))
        (check-enforced obj)
+       (check-cleanup obj)
        (check-agent-start)
        (check-served obj)))
+    ;; T31: a normal exit clears our own session.
+    (cleanup:clear-own-session)
     (match outcome
       ((Ok _)
        (say "attach-check: passed")
