@@ -39,10 +39,13 @@
 
 (defsystem "dakusui/agent"
   :description "The dakusui-agent binary: runs the LLM loop and owns the policy."
-  :depends-on ("coalton" "cffi" "dakusui/policy")
+  :depends-on ("coalton" "cffi" "com.inuoe.jzon" "dakusui/policy")
   :defsystem-depends-on ("coalton-asdf")
   :pathname "src/agent/"
-  :components ((:ct-file "main")))
+  :serial t
+  :components ((:ct-file "client")
+               (:ct-file "session")
+               (:ct-file "main")))
 
 (defsystem "dakusui/test"
   :description "Unit tests. Run them with `make test`."
@@ -59,4 +62,5 @@
                (:ct-file "compile")
                (:ct-file "libbpf")
                (:ct-file "spawn")
-               (:ct-file "protocol")))
+               (:ct-file "protocol")
+               (:ct-file "session")))

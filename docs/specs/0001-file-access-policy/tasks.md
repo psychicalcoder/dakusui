@@ -68,7 +68,7 @@ a task that can run in parallel with the one before it. The spike code in
 
 ## Phase 4: Agent side
 
-- [ ] T16 Write the protocol client and keep the ordered policy in the agent.
+- [x] T16 Write the protocol client and keep the ordered policy in the agent.
   Resolve symlinks in the project and home directories, build the session policy
   with an empty set until spec 0004 supplies one, and send it at startup. Resolve
   symlinks in each added rule before recording it. (R4, R13, R14) Done when the

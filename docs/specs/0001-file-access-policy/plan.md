@@ -70,6 +70,18 @@ inherits the flag.
 Owns the ordered policy, exposes it through a `show_policy` tool (R8) and to
 the judge, and runs commands through the launcher.
 
+The project directory is the directory Dakusui starts in, and the home
+directory is `$HOME`. The agent resolves both with `realpath` before it builds
+the session policy (R13). For a path that does not exist yet, it resolves the
+longest part that does and keeps the rest. The agent adds, removes, and
+replaces the rules of the session's set, resolving each path rule as it comes.
+It records a change only after the helper accepts it, so the policy it shows is
+the one in force.
+
+The client reads the socket only while it waits for a reply, and passes each
+event it reads on the way. T18 must also read events while no request is
+pending.
+
 ## Build and test
 
 `dakusui.asd` defines `dakusui/policy`, `dakusui/helper`, `dakusui/agent`, and

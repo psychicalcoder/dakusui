@@ -1,5 +1,7 @@
 (defpackage #:dakusui/agent
   (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:client #:dakusui/client)
+                    (#:session #:dakusui/session))
   (:export #:main #:harden))
 (in-package #:dakusui/agent)
 
@@ -33,9 +35,33 @@ memory through /proc. Then keep the helper socket on fd 3 from commands."
            (refuse "no helper socket on fd 3; start dakusui instead. fcntl"))
           (cl:t (coalton (Ok Unit)))))))
 
+  (declare project-directory (Void -> String))
+  (define (project-directory)
+    "The directory the user started Dakusui in."
+    (lisp (-> String) ()
+      (cl:let ((p (cffi:foreign-funcall "getcwd" :pointer (cffi:null-pointer)
+                                        :size 0 :pointer)))
+        (cl:if (cffi:null-pointer-p p)
+               ""
+               (cl:unwind-protect (cffi:foreign-string-to-lisp p)
+                 (cffi:foreign-free p))))))
+
+  (declare home-directory (Void -> String))
+  (define (home-directory)
+    (lisp (-> String) ()
+      (cl:or (sb-ext:posix-getenv "HOME") "")))
+
+  (declare show-event (String -> Unit))
+  (define (show-event line)
+    "Until T18 logs denials, show each event as the helper sent it."
+    (complain line))
+
   (declare main (Void -> UFix))
   (define (main)
-    (match (harden)
+    (match (do
+            (harden)
+            (let helper = (client:connect 3 show-event))
+            (session:start helper (project-directory) (home-directory)))
       ((Err why)
        (complain why)
        1)

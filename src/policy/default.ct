@@ -58,3 +58,23 @@ a confined command cannot change the stored rule sets. (R14, R11)"
            (make-list rules
                       set-rules
                       (make-list (Rule Deny (Kinds Write Nil) rule-sets)))))))))))
+
+;;; Symlinks. (R13)
+;;;
+;;; The enforcer matches real paths. The caller resolves a path, since that
+;;; needs the file system, and this library checks that the result is still a
+;;; path a rule can name.
+
+(coalton-toplevel
+  (declare resolve-rule ((String -> String) * Rule -> Result String Rule))
+  (define (resolve-rule resolve r)
+    "The rule R with its path passed through RESOLVE. A name rule has no path."
+    (match r
+      ((Rule effect kinds (PathPrefix path))
+       (let real = (resolve path))
+       (map (fn (pat) (Rule effect kinds pat))
+            (result:map-err (fn (message)
+                              (mconcat (make-list "cannot resolve " (quoted path)
+                                                  ": " message)))
+                            (parse-path real real))))
+      (_ (Ok r)))))

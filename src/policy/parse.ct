@@ -144,3 +144,19 @@
         (pure (Rule e k p))))
       (_ (complain "bad rule" line
                    "expected three fields: effect, kinds, pattern")))))
+
+;;; The text form of a pattern, the inverse of parse-pattern. The agent sends
+;;; patterns to the helper this way. (R10)
+
+(coalton-toplevel
+  (declare escape (String -> String))
+  (define (escape text)
+    (into (list:concatmap (fn (c) (if (escapable? c) (make-list #\\ c) (make-list c)))
+                          (the (List Char) (into text)))))
+
+  (declare pattern-text (Pattern -> String))
+  (define (pattern-text pat)
+    "PAT as rule text: parse-pattern gives PAT back."
+    (match pat
+      ((PathPrefix path) (escape path))
+      ((FileName name) (string:concat "name:" (escape name))))))

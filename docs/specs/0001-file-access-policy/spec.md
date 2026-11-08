@@ -15,7 +15,7 @@ enforces the policy, and the user can change it while commands run.
 - R2: The policy MUST be an ordered list of rules. The last matching rule
   decides. With no match, the access is denied.
 - R3: The default policy MUST be the rules below, in this order, where `P` is
-  the project directory. Users edit it from there.
+  the project directory. Users override it with a rule set (R14).
 
   ```
   allow read        /
@@ -29,9 +29,10 @@ enforces the policy, and the user can change it while commands run.
   deny  read,write  ~/.config/dakusui
   deny  read,write  name:.env
   ```
-- R4: The user MUST be able to add and remove rules while commands run. A change
-  takes effect on the next open or path operation. A descriptor that is already
-  open keeps working.
+- R4: The user MUST be able to add and remove rules of the session's rule set
+  (R14) while commands run. The rules of R3 cannot be removed, but a set's rule
+  can override them. A change takes effect on the next open or path operation.
+  A descriptor that is already open keeps working.
 - R5: Rules MUST distinguish two access kinds, read and write. Executing a file
   and listing a directory count as read. Creating, deleting, renaming, and
   truncating count as write.
