@@ -11,7 +11,9 @@ capabilities, loads a BPF LSM program, and owns its maps. The `dakusui-agent`
 runs the LLM loop and owns the policy. The agent sends the policy to the
 helper, which compiles it into a map and swaps it in at once. Before each
 command runs, the helper flags the command's process. The kernel then checks
-every file operation of flagged processes (ADRs 0002, 0004, 0005, 0006).
+every file operation of flagged processes (ADRs 0002, 0004, 0005, 0006, 0007).
+The helper pins the enforcer, so enforcement outlives it: if the helper ends,
+confined processes are denied everything (ADR 0008).
 
 ## Parts
 
@@ -27,6 +29,15 @@ every file operation of flagged processes (ADRs 0002, 0004, 0005, 0006).
 - Over the limits (32 components, 63 bytes per component, 190 bytes before the
   last component), deny and log. Failing closed is safer than guessing. The
   compiler rejects a rule beyond these limits, because it could never match.
+- The helper pins the links in bpffs, so when the helper crashes, confined
+  processes stay confined.
+- Each hook first checks that the helper lives. A one-entry map holds the helper's
+  pid, which the helper writes, and its start time, which the program records the
+  first time the helper enters a hook. The hook looks the pid up with
+  `bpf_task_from_pid`. If the task is gone, has another start time, or has PF_EXITING
+  set, the hook denies, with the reason "helper gone". An unset start time denies
+  too. The helper exits before starting the agent if the start time was never
+  recorded (R9).
 
 **2. Rule map**
 
@@ -52,18 +63,50 @@ compiles a policy into map entries.
 
 **4. Helper** (`dakusui`, Coalton with CFFI to libbpf)
 
-At start: check that `bpf` is in the LSM list, load and attach the programs,
-create the socketpair, fork. The child puts its end of the socketpair on fd 3,
-marks every other descriptor close-on-exec, sets `no_new_privs`, clears its
-capabilities, and execs `dakusui-agent`. Exec resets the dumpable flag, so the
+At start, in this order:
+
+1. Check that `bpf` is in the LSM list, and that the mount below is usable.
+2. Clear stale sessions (below).
+3. Load and attach the programs.
+4. Write the helper's pid to the liveness map, and open a file, so the hook
+   records the helper's start time.
+5. Pin every link and the `confined` map.
+6. Check that the start time was recorded.
+7. Create the socketpair and fork the agent.
+
+If any step fails, exit before the agent starts (R9). The child puts its end
+of the socketpair on fd 3, marks every other descriptor close-on-exec, sets
+`no_new_privs`, clears its capabilities, and execs `dakusui-agent`. Exec resets the dumpable flag, so the
 agent makes itself non-dumpable, and marks fd 3 close-on-exec so commands do
-not inherit it. If any step fails, exit (R9). Then serve the socket.
+not inherit it. Then serve the socket.
 
 The child keeps the bounding set. Dropping it needs CAP_SETPCAP, which the
 helper lacks. It would stop an exec of a file with capabilities, such as
 `dakusui` itself, from granting them. Under `no_new_privs` an exec grants
 nothing beyond what the process holds, which is nothing, and every descendant
 inherits the flag.
+
+The helper pins in `/run/dakusui/<uid>`, where `<uid>` is its real uid. Install
+adds a mount entry, and boot makes the mount; `/run/dakusui` must exist first,
+made at boot too. The path is fixed: the capability-bearing binary takes no
+input that could name it. At start, the helper checks that the path is a bpffs
+owned by that uid, with no group or other access, and exits otherwise (R9).
+
+Each session pins into `/run/dakusui/<uid>/<pid>-<start>/`, named for the
+helper's pid and its start time from `/proc/<pid>/stat`, so a later helper can
+tell a dead session from a live one. The hooks' liveness check uses the
+kernel's own `start_time` instead; each side uses its own unit. The session
+pins one link per program and the `confined` map, which cleanup needs, and
+nothing else. The helper pins every link before it starts the agent.
+
+At start, the helper clears every stale session in its mount: one whose helper
+is gone or has another start time. It opens the session's `confined` map, walks
+`/proc`, and kills each live, non-zombie process the map flags, through a pidfd.
+It repeats until a pass finds none, then unpins the session. If 100 passes do
+not clear it, it keeps the pins, warns, and starts anyway: the processes stay
+denied everything. At a normal exit, the helper clears its own session the
+same way, so only a crash leaves pins behind. No session is unpinned while a
+task it confines lives (R9).
 
 **5. Agent** (`dakusui-agent`, Coalton)
 
@@ -115,12 +158,15 @@ only: logging is not enforcement.
 - **Embedded enforcer.** Loading `dakusui/helper` reads `build/enforce.bpf.o`
   into the image, and libbpf opens it from memory. The library binds no open
   from a path, so the helper cannot read an object from disk (R11).
+- **Install.** Root grants the capabilities with `setcap` (ADR 0005) and adds
+  the bpffs mount entry for each user (ADR 0008). Running Dakusui needs neither.
 - **Kernel check.** `make attach-check` grants the capabilities to a check
   binary, loads `enforce.bpf.o`, attaches every program, and runs a denied and
-  an allowed read. It removes the capabilities after the run. It needs `sudo`.
-  It then grants them to a copy of the real helper in `build/check/`, which
-  starts a check agent built from the agent's code. The check agent runs A13,
-  A1, and A2 through the launcher in a temp project.
+  an allowed read. It removes the capabilities after the run. It needs `sudo`,
+  and, once pinning lands, the bpffs mount. It then grants them to a copy of
+  the real helper in `build/check/`, which starts a check agent built from the
+  agent's code. The check agent runs A13, A1, A2, and A6 through the launcher
+  in a temp project. A19 through A21 join it.
 
 ## Socket protocol
 
@@ -134,8 +180,8 @@ One JSON object per line. The agent sends a request; the helper answers.
 The helper also pushes
 `{"event":"denial","pid":1,"comm":"cat","hook":"file_open","kind":"read","reason":"denied by rule","path":"..."}`.
 `kind` is `read`, `write`, `read,write`, or `none` for a hook that denies every
-confined caller. `reason` tells a rule's denial from a missing match or a limit
-of the walk. The agent logs each one (R7). Replies come in the order of the
+confined caller. `reason` tells a rule's denial from a missing match, a limit
+of the walk, or "helper gone". The agent logs each one (R7). Replies come in the order of the
 requests, but an event can come before any reply, so the agent tells the two
 apart by the `event` field.
 
@@ -143,7 +189,8 @@ The helper parses each line with jzon (strict JSON, depth limit 8) into a typed
 request. A pattern uses the rule text's escapes (R10). Unknown ops and unknown
 fields are errors. Any line that fails, including one over 1 MiB or not UTF-8,
 gets `{"ok":false,"error":"..."}` naming the problem. The helper serves until
-the agent closes its end, then waits for it and exits with its code.
+the agent closes its end, then waits for it, clears its own session, and exits
+with the agent's code.
 
 ## Launching a command
 
@@ -177,9 +224,12 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
 - R7: `denials` ring buffer and the pushed event.
 - R8: `show_policy` tool.
 - R9: helper exits on any startup failure; the agent refuses to run commands if
-  the socket closes.
+  the socket closes; pinned links, the liveness check, and cleanup keep
+  leftover processes denied (ADR 0008, A19).
 - R11: ADR 0005 plus the `ptrace_access_check` hook.
 - R12: `userns_create` denial.
+- R15: not yet planned. The spec requires it (A20, A21); the plan for signals
+  and Unix sockets is still open.
 
 ## Alternatives rejected
 
@@ -228,17 +278,26 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
 - **A shared log file.** Two sessions append to the same `denials.log`. We
   assume SBCL opens it with `O_APPEND` and writes each line in one call, which
   keeps lines whole on Linux. Unchecked.
-- **Known gaps.** Unix sockets (D-Bus, ssh-agent) and other same-user services
-  stay reachable. The spec lists network and process limits as non-goals; a
-  later spec should cover sockets.
+- **Pins left by a crash.** A crashed session keeps its programs attached, and
+  they run on every file operation on the machine until the next start clears
+  them.
+- **Liveness cost.** Each hook call of a confined process looks the helper up
+  by pid. Unmeasured: compare it with the matching costs above.
+- **Cleanup that gives up.** After 100 passes, a session stays pinned with its
+  processes denied everything. Safe, but they linger until a later start.
+- **R15 not yet planned.** Signals and Unix sockets to unconfined processes
+  stay open until it is. Loopback networking is Q19.
 
 ## Testing
 
 - **Policy library:** unit tests for parsing, last-match order (A3), name rules,
   and compilation, against the reference evaluator.
 - **Enforcer:** an integration harness that builds a temp tree and runs shell
-  and Python snippets confined. One test per acceptance case A1 through A10.
+  and Python snippets confined. One test per acceptance case, A1 through A21.
   A random-policy test compares the kernel's verdicts with the reference
   evaluator.
+- **Cleanup:** a zombie in the flag map, a process that keeps forking, two
+  helpers starting at once, and a partial session left by a crash during
+  pinning.
 - **Environment:** needs the `setcap` binary and a BPF LSM kernel, so these
   tests run locally, not in generic CI.
