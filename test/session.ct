@@ -48,6 +48,15 @@ of a link and its target. Every name is relative to the new directory."
     (let fds = (lisp (-> (List I32)) (replies shut) (fake-helper-fds replies shut)))
     (Fake (with-default -1 (list:index 0 fds)) (with-default -1 (list:index 1 fds))))
 
+  (declare wait-until ((Void -> Boolean) -> Boolean))
+  (define (wait-until done?)
+    "Poll DONE? for up to two seconds."
+    (lisp (-> Boolean) (done?)
+      (cl:loop :repeat 200
+               :when (call-coalton-function done?) :return cl:t
+               :do (cl:sleep 0.01)
+               :finally (cl:return (call-coalton-function done?)))))
+
   (declare ok-replies (UFix -> List String))
   (define (ok-replies n)
     (list:repeat n "{\"ok\":true}"))

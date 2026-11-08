@@ -93,3 +93,18 @@ there are none. Return the outcome and the requests the helper got."
   (is (has? report "PATH="))
   (is (not (has? report "sk-secret")))
   (is (not (has? report "BASH_ENV"))))
+
+;;; T20: no command runs once the helper is gone. (R9, A6)
+
+(define-test run-command-refuses-once-the-helper-is-gone ()
+  (let base = (temp-tree Nil Nil Nil))
+  (let marker = (<> base "/ran"))
+  (let fake = (fake-helper Nil True))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (is (wait-until (fn () (client:closed? c))))
+  (is (== (Err "refused: the helper is gone, so no command can be confined")
+          (map (fn (_) Unit) (launch:run-command c "/" (<> "touch " marker)))))
+  (is (not (exists? marker)))
+  ;; It refused without asking the helper.
+  (is (== Nil (requests-of fake c)))
+  (remove-tree base))

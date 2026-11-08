@@ -13,7 +13,7 @@
 ;;; A stand-in for dakusui-agent, built from the agent's own code. make
 ;;; attach-check puts it next to a copy of the real helper, which starts it as
 ;;; it starts the real agent. It builds a temp project, sends the default
-;;; policy, and runs A13, A1, and A2 through the launcher. (T17, T18, R1, R7,
+;;; policy, and runs A13, A1, A2, and A6 through the launcher. (T17, T18, R1, R7,
 ;;; R11) The agent first reads .env itself, so only the policy can deny it.
 
 (cl:defun make-project ()
@@ -96,6 +96,29 @@ a second line follows."
                              (mconcat (map (fn (line) (<> line "; ")) new)))))
     passed)
 
+  (declare check-a6 (client:Client * String -> Boolean))
+  (define (check-a6 helper project)
+    "Stop the helper, our parent, then ask to run a command. Dakusui must
+refuse, and the command must not run. This ends the helper, so it comes last."
+    (let marker = (<> project "/ran"))
+    (let gone? = (fn () (client:closed? helper)))
+    (lisp (-> Unit) (gone?)
+      (cffi:foreign-funcall "kill" :int (cffi:foreign-funcall "getppid" :int)
+                            :int 9 :int)
+      (cl:loop :repeat 200
+               :until (call-coalton-function gone?)
+               :do (cl:sleep 0.01))
+      Unit)
+    (let ran = (launch:run-command helper project (<> "touch " marker)))
+    (let passed = (and (client:closed? helper)
+                       (match ran
+                         ((Err why) (string:substring? "refused" why))
+                         ((Ok _) False))
+                       (not (readable? marker))))
+    (say (mconcat (make-list (if passed "ok   " "FAIL ") "A6 the helper is stopped: "
+                             (match ran ((Err why) why) ((Ok _) "the command ran")))))
+    passed)
+
   (declare checks (client:Client * String -> List Boolean))
   (define (checks helper project)
     (let run = (fn (label command wanted) (check helper project label command wanted)))
@@ -109,6 +132,14 @@ a second line follows."
      (run "no API key reaches a command" "env | grep -c -e OPENAI_API_KEY -e BASH_ENV"
           (Fails "0"))))
 
+  (declare run-all (client:Client * String * String -> List Boolean))
+  (define (run-all helper project log-file)
+    "A13 first, so no earlier denial can reach its log, and A6 last."
+    (let a13 = (check-a13 helper project log-file))
+    (let rest = (checks helper project))
+    (let a6 = (check-a6 helper project))
+    (Cons a13 (<> rest (make-list a6))))
+
   (declare main (Void -> UFix))
   (define (main)
     (let project = (lisp (-> String) () (make-project)))
@@ -121,7 +152,7 @@ a second line follows."
        (let helper = (client:connect 3 (denials:open-log log-file)))
        (session:start helper project home)
        (if (readable? (<> project "/.env"))
-           (Ok (Cons (check-a13 helper project log-file) (checks helper project)))
+           (Ok (run-all helper project log-file))
            (Err "the check agent cannot read its own .env"))))
     (lisp (-> Unit) (project log-file)
       (uiop:delete-directory-tree (cl:pathname (cl:format cl:nil "~A/" project))
@@ -134,5 +165,5 @@ a second line follows."
        1)
       ((Ok results)
        (if (list:all id results)
-           (progn (say "check-agent passed: A13, A1, and A2 hold under the real helper") 0)
+           (progn (say "check-agent passed: A13, A1, A2, and A6 hold under the real helper") 0)
            (progn (say "check-agent: failed") 1))))))

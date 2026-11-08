@@ -201,7 +201,14 @@ BASH_ENV, which would run code before the flag. (R11)"
   (declare run-command (client:Client * String * String -> Result String Outcome))
   (define (run-command helper directory command)
     "Run COMMAND with sh in DIRECTORY, confined by the helper. Return how it
-ended, or an error if it could not be confined, in which case it did not run."
+ended, or an error if it could not be confined, in which case it did not run.
+Once the helper is gone, refuse at once: nothing could flag the command. (R9)"
+    (if (client:closed? helper)
+        (Err "refused: the helper is gone, so no command can be confined")
+        (run-flagged helper directory command)))
+
+  (declare run-flagged (client:Client * String * String -> Result String Outcome))
+  (define (run-flagged helper directory command)
     (let env = (scrub-environment (environment)))
     (let spawned =
       (lisp (-> (Result String (Tuple3 I32 I32 I32))) (directory command env launcher-script)

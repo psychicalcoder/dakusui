@@ -15,15 +15,6 @@
   (define (quoted-json text)
     (lisp (-> String) (text) (com.inuoe.jzon:stringify text)))
 
-  (declare wait-until ((Void -> Boolean) -> Boolean))
-  (define (wait-until done?)
-    "Poll DONE? for up to two seconds."
-    (lisp (-> Boolean) (done?)
-      (cl:loop :repeat 200
-               :when (call-coalton-function done?) :return cl:t
-               :do (cl:sleep 0.01)
-               :finally (cl:return (call-coalton-function done?)))))
-
   (declare file-lines (String -> List String))
   (define (file-lines path)
     (lisp (-> (List String)) (path)

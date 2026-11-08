@@ -1,7 +1,7 @@
 (defpackage #:dakusui/client
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:policy #:dakusui/policy))
-  (:export #:Client #:connect #:disconnect
+  (:export #:Client #:connect #:disconnect #:closed?
            #:send-policy #:send-flag
            #:policy-line))
 (in-package #:dakusui/client)
@@ -121,6 +121,12 @@ event line on the reader thread."
     (lisp (-> Unit) (c)
       (close-conn c)
       Unit))
+
+  (declare closed? (Client -> Boolean))
+  (define (closed? c)
+    "True once the helper has closed its end. It never reopens. (R9)"
+    (lisp (-> Boolean) (c)
+      (sb-thread:with-mutex ((conn-lock c)) (cl:and (conn-closed c) cl:t))))
 
   (declare request (Client * String -> Result String Unit))
   (define (request c line)

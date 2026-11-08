@@ -83,7 +83,7 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T19 Expose the current policy as text for a tool and for the judge.
   (R8) Done when A14 passes: a function returns the rules in order, as
   recorded and enforced. Wiring it into the tool list belongs to spec 0003.
-- [ ] T20 Refuse to run a command when the helper socket is closed. (R9) Done when
+- [x] T20 Refuse to run a command when the helper socket is closed. (R9) Done when
   A6 passes.
 
 ## Phase 5: Acceptance
