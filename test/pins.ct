@@ -1,0 +1,52 @@
+(in-package #:dakusui/test)
+
+;;; T26: the helper refuses to start unless unprivileged BPF is off and the
+;;; pin root is a bpffs that only the user can enter. (R9, ADR 0008) main runs
+;;; these checks before it loads anything or starts the agent.
+
+(coalton-toplevel
+  (declare bpffs UFix)
+  (define bpffs #xcafe4a11)
+
+  (declare pin-root-ok (UFix * UFix * UFix -> Result String Unit))
+  (define (pin-root-ok owner mode fs-type)
+    (pins:check-pin-root "/run/dakusui/1000" 1000
+                         (Ok (pins:DirStatus True owner mode fs-type))))
+
+  (declare names? (String * Result String Unit -> Boolean))
+  (define (names? text outcome)
+    (match outcome
+      ((Ok _) False)
+      ((Err why) (string:substring? text why)))))
+
+(define-test unprivileged-bpf-must-be-disabled ()
+  (is (== (Ok Unit) (pins:check-unprivileged-bpf (Ok (<> "1" (into #\Newline))))))
+  (is (== (Ok Unit) (pins:check-unprivileged-bpf (Ok "2"))))
+  (is (names? "kernel.unprivileged_bpf_disabled is 0"
+              (pins:check-unprivileged-bpf (Ok (<> "0" (into #\Newline))))))
+  (is (names? "docs/install.md" (pins:check-unprivileged-bpf (Ok "0"))))
+  (is (names? "cannot read kernel.unprivileged_bpf_disabled"
+              (pins:check-unprivileged-bpf (Err "no such file")))))
+
+(define-test pin-root-must-be-a-private-bpffs ()
+  (is (== (Ok Unit) (pin-root-ok 1000 #o700 bpffs)))
+  (is (names? "/run/dakusui/1000 is not a bpffs" (pin-root-ok 1000 #o700 #x01021994)))
+  (is (names? "belongs to uid 0, not 1000" (pin-root-ok 0 #o700 bpffs)))
+  (is (names? "has mode 0750" (pin-root-ok 1000 #o750 bpffs)))
+  (is (names? "has mode 0701" (pin-root-ok 1000 #o701 bpffs)))
+  (is (names? "/run/dakusui/1000 is not a directory"
+              (pins:check-pin-root "/run/dakusui/1000" 1000
+                                   (Ok (pins:DirStatus False 1000 #o700 bpffs)))))
+  (is (names? "bpffs /run/dakusui/1000 bpf uid=1000,mode=0700"
+              (pins:check-pin-root "/run/dakusui/1000" 1000 (Err "No such file or directory")))))
+
+(define-test read-dir-status-sees-the-real-directory ()
+  (let base = (temp-tree (make-list "d") Nil (make-list (Tuple "s" "d"))))
+  (let uid = (pins:real-uid))
+  (is (names? "is not a bpffs"
+              (pins:check-pin-root base uid (pins:read-dir-status (<> base "/d")))))
+  (is (names? "is not a directory"
+              (pins:check-pin-root base uid (pins:read-dir-status (<> base "/s")))))
+  (is (names? "No such file"
+              (pins:check-pin-root base uid (pins:read-dir-status (<> base "/none")))))
+  (remove-tree base))

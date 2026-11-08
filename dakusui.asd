@@ -31,6 +31,7 @@
   :pathname "src/helper/"
   :serial t
   :components ((:ct-file "libbpf")
+               (:ct-file "pins")
                (:ct-file "enforcer")
                (:ct-file "spawn")
                (:ct-file "protocol")
@@ -75,4 +76,5 @@ Run it with `make attach-check`."
                (:ct-file "protocol")
                (:ct-file "session")
                (:ct-file "launch")
-               (:ct-file "denials")))
+               (:ct-file "denials")
+               (:ct-file "pins")))

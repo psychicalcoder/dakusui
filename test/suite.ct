@@ -3,6 +3,7 @@
   (:local-nicknames (#:policy #:dakusui/policy)
                     (#:libbpf #:dakusui/libbpf)
                     (#:enforcer #:dakusui/enforcer)
+                    (#:pins #:dakusui/pins)
                     (#:spawn #:dakusui/spawn)
                     (#:protocol #:dakusui/protocol)
                     (#:serve #:dakusui/serve)

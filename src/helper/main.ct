@@ -2,6 +2,7 @@
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:libbpf #:dakusui/libbpf)
                     (#:enforcer #:dakusui/enforcer)
+                    (#:pins #:dakusui/pins)
                     (#:spawn #:dakusui/spawn)
                     (#:serve #:dakusui/serve))
   (:export #:main))
@@ -34,6 +35,8 @@ cannot start, close our end, so the agent sees the helper gone. (R9)"
 runs. (R9, R11) Exit with the agent's code."
     (match (do
             (lsm-list <- (enforcer:read-lsm-list))
+            (enforcer:check-lsm lsm-list)
+            (pins:check-system-pins)
             (obj <- (enforcer:start lsm-list))
             (agent <- (spawn:start-agent (spawn:agent-path) Nil))
             (pure (Tuple obj agent)))

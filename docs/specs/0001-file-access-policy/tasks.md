@@ -88,7 +88,7 @@ a task that can run in parallel with the one before it. The spike code in
 
 ## Phase 4b: Enforcement that outlives the helper (ADR 0008)
 
-- [ ] T26 Check at startup that `kernel.unprivileged_bpf_disabled` is nonzero
+- [x] T26 Check at startup that `kernel.unprivileged_bpf_disabled` is nonzero
   and that `/run/dakusui/<uid>` is a bpffs owned by the helper's real uid, with
   no group or other access. Exit with a message that names the path or the
   setting and the install step. (R9) Done when each failed check makes the

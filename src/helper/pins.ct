@@ -1,0 +1,141 @@
+(defpackage #:dakusui/pins
+  (:use #:coalton #:coalton-prelude)
+  (:export #:read-text-file
+           #:unprivileged-bpf-file #:check-unprivileged-bpf
+           #:DirStatus #:read-dir-status #:check-pin-root
+           #:real-uid #:pin-root #:check-system-pins))
+(in-package #:dakusui/pins)
+
+;;; Where the enforcer's pins live, and what must hold before the helper uses
+;;; them. (R9, ADR 0008, plan part 4)
+;;;
+;;; Each user owns a bpffs at /run/dakusui/<uid>, mounted at boot. The path is
+;;; fixed: the capability-bearing binary takes no input that could name it.
+;;; The pins sit in a directory the user owns, so only the bpf() syscall keeps
+;;; a confined command from them, and only while unprivileged BPF is off.
+
+(cl:defconstant +bpf-fs-magic+ #xcafe4a11)
+
+(cl:defun dir-status (path)
+  "lstat and statfs PATH. Return (values directory-p owner mode fs-type), or a
+string that says why not."
+  (cl:handler-case
+      (cl:let* ((stat (sb-posix:lstat path))
+                (mode (sb-posix:stat-mode stat)))
+        (cl:if (cl:/= (cl:logand mode sb-posix:s-ifmt) sb-posix:s-ifdir)
+               (cl:values cl:nil (sb-posix:stat-uid stat) (cl:logand mode #o7777) 0)
+               ;; struct statfs is 120 bytes on x86-64; f_type is its first long.
+               (cffi:with-foreign-object (buffer :uint8 256)
+                 (cl:if (cl:< (cffi:foreign-funcall "statfs" :string path :pointer buffer :int) 0)
+                        (cl:format cl:nil "statfs: ~A" (sb-int:strerror (sb-alien:get-errno)))
+                        (cl:values cl:t (sb-posix:stat-uid stat) (cl:logand mode #o7777)
+                                   (cffi:mem-ref buffer :long))))))
+    (sb-posix:syscall-error (e)
+      (sb-int:strerror (sb-posix:syscall-errno e)))))
+
+(coalton-toplevel
+  (declare read-text-file (String -> Result String String))
+  (define (read-text-file path)
+    (lisp (-> (Result String String)) (path)
+      (cl:handler-case
+          (cl:let ((text (uiop:read-file-string path)))
+            (coalton (Ok (lisp (-> String) () text))))
+        (cl:error (e)
+          (cl:let ((why (cl:let ((cl:*print-pretty* cl:nil)) (cl:princ-to-string e))))
+            (coalton (Err (lisp (-> String) () why))))))))
+
+  (declare install-note String)
+  (define install-note "See the install steps in docs/install.md.")
+
+  (declare unprivileged-bpf-file String)
+  (define unprivileged-bpf-file "/proc/sys/kernel/unprivileged_bpf_disabled")
+
+  (declare check-unprivileged-bpf (Result String String -> Result String Unit))
+  (define (check-unprivileged-bpf read)
+    "READ is the text of unprivileged-bpf-file. With unprivileged BPF on, any
+confined command could open the pins, so refuse. (R9, ADR 0008)"
+    (match read
+      ((Err why)
+       (Err (mconcat (make-list "cannot read kernel.unprivileged_bpf_disabled: " why ". "
+                                install-note))))
+      ((Ok text)
+       (let value = (lisp (-> String) (text) (cl:string-trim '(#\Newline #\Space) text)))
+       (if (or (== value "1") (== value "2"))
+           (Ok Unit)
+           (Err (mconcat (make-list "kernel.unprivileged_bpf_disabled is " value
+                                    ", so any process could open the enforcer's pins. "
+                                    "Set it to 2 in /etc/sysctl.d. " install-note)))))))
+
+  (define-struct DirStatus
+    "What the helper needs to know about the pin root."
+    (directory? Boolean)
+    (owner UFix)
+    (mode UFix)
+    (fs-type UFix))
+
+  (declare read-dir-status (String -> Result String DirStatus))
+  (define (read-dir-status path)
+    "lstat PATH, so a symlink is not a directory, and statfs it if it is one."
+    (lisp (-> (Result String DirStatus)) (path)
+      (cl:multiple-value-bind (dir owner mode fs-type) (dir-status path)
+        (cl:if (cl:stringp dir)
+               (coalton (Err (lisp (-> String) () dir)))
+               (coalton (Ok (DirStatus (lisp (-> Boolean) () dir)
+                                       (lisp (-> UFix) () owner)
+                                       (lisp (-> UFix) () mode)
+                                       (lisp (-> UFix) () fs-type))))))))
+
+  (declare octal (UFix -> String))
+  (define (octal n)
+    (lisp (-> String) (n) (cl:format cl:nil "0~O" n)))
+
+  (declare decimal (UFix -> String))
+  (define (decimal n)
+    (lisp (-> String) (n) (cl:format cl:nil "~D" n)))
+
+  (declare mount-line (UFix -> String))
+  (define (mount-line uid)
+    "The mount entry install adds. The group is the user's own, and mode 0700
+keeps out the group anyway."
+    (mconcat (make-list "bpffs " (pin-root uid) " bpf uid=" (decimal uid) ",mode=0700")))
+
+  (declare check-pin-root (String * UFix * Result String DirStatus -> Result String Unit))
+  (define (check-pin-root path uid status)
+    "PATH, with STATUS, must be a bpffs directory that UID owns, with no group
+or other access. (R9, ADR 0008)"
+    (let fix = (mconcat (make-list " Mount it at boot with `" (mount-line uid) "`. "
+                                   install-note)))
+    (match status
+      ((Err why)
+       (Err (mconcat (make-list "cannot use " path " for the enforcer's pins: " why "." fix))))
+      ((Ok s)
+       (cond
+         ((not (.directory? s))
+          (Err (mconcat (make-list path " is not a directory." fix))))
+         ((/= (.fs-type s) (lisp (-> UFix) () +bpf-fs-magic+))
+          (Err (mconcat (make-list path " is not a bpffs." fix))))
+         ((/= (.owner s) uid)
+          (Err (mconcat (make-list path " belongs to uid " (decimal (.owner s))
+                                   ", not " (decimal uid) "." fix))))
+         ((/= 0 (let ((mode (.mode s))) (lisp (-> UFix) (mode) (cl:logand mode #o077))))
+          (Err (mconcat (make-list path " has mode " (octal (.mode s))
+                                   ", which lets the group or others in." fix))))
+         (True (Ok Unit))))))
+
+  (declare real-uid (Void -> UFix))
+  (define (real-uid)
+    "The real uid: the user who ran dakusui, whatever the file capabilities."
+    (lisp (-> UFix) () (sb-posix:getuid)))
+
+  (declare pin-root (UFix -> String))
+  (define (pin-root uid)
+    (<> "/run/dakusui/" (decimal uid)))
+
+  (declare check-system-pins (Void -> Result String Unit))
+  (define (check-system-pins)
+    "The checks of plan part 4, step 1, after the LSM list."
+    (let uid = (real-uid))
+    (let root = (pin-root uid))
+    (do
+     (check-unprivileged-bpf (read-text-file unprivileged-bpf-file))
+     (check-pin-root root uid (read-dir-status root)))))
