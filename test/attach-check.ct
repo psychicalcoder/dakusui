@@ -11,7 +11,7 @@
   (:export #:main))
 (in-package #:dakusui/attach-check)
 
-;;; The check for T8 through T14. Start the enforcer embedded in this image, then
+;;; The check for T8 through T14, and T28. Start the enforcer embedded in this image, then
 ;;; run commands confined to show that policies, live swaps (A4), and denial
 ;;; records work. Then start stand-in agents to show the agent holds nothing and
 ;;; the helper serves it. It needs CAP_BPF and CAP_PERFMON, so it runs through
@@ -128,6 +128,48 @@ allow rule, and the same command's next read succeeds."
          (cl:coerce (cl:subseq field 0 end) '(cl:vector (cl:unsigned-byte 8)))
          :external-format :utf-8))))
 
+  (declare denial-status (List U8 -> UFix))
+  (define (denial-status record)
+    "The status field of struct denial, at byte 12."
+    (lisp (-> UFix) (record)
+      (cl:loop :for i :from 0 :below 4
+               :sum (cl:ash (cl:or (cl:nth (cl:+ 12 i) record) 0) (cl:* 8 i)))))
+
+  (declare st-gone UFix)
+  (define st-gone 9)
+
+  (declare check-liveness (libbpf:BpfObject -> Result String Unit))
+  (define (check-liveness obj)
+    "T28 (R9): point the helper map at pid 1, keeping our start time, so the
+recorded helper is not us. A confined read the policy allows then fails, with
+the reason helper gone. Then point it back at us, and the read succeeds."
+    (let statuses = (cell:new Nil))
+    (let zero = (make-list 0 0 0 0))
+    (do
+     (helper <- (libbpf:find-map obj "helper"))
+     (ours <- (map (fn (found) (with-default Nil found)) (libbpf:map-lookup helper zero)))
+     (let start = (enforcer:helper-start ours))
+     (ring <- (do
+               (denials <- (libbpf:find-map obj "denials"))
+               (libbpf:ring-buffer-new
+                denials
+                (fn (record)
+                  (cell:push! statuses (denial-status record))
+                  Unit))))
+     (libbpf:map-update helper zero (enforcer:helper-bytes 1 start))
+     (gone-code <- (run-confined obj "/etc/passwd"))
+     (libbpf:map-update helper zero ours)
+     (libbpf:ring-buffer-poll ring 200)
+     (back-code <- (run-confined obj "/etc/passwd"))
+     (cond
+       ((== gone-code 0)
+        (Err "T28: a confined read succeeded while the helper map named another task"))
+       ((not (list:member st-gone (cell:read statuses)))
+        (Err "T28: no denial gave the reason helper gone"))
+       ((/= back-code 0)
+        (Err "T28: a confined read failed once the helper map named us again"))
+       (True (Ok (say "T28 passed: with the helper gone, a confined read was denied"))))))
+
   (declare check-attached (Void -> Result String libbpf:BpfObject))
   (define (check-attached)
     "The helper's own startup. It fails unless every program attached."
@@ -168,7 +210,8 @@ allow rule, and the same command's next read succeeds."
        (True (Ok Unit)))
      (install obj base)
      (check-live-swap obj base)
-     (pure (say "A4 passed: a running command saw the new policy"))))
+     (let _ = (say "A4 passed: a running command saw the new policy"))
+     (check-liveness obj)))
 
   (declare read-socket (I32 -> String))
   (define (read-socket fd)

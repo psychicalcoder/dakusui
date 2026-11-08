@@ -60,6 +60,14 @@ struct rule_val {
 	__u8 pad[2];
 };
 
+/* The helper's liveness (ADR 0008). The helper writes its pid; the enforcer
+ * records its start time the first time the helper opens a file. */
+struct helper_info {
+	__s32 pid;
+	__u32 pad;
+	__u64 start; /* task_struct start_time, in ns; 0 until recorded */
+};
+
 struct denial {
 	__u32 pid;
 	__u32 hook;

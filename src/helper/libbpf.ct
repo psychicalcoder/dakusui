@@ -13,6 +13,7 @@
    #:map-capacity
    #:create-hash-map-like
    #:map-update
+   #:map-lookup
    #:map-set-inner
    #:close-map
    #:fd-bytes
@@ -64,6 +65,8 @@
   (max-entries :uint32) (opts :pointer))
 (cffi:defcfun ("bpf_map_update_elem" %map-update) :int
   (fd :int) (key :pointer) (value :pointer) (flags :uint64))
+(cffi:defcfun ("bpf_map_lookup_elem" %map-lookup) :int
+  (fd :int) (key :pointer) (value :pointer))
 (cffi:defcfun ("ring_buffer__new" %ring-buffer-new) :pointer
   (fd :int) (callback :pointer) (ctx :pointer) (opts :pointer))
 (cffi:defcfun ("ring_buffer__epoll_fd" %ring-buffer-epoll-fd) :int
@@ -250,6 +253,33 @@ list of any other length is an error, not an out-of-bounds read."
                    (cl:lambda (value-pointer)
                      ;; 0 is BPF_ANY: create the element or replace it.
                      (%map-update fd key-pointer value-pointer 0)))))))))))
+
+  (declare map-lookup (BpfMap * List U8 -> Result String (Optional (List U8))))
+  (define (map-lookup m key)
+    "The value for KEY, or None if the map holds none."
+    (let fd = (.fd m))
+    (let value-size = (.value-size m))
+    (let enoent = 2)
+    (if (/= (list:length key) (.key-size m))
+        (Err "bpf_map_lookup_elem: wrong key size")
+        (let ((found
+                (lisp (-> (Tuple I32 (List U8))) (fd key value-size)
+                  (call-with-bytes
+                   key
+                   (cl:lambda (key-pointer)
+                     (cffi:with-foreign-object (value-pointer :uint8 (cl:max 1 value-size))
+                       (cl:let ((status (%map-lookup fd key-pointer value-pointer)))
+                         (Tuple status
+                                (cl:if (cl:< status 0)
+                                       cl:nil
+                                       (cl:loop :for i :from 0 :below value-size
+                                                :collect (cffi:mem-aref value-pointer :uint8 i)))))))))))
+          (match found
+            ((Tuple status bytes)
+             (cond
+               ((== status (negate enoent)) (Ok None))
+               ((< status 0) (failure "bpf_map_lookup_elem" (negate status)))
+               (True (Ok (Some bytes)))))))))
 
   (declare fd-bytes (I32 -> List U8))
   (define (fd-bytes fd)

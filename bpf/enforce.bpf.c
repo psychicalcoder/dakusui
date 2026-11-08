@@ -7,6 +7,7 @@
  * keeps the match with the highest sequence number per access kind (last
  * match wins), and returns -EACCES unless every needed kind is allowed.
  * Anything that goes wrong while building the path denies (fail closed).
+ * Once the helper is gone, every hook denies every confined task (ADR 0008).
  */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -20,6 +21,10 @@ char LICENSE[] SEC("license") = "GPL";
 #define EACCES 13
 #define M_READ 0x1  /* FMODE_READ */
 #define M_WRITE 0x2 /* FMODE_WRITE */
+#define PF_EXITING 0x00000004
+
+extern struct task_struct *bpf_task_from_pid(s32 pid) __ksym;
+extern void bpf_task_release(struct task_struct *p) __ksym;
 
 /* The task flag (ADR 0004). Userspace sets it with a pidfd key. */
 struct {
@@ -28,6 +33,14 @@ struct {
 	__type(key, int);
 	__type(value, __u32);
 } confined SEC(".maps");
+
+/* One entry: the helper's pid and start time. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct helper_info);
+} helper SEC(".maps");
 
 struct scratch {
 	char comp[MAX_COMP][COMP_LEN]; /* path components, leaf first */
@@ -77,6 +90,36 @@ static __always_inline struct scratch *get_scratch(void)
 {
 	return bpf_task_storage_get(&scratch_map, bpf_get_current_task_btf(), 0,
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);
+}
+
+/* The helper lives: its pid holds the task whose start time we recorded, and
+ * that task is not exiting. An unset pid or start time counts as gone. */
+static __always_inline int helper_alive(void)
+{
+	__u32 zero = 0;
+	struct helper_info *h = bpf_map_lookup_elem(&helper, &zero);
+	struct task_struct *t;
+	int alive;
+
+	if (!h || !h->pid || !h->start)
+		return 0;
+	t = bpf_task_from_pid(h->pid);
+	if (!t)
+		return 0;
+	alive = t->start_time == h->start && !(t->flags & PF_EXITING);
+	bpf_task_release(t);
+	return alive;
+}
+
+/* The helper opens a file once it has written its pid, so the first open by
+ * one of its threads records its start time. Nothing changes it later. */
+static __always_inline void record_helper(struct task_struct *cur)
+{
+	__u32 zero = 0;
+	struct helper_info *h = bpf_map_lookup_elem(&helper, &zero);
+
+	if (h && h->pid && !h->start && cur->tgid == h->pid)
+		h->start = cur->group_leader->start_time;
 }
 
 /* Turn a typed pointer into a plain integer the verifier will not track. */
@@ -250,6 +293,8 @@ static __always_inline int decide(__u32 hook, __u32 need, __u64 start,
 
 	if (!s)
 		return -EACCES;
+	if (!helper_alive())
+		return deny(s, hook, need, ST_GONE);
 	if (!mnt)
 		return deny(s, hook, need, ST_ERR);
 	w.dentry = start;
@@ -312,9 +357,11 @@ int BPF_PROG(e_inherit, struct task_struct *task, unsigned long clone_flags)
 SEC("lsm/file_open")
 int BPF_PROG(e_file_open, struct file *file)
 {
+	struct task_struct *cur = bpf_get_current_task_btf();
 	__u32 mode, need = 0;
 
-	if (!is_confined(bpf_get_current_task_btf()))
+	record_helper(cur);
+	if (!is_confined(cur))
 		return 0;
 	mode = BPF_CORE_READ(file, f_mode);
 	if (mode & M_WRITE)

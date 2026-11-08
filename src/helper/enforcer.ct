@@ -5,7 +5,8 @@
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
   (:export #:open-enforcer #:read-lsm-list #:check-lsm #:start
-           #:check-capacity #:install-policy #:flag-process))
+           #:check-capacity #:install-policy #:flag-process
+           #:helper-bytes #:helper-start #:register-helper))
 (in-package #:dakusui/enforcer)
 
 ;;; The enforcer, embedded in the image. (R11)
@@ -56,16 +57,58 @@
                                  "Active: " active ". "
                                  "Add bpf to the lsm= boot parameter.")))))
 
+  (declare helper-bytes (I32 * U64 -> List U8))
+  (define (helper-bytes pid start)
+    "struct helper_info: pid, pad, start, little-endian."
+    (lisp (-> (List U8)) (pid start)
+      (cl:append (cl:loop :for shift :from 0 :below 32 :by 8
+                          :collect (cl:ldb (cl:byte 8 shift) pid))
+                 (cl:list 0 0 0 0)
+                 (cl:loop :for shift :from 0 :below 64 :by 8
+                          :collect (cl:ldb (cl:byte 8 shift) start)))))
+
+  (declare helper-start (List U8 -> U64))
+  (define (helper-start bytes)
+    "The start field of struct helper_info, or 0 if BYTES is too short."
+    (lisp (-> U64) (bytes)
+      (cl:if (cl:< (cl:length bytes) 16)
+             0
+             (cl:loop :for i :from 0 :below 8
+                      :sum (cl:ash (cl:nth (cl:+ 8 i) bytes) (cl:* 8 i))))))
+
+  (declare register-helper (libbpf:BpfObject -> Result String Unit))
+  (define (register-helper obj)
+    "Write our pid to the helper map, and open a file, so the enforcer records
+our start time. Until then, every hook denies every confined task, and so it
+does again once we are gone. (R9, ADR 0008)"
+    (let pid = (lisp (-> I32) () (sb-posix:getpid)))
+    (let zero = (make-list 0 0 0 0))
+    (do
+     (helper <- (libbpf:find-map obj "helper"))
+     (libbpf:map-update helper zero (helper-bytes pid 0))
+     (let _ = (lisp (-> Unit) ()
+                ;; O_RDONLY. Any open by one of our threads will do.
+                (cffi:foreign-funcall "close"
+                                      :int (cffi:foreign-funcall "open" :string "/" :int 0 :int)
+                                      :int)
+                Unit))
+     (found <- (libbpf:map-lookup helper zero))
+     (if (== 0 (helper-start (with-default Nil found)))
+         (Err "the enforcer did not record the helper's start time")
+         (Ok Unit))))
+
   (declare start (String -> Result String libbpf:BpfObject))
   (define (start lsm-list)
-    "Check LSM-LIST, then load the enforcer and attach every program. Each
-failure is an Err that says which step failed. (R9)"
+    "Check LSM-LIST, then load the enforcer, attach every program, and
+register as the live helper. Each failure is an Err that says which step
+failed. (R9)"
     (do
      (check-lsm lsm-list)
      (match (do
              (obj <- (open-enforcer))
              (libbpf:load-object obj)
              (libbpf:attach-all obj)
+             (register-helper obj)
              (pure obj))
        ((Ok obj) (Ok obj))
        ((Err why) (Err (<> "cannot start the enforcer: " why))))))

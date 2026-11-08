@@ -87,3 +87,16 @@
           (libbpf:pidfd-open 0)))
   (is (== (Err "pidfd_open 2147483647: No such process")
           (libbpf:pidfd-open 2147483647))))
+
+;;; T28: struct helper_info, as the helper writes it and reads it back. (R9)
+
+(define-test helper-bytes-match-struct-helper-info ()
+  (is (== (make-list #x39 #x30 0 0  0 0 0 0  8 7 6 5 4 3 2 1)
+          (enforcer:helper-bytes 12345 #x0102030405060708)))
+  (is (== #x0102030405060708
+          (enforcer:helper-start (enforcer:helper-bytes 12345 #x0102030405060708))))
+  (is (== 0 (enforcer:helper-start (make-list 1 2 3)))))
+
+(define-test map-lookup-rejects-a-wrong-key-size ()
+  (is (== "bpf_map_lookup_elem: wrong key size"
+          (failure-message (libbpf:map-lookup no-such-map (make-list 1 2))))))
