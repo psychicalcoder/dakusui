@@ -68,7 +68,7 @@ enforces the policy, and the user can change it while commands run.
   override any rule of R3, but no rule can reopen `.dakusui` to a confined
   command. A session without a set has an empty one. Spec 0004 stores and chooses
   sets.
-- R15: A confined process MUST NOT act on an unconfined process, or ask one to
+- R15 (deferred past v0): A confined process MUST NOT act on an unconfined process, or ask one to
   act for it: no ptrace, no signal, and no connection or datagram to a Unix
   socket, named or abstract, that an unconfined process listens on. Confined
   processes MAY do all of these among themselves. Otherwise a confined command
@@ -132,10 +132,10 @@ enforces the policy, and the user can change it while commands run.
 - A19 (R9): Given a confined command in its own session that outlives the
   helper, when the helper is killed and the command then reads `src/a.c`, then
   the read fails. When Dakusui next starts, the command is gone.
-- A20 (R15): Given a confined command, when it signals the helper, the agent,
+- A20 (R15, deferred): Given a confined command, when it signals the helper, the agent,
   or another process of the user that is not confined, then the call fails
   with a permission error. Signalling its own child succeeds.
-- A21 (R15): Given an unconfined process listening on a Unix socket, named or
+- A21 (R15, deferred): Given an unconfined process listening on a Unix socket, named or
   abstract, when a confined command connects or sends to it, then the call
   fails. When a confined command listens instead, another confined command
   can connect.
@@ -152,7 +152,9 @@ enforces the policy, and the user can change it while commands run.
 
 ## Non-goals
 
-- Network restrictions, and process restrictions beyond R15.
+- Network and process restrictions in v0. R15 states the process limits a
+  later version needs; until then a confined command can still ask an
+  unconfined process of the user to act for it.
 - Asking the user to approve an access.
 - Globs in rules.
 - Checks on each read or write of an open descriptor.
@@ -202,4 +204,4 @@ Design choices made while writing this spec live in the ADRs:
 | R12 | A10 | Not started |
 | R13 | A17 | Not started |
 | R14 | A18 | Not started |
-| R15 | A20, A21 | Not started |
+| R15 | A20, A21 | Deferred |

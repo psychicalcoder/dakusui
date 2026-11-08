@@ -166,7 +166,7 @@ only: logging is not enforcement.
   and, once pinning lands, the bpffs mount. It then grants them to a copy of
   the real helper in `build/check/`, which starts a check agent built from the
   agent's code. The check agent runs A13, A1, A2, and A6 through the launcher
-  in a temp project. A19 through A21 join it.
+  in a temp project. A19 joins it.
 
 ## Socket protocol
 
@@ -228,8 +228,7 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
   leftover processes denied (ADR 0008, A19).
 - R11: ADR 0005 plus the `ptrace_access_check` hook.
 - R12: `userns_create` denial.
-- R15: not yet planned. The spec requires it (A20, A21); the plan for signals
-  and Unix sockets is still open.
+- R15: deferred past v0, with A20 and A21. No hook covers it yet beyond ptrace.
 
 ## Alternatives rejected
 
@@ -285,15 +284,17 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
   by pid. Unmeasured: compare it with the matching costs above.
 - **Cleanup that gives up.** After 100 passes, a session stays pinned with its
   processes denied everything. Safe, but they linger until a later start.
-- **R15 not yet planned.** Signals and Unix sockets to unconfined processes
-  stay open until it is. Loopback networking is Q19.
+- **R15 deferred.** In v0 a confined command can still signal unconfined
+  processes of the user, or reach them over Unix sockets and loopback (Q19),
+  and some of those can run work outside the policy. Pinning makes killing
+  the helper or the agent gain nothing, but the other routes stay open.
 
 ## Testing
 
 - **Policy library:** unit tests for parsing, last-match order (A3), name rules,
   and compilation, against the reference evaluator.
 - **Enforcer:** an integration harness that builds a temp tree and runs shell
-  and Python snippets confined. One test per acceptance case, A1 through A21.
+  and Python snippets confined. One test per acceptance case, A1 through A19.
   A random-policy test compares the kernel's verdicts with the reference
   evaluator.
 - **Cleanup:** a zombie in the flag map, a process that keeps forking, two
