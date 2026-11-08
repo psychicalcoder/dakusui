@@ -16,6 +16,8 @@
    #:parse-kind
    #:parse-pattern
    #:pattern-text
+   #:rule-text
+   #:policy-text
    #:resolve-rule
    #:allows?
    #:default-policy

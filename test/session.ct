@@ -218,3 +218,38 @@ of a link and its target. Every name is relative to the new directory."
           (session:set-rules (unwrap (session:replace-rules s (make-list (rule-of "deny read name:new")))))))
   (requests-of fake c)
   (remove-tree base))
+
+;;; T19: the policy as text. (R8, A14)
+
+(define-test a14-policy-text-lists-the-rules-as-enforced ()
+  (let base = (temp-tree (make-list "data/s") Nil (make-list (Tuple "s" "data/s"))))
+  (let fake = (fake-helper (ok-replies 2) False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (let s = (started c "/no-such-dakusui/u/proj" "/no-such-dakusui/u"))
+  (let changed = (unwrap (session:replace-rules
+                          s (make-list (rule-of (<> "deny read " (<> base "/s/new/")))
+                                       (rule-of "allow read /my\\ dir")))))
+  (let text = (session:policy-text changed))
+  (is (== (mconcat
+           (make-list "allow read /
+allow read,write /no-such-dakusui/u/proj
+allow write /tmp
+allow write /dev/null
+allow write /dev/tty
+deny read,write /no-such-dakusui/u/.ssh
+deny read,write /no-such-dakusui/u/.aws
+deny read,write /no-such-dakusui/u/.gnupg
+deny read,write /no-such-dakusui/u/.config/dakusui
+deny read,write name:.env
+deny read " base "/data/s/new
+allow read /my\\ dir
+deny write /no-such-dakusui/u/proj/.dakusui
+"))
+          text))
+  ;; Each line parses back to the rule in force at its place.
+  (is (== (Ok (session:current-policy changed))
+          (map policy:Policy
+               (traverse policy:parse-rule
+                         (list:filter (fn (line) (/= line "")) (string:split #\Newline text))))))
+  (requests-of fake c)
+  (remove-tree base))

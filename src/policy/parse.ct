@@ -160,3 +160,35 @@
     (match pat
       ((PathPrefix path) (escape path))
       ((FileName name) (string:concat "name:" (escape name))))))
+
+;;; The text form of a rule and a policy, for the agent and the judge. (R8)
+;;; Each line parses back to the rule it shows.
+
+(coalton-toplevel
+  (declare kind-word (Kind -> String))
+  (define (kind-word kind)
+    (match kind
+      ((Read) "read")
+      ((Write) "write")))
+
+  (declare rule-text (Rule -> String))
+  (define (rule-text r)
+    "R as rule text: parse-rule gives R back."
+    (match r
+      ((Rule effect (Kinds first rest) pat)
+       (mconcat
+        (make-list (match effect
+                     ((Allow) "allow")
+                     ((Deny) "deny"))
+                   " "
+                   (kind-word first)
+                   (mconcat (map (fn (k) (string:concat "," (kind-word k))) rest))
+                   " "
+                   (pattern-text pat))))))
+
+  (declare policy-text (Policy -> String))
+  (define (policy-text pol)
+    "POL's rules in order, one per line, each ending in a newline."
+    (match pol
+      ((Policy rules)
+       (mconcat (map (fn (r) (string:concat (rule-text r) (into #\Newline))) rules))))))

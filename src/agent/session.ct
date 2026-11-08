@@ -4,7 +4,7 @@
                     (#:client #:dakusui/client)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
-  (:export #:Session #:start #:current-policy #:set-rules
+  (:export #:Session #:start #:current-policy #:policy-text #:set-rules
            #:replace-rules #:add-rule #:remove-rule
            #:resolve-path))
 (in-package #:dakusui/session)
@@ -59,6 +59,13 @@ absolute, with no trailing slash and no . or .. component."
   (define (current-policy s)
     "The whole policy the helper enforces, in order. (R8)"
     (.policy s))
+
+  (declare policy-text (Session -> String))
+  (define (policy-text s)
+    "The policy in force as text, one rule per line, in order, as recorded and
+enforced: paths resolved, with no trailing slash. For the policy tool and the
+judge. (R8, A14)"
+    (policy:policy-text (.policy s)))
 
   (declare set-rules (Session -> List policy:Rule))
   (define (set-rules s)

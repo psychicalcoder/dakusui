@@ -102,8 +102,9 @@ enforces the policy, and the user can change it while commands run.
 - A13 (R7): Given a denied access, when the command fails, then Dakusui logs one
   line naming the process, the path, and the access kind.
 - A14 (R8): Given any policy, when the agent calls the policy tool or the judge
-  is shown the policy, then the text lists the rules in force, in order, as the
-  user wrote them.
+  is shown the policy, then the text lists the rules in force, in order, as
+  recorded and enforced: each path with its symlinks resolved (R13) and no
+  trailing slash (R10).
 - A15 (R10): Given the rule `deny read,write name:.env`, then it parses. Given a
   relative path, a glob such as `*.pem`, or an unknown kind, then it is
   rejected with a message that names the problem.
@@ -142,9 +143,6 @@ enforces the policy, and the user can change it while commands run.
 - Q17: A rule set can override the denies of R3, and sets live in the project, so
   a cloned repository can ship a set such as `allow read ~/.ssh`. How does a user
   come to trust a set? (for spec 0004; must be settled before sets load)
-- Q16: A14 shows the rules "as the user wrote them", but R13 records the resolved
-  path, and R10 cleans up a trailing slash. Should A14 show the rules as recorded?
-  (blocks T19)
 
 ## Decisions
 

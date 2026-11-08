@@ -76,7 +76,8 @@ the session policy (R13). For a path that does not exist yet, it resolves the
 longest part that does and keeps the rest. The agent adds, removes, and
 replaces the rules of the session's set, resolving each path rule as it comes.
 It records a change only after the helper accepts it, so the policy it shows is
-the one in force.
+the one in force. It shows the policy as rule text, one rule per line, in
+order, with each pattern escaped so that the line parses back to its rule.
 
 A reader thread owns the socket's input. It passes each event to the denial
 log as it comes, and hands each reply to the request waiting for it. Requests
