@@ -282,7 +282,12 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
   they run on every file operation on the machine until the next start clears
   them.
 - **Liveness cost.** Each hook call of a confined process looks the helper up
-  by pid. Unmeasured: compare it with the matching costs above.
+  by pid, and every `open` on the machine reads the helper map. Measured with
+  spike 2's bench, one run each before and after the check (T28): confined
+  opens took 2795, 3686, and 6572 ns before, and 2674, 3486, and 6608 ns
+  after, on `/etc/hostname`, a sandbox file, and a path of 22 components.
+  The unconfined baselines moved by up to 0.9 us between runs, so the check
+  costs less than this noise shows, about 0.2 us at most.
 - **Cleanup that gives up.** After 100 passes, a session stays pinned with its
   processes denied everything. Safe, but they linger until a later start.
 - **R15 deferred.** In v0 a confined command can still signal unconfined

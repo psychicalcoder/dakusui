@@ -95,7 +95,7 @@ a task that can run in parallel with the one before it. The spike code in
   helper exit non-zero before the agent starts.
 - [x] T27 [P] Add the reason "helper gone" to the enforcer, the denial event,
   and the denial log. (R7) Done when the event and log tests cover it.
-- [ ] T28 Check in every hook that the helper lives: pid, start time, and not
+- [x] T28 Check in every hook that the helper lives: pid, start time, and not
   `PF_EXITING`, as in spike 3. The helper writes its pid and opens a file so
   the hook records its start time, and exits before the agent starts if none
   was recorded. `attach-check` registers itself the same way. (R9) Done when
