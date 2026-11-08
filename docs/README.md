@@ -30,6 +30,7 @@ CLAUDE.md
 docs/
   brief.md
   constitution.md
+  install.md
   templates/
   specs/NNNN-name/{spec,plan,tasks}.md
   adr/NNNN-title.md
