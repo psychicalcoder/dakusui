@@ -102,18 +102,18 @@ a task that can run in parallel with the one before it. The spike code in
   the existing `attach-check` checks pass, a confined command is denied with
   "helper gone" when the recorded pid is not the loader's, and the added cost
   per confined `open` is recorded in the plan.
-- [ ] T29 Pin one link per program and the `confined` map into
+- [x] T29 Pin one link per program and the `confined` map into
   `/run/dakusui/<uid>/<pid>-<start>/` before the agent starts. `make
   attach-check` needs the mount from then on. (R9) Done when the first half of
   A19 passes: a confined command in its own session outlives a killed helper,
   and its read of `src/a.c` fails.
-- [ ] T30 Clear stale sessions at startup: find each one whose helper is gone,
+- [x] T30 Clear stale sessions at startup: find each one whose helper is gone,
   kill its live, non-zombie confined processes through pidfds until a pass
   finds none, then unpin it. After 100 passes, keep its pins and warn. (R9)
   Done when the second half of A19 passes, and tests cover a zombie in the
   flag map, a process that keeps forking, a partial session, and two helpers
   starting at once.
-- [ ] T31 Clear the helper's own session at a normal exit, the same way.
+- [x] T31 Clear the helper's own session at a normal exit, the same way.
   (R9) Done when a normal exit leaves no pins and ends a `nohup`'d confined
   command.
 - [ ] T32 Write the install steps: `setcap` on the binary, `/run/dakusui`
