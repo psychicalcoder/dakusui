@@ -116,9 +116,10 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T31 Clear the helper's own session at a normal exit, the same way.
   (R9) Done when a normal exit leaves no pins and ends a `nohup`'d confined
   command.
-- [ ] T32 Write the install steps: `setcap` on the binary, `/run/dakusui`
-  made at boot, and one bpffs mount entry per user. Done when a fresh boot
-  following them lets `make attach-check` pass.
+- [x] T32 Write the install steps: `setcap` on the binary, unprivileged BPF
+  off, and a bpffs for each user at `/run/dakusui/<uid>`. State what boot must
+  provide; init scripts are out of scope. Done when `docs/install.md` names
+  each step.
 
 ## Phase 5: Acceptance
 

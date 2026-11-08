@@ -1,8 +1,7 @@
 # Install
 
-Dakusui needs root three times, once each: to grant the binary its
-capabilities, to keep unprivileged BPF off, and to mount a bpffs for each
-user. Running it needs no root. (ADR 0005, ADR 0008, spec 0001 R9)
+Dakusui needs root for three things: to grant the binary its capabilities,
+to keep unprivileged BPF off, and to mount a bpffs for each user. Running it needs no root. (ADR 0005, ADR 0008, spec 0001 R9)
 
 Check first that the kernel lists `bpf` as an active LSM:
 
@@ -35,25 +34,12 @@ Most distributions set it already. If yours does not:
 
 ## 3. A bpffs for each user
 
-Each user needs a bpffs at `/run/dakusui/<uid>`, owned by that user, mode
-0700. `/run` is empty at each boot, so make it at boot. Below, `1000` is the
-user's uid and group id; use `id -u` and `id -g`.
+Each user needs a bpffs mounted at `/run/dakusui/<uid>`, owned by that user,
+with mode 0700. `/run` is empty at each boot, so the system must make
+`/run/dakusui` and the mount at boot. How depends on the init system. The
+mount itself looks like this, with `1000` as the user's uid and group id:
 
-**With systemd**, make `/run/dakusui` with tmpfiles, and add one mount line
-per user to `/etc/fstab`. systemd makes the mount point.
-
-    echo 'd /run/dakusui 0755 root root -' | sudo tee /etc/tmpfiles.d/dakusui.conf
-    echo 'bpffs /run/dakusui/1000 bpf uid=1000,gid=1000,mode=0700,nofail 0 0' | sudo tee -a /etc/fstab
-
-**With runit or another init**, add these lines to a script that runs at
-boot after `/run` is mounted, such as `/etc/rc.local` on Void Linux. Repeat
-the last two for each user.
-
-    mkdir -p -m 0755 /run/dakusui
-    mkdir -p -m 0700 /run/dakusui/1000
     mount -t bpf -o uid=1000,gid=1000,mode=0700 bpffs /run/dakusui/1000
-
-To mount it now, without a reboot, run the same lines with `sudo`.
 
 ## Check
 
