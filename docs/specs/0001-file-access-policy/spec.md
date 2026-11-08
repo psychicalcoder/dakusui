@@ -41,6 +41,9 @@ enforces the policy, and the user can change it while commands run.
 - R7: The system MUST log each denial with the process, path, and access kind.
 - R8: The agent and the judge MUST be able to read the current policy.
 - R9: If enforcement is not active, the system MUST NOT run commands.
+  Enforcement MUST NOT end with any process: if the helper ends, every confined
+  process still alive MUST be denied every file access. When Dakusui next
+  starts, it MUST end those processes before it removes their enforcement.
 - R10: A rule MUST be `allow` or `deny`, name one or more access kinds, and give
   a pattern: an absolute path, which covers itself and everything beneath it
   whether or not it exists yet, or `name:X`, which matches a path whose last
@@ -65,6 +68,12 @@ enforces the policy, and the user can change it while commands run.
   override any rule of R3, but no rule can reopen `.dakusui` to a confined
   command. A session without a set has an empty one. Spec 0004 stores and chooses
   sets.
+- R15: A confined process MUST NOT act on an unconfined process, or ask one to
+  act for it: no ptrace, no signal, and no connection or datagram to a Unix
+  socket, named or abstract, that an unconfined process listens on. Confined
+  processes MAY do all of these among themselves. Otherwise a confined command
+  could run work outside its confinement, such as `systemd-run --user`, a
+  command in a running tmux server, or a container through the Docker socket.
 
 ## Acceptance
 
@@ -120,6 +129,16 @@ enforces the policy, and the user can change it while commands run.
 - A18 (R14): Given a set with `allow read,write P` and `allow read ~/.ssh`, when
   a command reads `~/.ssh/id_ed25519`, then it succeeds. Writing
   `P/.dakusui/rules/x` fails, and reading it succeeds.
+- A19 (R9): Given a confined command in its own session that outlives the
+  helper, when the helper is killed and the command then reads `src/a.c`, then
+  the read fails. When Dakusui next starts, the command is gone.
+- A20 (R15): Given a confined command, when it signals the helper, the agent,
+  or another process of the user that is not confined, then the call fails
+  with a permission error. Signalling its own child succeeds.
+- A21 (R15): Given an unconfined process listening on a Unix socket, named or
+  abstract, when a confined command connects or sends to it, then the call
+  fails. When a confined command listens instead, another confined command
+  can connect.
 
 ## Constraints
 
@@ -128,10 +147,12 @@ enforces the policy, and the user can change it while commands run.
   later.
 - Rules match path strings, so confined commands share Dakusui's root and mount
   namespace. No chroot, no private mounts.
+- A bpffs that the user owns is mounted at boot, for the pins of R9. Making it
+  needs root once, at install, like the `setcap` of the binary.
 
 ## Non-goals
 
-- Network and process restrictions.
+- Network restrictions, and process restrictions beyond R15.
 - Asking the user to approve an access.
 - Globs in rules.
 - Checks on each read or write of an open descriptor.
@@ -143,6 +164,10 @@ enforces the policy, and the user can change it while commands run.
 - Q17: A rule set can override the denies of R3, and sets live in the project, so
   a cloned repository can ship a set such as `allow read ~/.ssh`. How does a user
   come to trust a set? (for spec 0004; must be settled before sets load)
+- Q19: A confined command can still reach an unconfined server over loopback
+  TCP or UDP, such as `ssh localhost` or a language server, which is the
+  escape R15 closes for Unix sockets. Network limits are a non-goal. Should
+  loopback be the exception? (not blocking)
 
 ## Decisions
 
@@ -156,6 +181,8 @@ Design choices made while writing this spec live in the ADRs:
   walking dentries.
 - [0007](../../adr/0007-store-rule-sets-in-the-project.md): store rule sets in
   the project.
+- [0008](../../adr/0008-pin-the-enforcer.md): pin the enforcer so it outlives
+  the helper.
 
 ## Verification
 
@@ -169,9 +196,10 @@ Design choices made while writing this spec live in the ADRs:
 | R6 | A5, A9 | Not started |
 | R7 | A13 | Not started |
 | R8 | A14 | Not started |
-| R9 | A6 | Not started |
+| R9 | A6, A19 | Not started |
 | R10 | A15, A16 | Not started |
 | R11 | A8 | Not started |
 | R12 | A10 | Not started |
 | R13 | A17 | Not started |
 | R14 | A18 | Not started |
+| R15 | A20, A21 | Not started |
