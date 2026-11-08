@@ -86,11 +86,46 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T20 Refuse to run a command when the helper socket is closed. (R9) Done when
   A6 passes.
 
+## Phase 4b: Enforcement that outlives the helper (ADR 0008)
+
+- [ ] T26 Check at startup that `kernel.unprivileged_bpf_disabled` is nonzero
+  and that `/run/dakusui/<uid>` is a bpffs owned by the helper's real uid, with
+  no group or other access. Exit with a message that names the path or the
+  setting and the install step. (R9) Done when each failed check makes the
+  helper exit non-zero before the agent starts.
+- [ ] T27 [P] Add the reason "helper gone" to the enforcer, the denial event,
+  and the denial log. (R7) Done when the event and log tests cover it.
+- [ ] T28 Check in every hook that the helper lives: pid, start time, and not
+  `PF_EXITING`, as in spike 3. The helper writes its pid and opens a file so
+  the hook records its start time, and exits before the agent starts if none
+  was recorded. `attach-check` registers itself the same way. (R9) Done when
+  the existing `attach-check` checks pass, a confined command is denied with
+  "helper gone" when the recorded pid is not the loader's, and the added cost
+  per confined `open` is recorded in the plan.
+- [ ] T29 Pin one link per program and the `confined` map into
+  `/run/dakusui/<uid>/<pid>-<start>/` before the agent starts. `make
+  attach-check` needs the mount from then on. (R9) Done when the first half of
+  A19 passes: a confined command in its own session outlives a killed helper,
+  and its read of `src/a.c` fails.
+- [ ] T30 Clear stale sessions at startup: find each one whose helper is gone,
+  kill its live, non-zombie confined processes through pidfds until a pass
+  finds none, then unpin it. After 100 passes, keep its pins and warn. (R9)
+  Done when the second half of A19 passes, and tests cover a zombie in the
+  flag map, a process that keeps forking, a partial session, and two helpers
+  starting at once.
+- [ ] T31 Clear the helper's own session at a normal exit, the same way.
+  (R9) Done when a normal exit leaves no pins and ends a `nohup`'d confined
+  command.
+- [ ] T32 Write the install steps: `setcap` on the binary, `/run/dakusui`
+  made at boot, and one bpffs mount entry per user. Done when a fresh boot
+  following them lets `make attach-check` pass.
+
 ## Phase 5: Acceptance
 
 - [ ] T21 Port the spike tests into an acceptance harness that uses the real
-  binaries, one test per case A1 through A18 (A12, A15, A16, and A18 also have unit
-  tests in T5, T4, and T25). Done when all pass on the development machine.
+  binaries, one test per case A1 through A19 (A12, A15, A16, and A18 also have unit
+  tests in T5, T4, and T25; A20 and A21 are deferred with R15). Done when all
+  pass on the development machine.
 - [ ] T22 Add a random-policy test that compares kernel verdicts with the
   reference evaluator over a temp tree. Done when 1,000 random cases agree.
 - [ ] T23 Stress the torn-walk risk: run concurrent renames against opens and
