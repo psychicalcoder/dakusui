@@ -17,6 +17,7 @@
                     (#:tools #:dakusui/tools)
                     (#:provider #:dakusui/provider)
                     (#:turn #:dakusui/loop)
+                    (#:gate #:dakusui/gate)
                     (#:commands #:dakusui/commands)
                     (#:options #:dakusui/options)
                     (#:config #:dakusui/config)

@@ -22,9 +22,10 @@ more call through the provider of spec 0002, with no tools.
 
     Gate = (ToolCall * Conversation -> Result String Unit)
 
-- `user-gate` prints the call through the terminal and reads a line. `y` or
-  `yes` is `Ok`. Anything else, or the end of input, is
-  `Err "the user declined"`.
+- `user-gate` takes a function that prints a question and reads a line
+  (`terminal:ask-with`). The loop has already shown the call, so it asks
+  only `Run? [y/n] `. `y` or `yes` is `Ok`. Anything else, or the end of
+  input, is `Err "the user declined"`.
 - `judge-gate` takes the judge's provider and a function that returns the
   policy text. It sends two messages: a system prompt, and one user message
   that holds the policy, the user's messages so far, and the call. It reads

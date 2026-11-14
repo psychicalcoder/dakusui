@@ -1,0 +1,29 @@
+(defpackage #:dakusui/gate
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:turn #:dakusui/loop))
+  (:export #:question #:yes? #:user-gate))
+(in-package #:dakusui/gate)
+
+;;; The gates that say whether a tool call may run. (Spec 0005 R1, R2) The
+;;; loop shows the call before it asks a gate, so a gate need not show it
+;;; again.
+
+(coalton-toplevel
+  (declare question String)
+  (define question "Run? [y/n] ")
+
+  (declare yes? (String -> Boolean))
+  (define (yes? answer)
+    "True if ANSWER is y or yes, in any case, with any spaces around it."
+    (lisp (-> Boolean) (answer)
+      (cl:let ((word (cl:string-trim '(#\Space #\Tab #\Return) answer)))
+        (cl:or (cl:string-equal word "y") (cl:string-equal word "yes")))))
+
+  (declare user-gate ((String -> Optional String) -> turn:Gate))
+  (define (user-gate ask)
+    "A gate that asks the user. ASK prints a question and reads one line, or
+None at the end of input. Only y or yes lets the call run. (R2)"
+    (fn (_ _)
+      (match (ask question)
+        ((Some answer) (if (yes? answer) (Ok Unit) (Err "the user declined")))
+        ((None) (Err "the user declined"))))))

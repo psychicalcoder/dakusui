@@ -1,6 +1,6 @@
 (defpackage #:dakusui/terminal
   (:use #:coalton #:coalton-prelude)
-  (:export #:Terminal #:say #:warn #:ask
+  (:export #:Terminal #:say #:warn #:ask #:ask-with
            #:write-line-locked))
 (in-package #:dakusui/terminal)
 
@@ -39,9 +39,15 @@
   (declare ask (Void -> Optional String))
   (define (ask)
     "Print the prompt and read one line, or None at the end of input."
-    (lisp (-> (Optional String)) ()
+    (ask-with "> "))
+
+  (declare ask-with (String -> Optional String))
+  (define (ask-with question)
+    "Print QUESTION, without a newline, and read one line, or None at the end
+of input."
+    (lisp (-> (Optional String)) (question)
       (sb-thread:with-mutex (*lock*)
-        (cl:write-string "> " cl:*standard-output*)
+        (cl:write-string question cl:*standard-output*)
         (cl:finish-output cl:*standard-output*))
       (cl:let ((line (cl:handler-case (cl:read-line cl:*standard-input* cl:nil)
                        (cl:error () cl:nil))))

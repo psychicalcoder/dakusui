@@ -1,0 +1,73 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0005 T2: the user's gate, against a scripted terminal. (R1, R2) The
+;;; tools are the real ones on a live fake helper, so bash runs unconfined.
+
+(coalton-toplevel
+  (declare answering (List String * cell:Cell (List String) -> (String -> Optional String)))
+  (define (answering answers asked)
+    "A scripted terminal that gives ANSWERS, then the end of input. It pushes
+each question it is asked onto ASKED."
+    (let left = (cell:new answers))
+    (fn (q)
+      (cell:push! asked q)
+      (match (cell:read left)
+        ((Cons answer rest)
+         (cell:write! left rest)
+         (Some answer))
+        ((Nil) None))))
+
+  (declare gated-turn (Rig * List String * List chat:ToolCall
+                       -> Tuple (List chat:Message) (List String)))
+  (define (gated-turn r answers calls)
+    "Run one turn whose reply makes CALLS, through a user gate that gives
+ANSWERS. Return the results the model saw and the questions asked."
+    (let asked = (cell:new Nil))
+    (let sc = (make-script (make-list (Ok (calls-reply calls)) (Ok (text-reply "done")))))
+    (let (Tuple _ say) = (capture))
+    (turn:run-turn (scripted sc) (rig-tools r) (gate:user-gate (answering answers asked))
+                   say (turn:new-conversation (rig-project r)) "hi")
+    (Tuple (list:drop 3 (with-default Nil (list:index 1 (requests sc))))
+           (list:reverse (cell:read asked)))))
+
+(define-test gate-yes-reads-y-and-yes-only ()
+  (is (gate:yes? "y"))
+  (is (gate:yes? "yes"))
+  (is (gate:yes? "  Y "))
+  (is (gate:yes? "YES"))
+  (is (not (gate:yes? "n")))
+  (is (not (gate:yes? "")))
+  (is (not (gate:yes? "yes please")))
+  (is (not (gate:yes? "sure"))))
+
+(define-test gate-a1-y-runs-the-command ()
+  (let r = (make-rig Nil))
+  (let (Tuple results asked) = (gated-turn r (make-list "y") (make-list (bash-call "c1" "echo one"))))
+  (is (== (make-list (chat:ToolResult "c1" "one")) results))
+  (is (== (make-list gate:question) asked))
+  (is (== 1 (op-count "flag" (unrig r))))
+  Unit)
+
+(define-test gate-a1-n-does-not-run-the-command ()
+  (let r = (make-rig Nil))
+  (let (Tuple results asked) = (gated-turn r (make-list "n") (make-list (bash-call "c1" "echo one"))))
+  (is (== (make-list (chat:ToolResult "c1" "the user declined")) results))
+  (is (== 1 (list:length asked)))
+  (is (== 0 (op-count "flag" (unrig r))))
+  Unit)
+
+(define-test gate-a1-show-policy-asks-nothing ()
+  (let r = (make-rig Nil))
+  (let (Tuple results asked) = (gated-turn r (make-list "n") (make-list (chat:ToolCall "c1" "show_policy" "{}"))))
+  (is (== (make-list (chat:ToolResult "c1" (session:policy-text (cell:read (.sessions r))))) results))
+  (is (== Nil asked))
+  (unrig r)
+  Unit)
+
+(define-test gate-a2-the-end-of-input-is-no ()
+  (let r = (make-rig Nil))
+  (let (Tuple results asked) = (gated-turn r Nil (make-list (bash-call "c1" "echo one"))))
+  (is (== (make-list (chat:ToolResult "c1" "the user declined")) results))
+  (is (== 1 (list:length asked)))
+  (is (== 0 (op-count "flag" (unrig r))))
+  Unit)
