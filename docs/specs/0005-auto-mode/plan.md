@@ -45,7 +45,9 @@ ordinary development work; answer with the JSON object only.
 `run-turn` takes the gate. For a gated tool it calls the gate first; on `Err`
 it prints the reason and uses it as the tool result, without running the
 tool. A mutable cell holds the mode; `/auto` flips it, and the gate handed to
-the loop reads the cell on each call.
+the loop reads the cell on each call. The cell, the user's gate, and the
+judge's gate make a `Mode` in `gate.ct`. If the `judge` role has no model,
+`--auto` stops start-up and `/auto on` leaves auto mode off; both say why.
 
 ## Requirement coverage
 

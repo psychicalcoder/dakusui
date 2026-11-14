@@ -3,9 +3,11 @@
   (:local-nicknames (#:chat #:dakusui/chat)
                     (#:provider #:dakusui/provider)
                     (#:turn #:dakusui/loop)
+                    (#:cell #:coalton/cell)
                     (#:list #:coalton/list))
   (:export #:question #:yes? #:user-gate
-           #:judge-prompt #:judge-request #:read-verdict #:judge-gate))
+           #:judge-prompt #:judge-request #:read-verdict #:judge-gate
+           #:Mode #:new-mode #:auto? #:set-auto! #:mode-gate))
 (in-package #:dakusui/gate)
 
 ;;; The gates that say whether a tool call may run. (Spec 0005 R1, R2, R3)
@@ -126,4 +128,46 @@ the policy text in force. A provider error blocks the call. (R3 to R6, R8)"
     (fn (call conversation)
       (match (ask (judge-request (policy) call conversation) Nil)
         ((Err why) (no-verdict why))
-        ((Ok reply) (read-verdict (chat:reply-text reply)))))))
+        ((Ok reply) (read-verdict (chat:reply-text reply))))))
+
+  ;; Auto mode. (R7)
+
+  (define-type Mode
+    "Who says yes to a gated call: a cell that is true in auto mode, the
+user's gate, and the judge's gate, or why there is no judge. Auto mode is on
+only when there is a judge."
+    (MakeMode (cell:Cell Boolean) turn:Gate (Result String turn:Gate)))
+
+  (declare new-mode (Boolean * turn:Gate * Result String turn:Gate -> Result String Mode))
+  (define (new-mode auto user judge)
+    "A mode that starts in auto mode if AUTO is true. That needs the judge."
+    (if auto
+        (match judge
+          ((Err why) (Err (<> "auto mode needs the judge role; " why)))
+          ((Ok _) (Ok (MakeMode (cell:new True) user judge))))
+        (Ok (MakeMode (cell:new False) user judge))))
+
+  (declare auto? (Mode -> Boolean))
+  (define (auto? (MakeMode on _ _))
+    (cell:read on))
+
+  (declare set-auto! (Mode * Boolean -> Result String Unit))
+  (define (set-auto! (MakeMode on _ judge) auto)
+    "Turn auto mode on if AUTO is true, else off. With no judge it stays off,
+and Err says why."
+    (if auto
+        (match judge
+          ((Err why) (Err why))
+          ((Ok _) (cell:write! on True) (Ok Unit)))
+        (progn (cell:write! on False) (Ok Unit))))
+
+  (declare mode-gate (Mode -> turn:Gate))
+  (define (mode-gate (MakeMode on user judge))
+    "A gate that asks the judge in auto mode, else the user. It reads the mode
+on each call, so a switch holds from the next call."
+    (fn (call conversation)
+      (if (cell:read on)
+          (match judge
+            ((Ok g) (g call conversation))
+            ((Err why) (Err why)))
+          (user call conversation)))))

@@ -40,6 +40,7 @@ model answers. The terminal also takes the commands that change the policy.
   /allow KINDS PATH  add an allow rule to the session's rule set
   /deny KINDS PATH   add a deny rule
   /remove N          remove rule N of the set, as /policy numbers it
+  /auto [on|off]     show auto mode, or turn it on or off (spec 0005)
   /clear             forget the conversation
   /help              list these commands
   /quit              leave; so does the end of input

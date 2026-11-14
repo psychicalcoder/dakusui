@@ -26,7 +26,8 @@
     "Run the prompt loop on INPUT, saving rule changes to SET-FILE. Return the
 terminal's lines."
     (let (Tuple lines say) = (capture))
-    (commands:prompt-loop (scripted sc) (rig-tools r) yes-gate (.sessions r) set-file say (typed input)
+    (commands:prompt-loop (scripted sc) (rig-tools r) (unwrap (gate:new-mode False yes-gate (Err "no judge")))
+                          (.sessions r) set-file say (typed input)
                           (turn:new-conversation (rig-project r)))
     (captured lines))
 
@@ -49,6 +50,10 @@ terminal's lines."
   (is (== (Ok commands:Clear) (commands:parse-command "/clear")))
   (is (== (Ok commands:Help) (commands:parse-command "/help")))
   (is (== (Ok commands:Quit) (commands:parse-command "/quit ")))
+  (is (== (Ok (commands:Auto None)) (commands:parse-command "/auto")))
+  (is (== (Ok (commands:Auto (Some True))) (commands:parse-command "/auto on")))
+  (is (== (Ok (commands:Auto (Some False))) (commands:parse-command "/auto  off ")))
+  (is (== (Err "/auto takes on, off, or nothing") (commands:parse-command "/auto yes")))
   (is (== (Err "/remove takes a rule number, as /policy shows it") (commands:parse-command "/remove x")))
   (is (== (Err "/remove takes a rule number, as /policy shows it") (commands:parse-command "/remove 0")))
   (is (== (Err "/policy takes nothing after it") (commands:parse-command "/policy now")))

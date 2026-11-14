@@ -118,3 +118,57 @@ deny read /p/x
   1 deny read /p/x" (with-default "" (list:index 2 lines))))
   (unrig r)
   Unit)
+
+;;; Spec 0005 T4: auto mode, as main sets it up from the command line. (R7)
+
+(coalton-toplevel
+  (declare auto-session (gate:Mode * Rig * List String * Script -> List String))
+  (define (auto-session mode r input sc)
+    "Run the prompt loop on INPUT with MODE. Return the terminal's lines."
+    (let (Tuple lines say) = (capture))
+    (commands:prompt-loop (scripted sc) (rig-tools r) mode (.sessions r) (rig-set r) say (typed input)
+                          (turn:new-conversation (rig-project r)))
+    (captured lines))
+
+  (declare auto-on-text String)
+  (define auto-on-text "Auto mode is on: the judge decides which commands run.")
+
+  (declare auto-off-text String)
+  (define auto-off-text "Auto mode is off: you decide which commands run."))
+
+(define-test auto-a6-auto-starts-on-and-off-asks-the-user ()
+  (let r = (make-rig Nil))
+  (let opts = (unwrap (options:parse-options (make-list "--auto"))))
+  (let asked = (cell:new Nil))
+  (let heard = (cell:new Nil))
+  (let allow = (Ok (judge-says (Some "{\"allow\": true, \"reason\": \"asked for\"}"))))
+  (let mode = (unwrap (gate:new-mode (.auto opts) (gate:user-gate (answering (make-list "y") asked))
+                                     (Ok (gate:judge-gate (judging allow heard) (fn () judge-policy-text))))))
+  (let sc = (make-script (make-list (Ok (calls-reply (make-list (bash-call "c1" "echo one"))))
+                                    (Ok (text-reply "done"))
+                                    (Ok (calls-reply (make-list (bash-call "c2" "echo two"))))
+                                    (Ok (text-reply "done")))))
+  (let shown = (auto-session mode r (make-list "/auto" "first" "/auto off" "/auto" "second") sc))
+  (is (== (Some auto-on-text) (list:index 0 shown)))
+  (is (== 2 (list:length (list:filter (fn (line) (== line auto-off-text)) shown))))
+  ;; The first call went to the judge, the second to the user.
+  (is (== 1 (list:length (cell:read heard))))
+  (is (== (make-list gate:question) (cell:read asked)))
+  (is (== 2 (op-count "flag" (unrig r))))
+  Unit)
+
+(define-test auto-with-no-judge-auto-mode-stays-off ()
+  (let r = (make-rig Nil))
+  ;; With no OPENAI_MODEL and no model in the file, the judge has none.
+  (let judge = (map (const yes-gate) (>>= (config:parse-config "{}" (env-of Nil))
+                                          (fn (c) (config:role c "judge")))))
+  (let why = (why-of judge))
+  (is (string:substring? "the role \"judge\" has no model" why))
+  (is (== (Err (<> "auto mode needs the judge role; " why)) (map (const Unit) (gate:new-mode True yes-gate judge))))
+  (let mode = (unwrap (gate:new-mode False yes-gate judge)))
+  (let sc = (make-script (make-list (Ok (text-reply "never")))))
+  (let shown = (auto-session mode r (make-list "/auto on" "/auto") sc))
+  (is (== (make-list (<> "dakusui: auto mode stays off; " why) auto-off-text) shown))
+  (is (== Nil (requests sc)))
+  (unrig r)
+  Unit)

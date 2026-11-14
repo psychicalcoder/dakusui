@@ -7,17 +7,19 @@
                     (#:tools #:dakusui/tools)
                     (#:terminal #:dakusui/terminal)
                     (#:turn #:dakusui/loop)
+                    (#:gate #:dakusui/gate)
                     (#:cell #:coalton/cell)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
-  (:export #:Command #:ShowPolicy #:AddRule #:RemoveRule #:Clear #:Help #:Quit
-           #:parse-command #:policy-listing #:set-listing #:help-text #:prompt-loop))
+  (:export #:Command #:ShowPolicy #:AddRule #:RemoveRule #:Clear #:Help #:Quit #:Auto
+           #:parse-command #:policy-listing #:set-listing #:help-text #:mode-text
+           #:prompt-loop))
 (in-package #:dakusui/commands)
 
 ;;; The commands the user types at the prompt, and the prompt loop. (Spec 0002
 ;;; R1, R9) A line that starts with / never reaches the model. A change to the
 ;;; rule set is saved to the set's file once the helper accepts it. (Spec 0004
-;;; R10)
+;;; R10) /auto shows or switches auto mode. (Spec 0005 R7)
 
 (cl:defun split-word (text)
   "TEXT's first word and the rest, trimmed, as a list of two strings."
@@ -36,7 +38,8 @@
     (RemoveRule UFix)
     Clear
     Help
-    Quit)
+    Quit
+    (Auto (Optional Boolean)))
 
   (declare help-text String)
   (define help-text
@@ -44,6 +47,7 @@
 /allow KINDS PATH  add an allow rule to the session's rule set
 /deny KINDS PATH   add a deny rule
 /remove N          remove rule N of the set, as /policy numbers it
+/auto [on|off]     show auto mode, or turn it on or off
 /clear             forget the conversation
 /help              list these commands
 /quit              leave; so does the end of input")
@@ -73,6 +77,12 @@ with the slash before it. (R9)"
               (Ok (RemoveRule (lisp (-> UFix) (n) n)))
               (Err "/remove takes a rule number, as /policy shows it")))
          ((None) (Err "/remove takes a rule number, as /policy shows it"))))
+      ("auto"
+       (match rest
+         ("" (Ok (Auto None)))
+         ("on" (Ok (Auto (Some True))))
+         ("off" (Ok (Auto (Some False))))
+         (_ (Err "/auto takes on, off, or nothing"))))
       ("clear" (alone Clear))
       ("help" (alone Help))
       ("quit" (alone Quit))
@@ -124,11 +134,20 @@ enforces them, symlinks resolved. (Spec 0004 R9)"
      (Cons (mconcat (make-list "The rule set \"" name "\":"))
            (if (list:null? set) (make-list "  (none)") (numbered 1 set)))))
 
-  (declare run-command (cell:Cell session:Session * String * terminal:Terminal * Command -> Unit))
-  (define (run-command sessions set-file say command)
-    "Run a command that changes or shows the policy. A change is recorded only
-once the helper has accepted it, and then saved to SET-FILE. A failed save
-leaves the change in force. (Spec 0004 R10)"
+  (declare mode-text (gate:Mode -> String))
+  (define (mode-text mode)
+    "What /auto shows. (Spec 0005 R7)"
+    (if (gate:auto? mode)
+        "Auto mode is on: the judge decides which commands run."
+        "Auto mode is off: you decide which commands run."))
+
+  (declare run-command (cell:Cell session:Session * String * gate:Mode * terminal:Terminal * Command
+                        -> Unit))
+  (define (run-command sessions set-file mode say command)
+    "Run a command that changes or shows the policy or the mode. A change is
+recorded only once the helper has accepted it, and then saved to SET-FILE. A
+failed save leaves the change in force. (Spec 0004 R10) Auto mode stays off
+when there is no judge. (Spec 0005 R7)"
     (let change =
       (fn (changed what save)
         (match changed
@@ -159,14 +178,20 @@ leaves the change in force. (Spec 0004 R10)"
                    ((Some removed) (rulesets:drop-line set-file removed))
                    ((None) (Ok Unit))))))
       ((Help) (say help-text))
+      ((Auto (None)) (say (mode-text mode)))
+      ((Auto (Some auto))
+       (match (gate:set-auto! mode auto)
+         ((Ok _) (say (mode-text mode)))
+         ((Err why) (say (<> "dakusui: auto mode stays off; " why)))))
       (_ Unit)))
 
-  (declare prompt-loop (provider:Provider * tools:Tools * turn:Gate * cell:Cell session:Session * String
+  (declare prompt-loop (provider:Provider * tools:Tools * gate:Mode * cell:Cell session:Session * String
                         * terminal:Terminal * (Void -> Optional String) * turn:Conversation
                         -> Unit))
-  (define (prompt-loop ask tools gate sessions set-file say read-line conversation)
+  (define (prompt-loop ask tools mode sessions set-file say read-line conversation)
     "Read a line, and run it as a command or a turn, until /quit or the end of
-input. Changes to the rule set are saved to SET-FILE. (R1, R9; spec 0004 R10)"
+input. Changes to the rule set are saved to SET-FILE. MODE picks who says yes
+to each gated call. (R1, R9; spec 0004 R10; spec 0005 R7)"
     (match (read-line)
       ((None) Unit)
       ((Some line)
@@ -175,17 +200,17 @@ input. Changes to the rule set are saved to SET-FILE. (R1, R9; spec 0004 R10)"
           (match (parse-command line)
             ((Err why)
              (say (<> "dakusui: " why))
-             (prompt-loop ask tools gate sessions set-file say read-line conversation))
+             (prompt-loop ask tools mode sessions set-file say read-line conversation))
             ((Ok (Quit)) Unit)
             ((Ok (Clear))
              (say "The conversation is cleared.")
-             (prompt-loop ask tools gate sessions set-file say read-line
+             (prompt-loop ask tools mode sessions set-file say read-line
                           (turn:new-conversation (session:session-project (cell:read sessions)))))
             ((Ok command)
-             (run-command sessions set-file say command)
-             (prompt-loop ask tools gate sessions set-file say read-line conversation))))
+             (run-command sessions set-file mode say command)
+             (prompt-loop ask tools mode sessions set-file say read-line conversation))))
          ((None)
           (if (== "" line)
-              (prompt-loop ask tools gate sessions set-file say read-line conversation)
-              (prompt-loop ask tools gate sessions set-file say read-line
-                           (fst (turn:run-turn ask tools gate say conversation line))))))))))
+              (prompt-loop ask tools mode sessions set-file say read-line conversation)
+              (prompt-loop ask tools mode sessions set-file say read-line
+                           (fst (turn:run-turn ask tools (gate:mode-gate mode) say conversation line))))))))))
