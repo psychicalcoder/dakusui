@@ -1,6 +1,6 @@
 # 0003: Tools and MCP
 
-Status: Review
+Status: Approved
 
 ## Summary
 
@@ -32,7 +32,7 @@ files does so in a confined process.
   policy.
 - R9: At start, Dakusui MUST start each MCP server named in the configuration
   (spec 0004) over stdio, and add its tools to the list as `SERVER__TOOL`.
-- R10: An MCP server's process MUST run confined, like a command. (Q1)
+- R10: An MCP server's process MUST run confined, like a command.
 - R11: A call to an MCP tool MUST return the text of the server's result, and
   mark it an error when the server does. A call that gets no answer in 120
   seconds returns an error.
@@ -75,11 +75,7 @@ files does so in a confined process.
 
 ## Open questions
 
-- Q1: Does an MCP server run confined (R10)? A server is a program the user
-  chose, but the model drives it, and an unconfined one can read what the
-  policy denies. Confined is the safe answer; it stops a server that needs
-  files outside the policy until the user adds a rule. (blocking for R9
-  through R12)
+None. Settled: Q1 (2026-11-14), an MCP server runs confined (R10).
 
 ## Verification
 

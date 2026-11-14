@@ -17,7 +17,7 @@ Write each test first or alongside its code.
 - [x] T4 Write `bash` and `show_policy`, with truncation. (R3, R5, R6, R7, R8)
   Done when A1's built-in half, A5, and A7 pass, and A3 is in the check agent.
 
-## Phase 2: MCP (after Q1)
+## Phase 2: MCP
 
 - [ ] T5 Write `start-process`. (R10) Done when a process started through it
   answers on its pipes and shows as confined in the check agent.

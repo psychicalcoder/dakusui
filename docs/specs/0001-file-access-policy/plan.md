@@ -191,6 +191,7 @@ One JSON object per line. The agent sends a request; the helper answers.
 |---------|--------|
 | `{"op":"policy","rules":[{"effect":"allow","kinds":["read"],"pattern":"/usr"}]}` | `{"ok":true}` or `{"ok":false,"error":"..."}` |
 | `{"op":"flag","pid":1234}` | `{"ok":true}` |
+| `{"op":"sync"}` | `{"ok":true}`, after every denial logged so far (spec 0003 R6) |
 
 The helper also pushes
 `{"event":"denial","pid":1,"comm":"cat","hook":"file_open","kind":"read","reason":"denied by rule","path":"..."}`.
@@ -292,16 +293,9 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
   where the launcher reads, such as `allow write /bin`, reopens the window.
   Accepted for v0. A fork server, flagged once, would close it.
 - **A late denial line.** The reader thread logs a denial when its event
-  comes, so a command can end before its line appears. To tell the model which
-  access failed (spec 0003), the agent needs a barrier. The kernel submits the
-  record before the command sees `-EACCES`, and the helper drains the ring
-  buffer before it reads a request, so any request after the command ends
-  should get its reply after the event. Untested: it depends on the ring
-  buffer waking the helper in time.
-- **Mixed terminal output.** The reader thread writes denials to stderr. Once
-  the terminal UI (spec 0002) prints from another thread, lines can mix, since
-  SBCL streams are not thread-safe. All terminal output should go through one
-  place.
+  comes, so a command can end before its line appears. The `sync` request
+  (spec 0003) is the barrier: the helper drains the ring buffer before it
+  answers. Its kernel side is not yet run under `make attach-check`.
 - **A shared log file.** Two sessions append to the same `denials.log`. We
   assume SBCL opens it with `O_APPEND` and writes each line in one call, which
   keeps lines whole on Linux. Unchecked.
