@@ -58,4 +58,4 @@ user ── Dakusui (no capabilities) ── LLM server
 | 0002 | Agent loop and provider client | Approved |
 | 0003 | Tools and MCP | Approved |
 | 0004 | Roles and configuration | Implemented |
-| 0005 | Auto mode (judge) | Approved |
+| 0005 | Auto mode (judge) | Implemented |
