@@ -1,14 +1,69 @@
 (defpackage #:dakusui/rulesets
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:policy #:dakusui/policy)
+                    (#:list #:coalton/list)
                     (#:string #:coalton/string))
-  (:export #:set-path #:load-set))
+  (:export #:set-path #:load-set #:add-line #:drop-line))
 (in-package #:dakusui/rulesets)
 
 ;;; Rule sets: named files of rules in the project. (Spec 0004 R6, R8)
 ;;;
 ;;; A set is the file `.dakusui/rules/NAME`, one rule per line. Loading gives
 ;;; the rules as written; the session resolves their symlinks later.
+;;;
+;;; A save holds flock on `.dakusui/rules/.lock`, reads the set as it is now,
+;;; changes one line, writes `.NAME.tmp` beside it, and renames that over the
+;;; set. Each save opens the lock file itself, since flock belongs to an open
+;;; file: two threads then exclude each other as two processes do. (R10, R11)
+
+(cl:defconstant +o-rdwr+ 2)
+(cl:defconstant +o-creat+ #o100)
+(cl:defconstant +o-cloexec+ #o2000000)
+(cl:defconstant +lock-ex+ 2)
+(cl:defconstant +eintr+ 4)
+
+(cl:defun directory-of (path)
+  (cl:subseq path 0 (cl:or (cl:position #\/ path :from-end cl:t) 0)))
+
+(cl:defun errno-text ()
+  (cffi:foreign-funcall "strerror" :int (sb-alien:get-errno) :string))
+
+(cl:defun lock-rules (path)
+  "Make the directory of the set PATH, open its .lock, and wait for flock.
+Return the file descriptor, or a string that says why not."
+  (cl:handler-case
+      (cl:let ((lock (cl:format cl:nil "~A/.lock" (directory-of path))))
+        (cl:ensure-directories-exist (sb-ext:parse-native-namestring lock))
+        (cl:let ((fd (cffi:foreign-funcall "open" :string lock
+                                           :int (cl:logior +o-rdwr+ +o-creat+ +o-cloexec+)
+                                           :int #o644 :int)))
+          (cl:if (cl:minusp fd)
+                 (cl:format cl:nil "cannot open ~A: ~A" lock (errno-text))
+                 (cl:loop
+                   (cl:cond ((cl:zerop (cffi:foreign-funcall "flock" :int fd :int +lock-ex+ :int))
+                             (cl:return fd))
+                            ((cl:/= (sb-alien:get-errno) +eintr+)
+                             (cl:let ((why (cl:format cl:nil "cannot lock ~A: ~A" lock (errno-text))))
+                               (cffi:foreign-funcall "close" :int fd :int)
+                               (cl:return why))))))))
+    (cl:error (e) (cl:format cl:nil "~A" e))))
+
+(cl:defun replace-file (path text)
+  "Write TEXT to a temporary file beside PATH and rename it over PATH.
+Return NIL, or a string that says why not."
+  (cl:let* ((slash (cl:position #\/ path :from-end cl:t))
+            (temp (cl:format cl:nil "~A/.~A.tmp" (directory-of path)
+                             (cl:subseq path (cl:if slash (cl:1+ slash) 0)))))
+    (cl:handler-case
+        (cl:progn
+          (cl:with-open-file (out (sb-ext:parse-native-namestring temp)
+                                  :direction :output :if-exists :supersede
+                                  :external-format :utf-8)
+            (cl:write-string text out))
+          (cl:if (cl:zerop (cffi:foreign-funcall "rename" :string temp :string path :int))
+                 cl:nil
+                 (cl:format cl:nil "cannot rename ~A: ~A" temp (errno-text))))
+      (cl:error (e) (cl:format cl:nil "~A" e)))))
 
 (coalton-toplevel
   (declare quoted (String -> String))
@@ -84,4 +139,71 @@ a line that is not a rule is an error that names PATH and the line. (R6, R8)"
      (text <- (read-file path))
      (match text
        ((None) (pure Nil))
-       ((Some lines) (parse-lines path 1 (string:split #\Newline lines)))))))
+       ((Some lines) (parse-lines path 1 (string:split #\Newline lines))))))
+
+  (declare locked (String * (Void -> Result String Unit) -> Result String Unit))
+  (define (locked path save)
+    "Run SAVE holding the lock of the set PATH. (R11)"
+    (lisp (-> (Result String Unit)) (path save)
+      (cl:let ((fd (lock-rules path)))
+        (cl:if (cl:stringp fd)
+               (coalton (Err (lisp (-> String) () fd)))
+               (cl:unwind-protect (call-coalton-function save)
+                 (cffi:foreign-funcall "close" :int fd :int))))))
+
+  (declare write-set (String * String -> Result String Unit))
+  (define (write-set path text)
+    (lisp (-> (Result String Unit)) (path text)
+      (cl:let ((why (replace-file path text)))
+        (cl:if why
+               (coalton (Err (lisp (-> String) () why)))
+               (coalton (Ok Unit))))))
+
+  (declare save (String * (String -> String) -> Result String Unit))
+  (define (save path change)
+    "Replace the set file PATH with CHANGE of its text, under the lock. A
+missing file has the text \"\". Write nothing if the text stays the same.
+An error names PATH. (R10, R11)"
+    (let result = (locked path
+                          (fn ()
+                            (do
+                             (old <- (map (fn (text) (with-default "" text)) (read-file path)))
+                             (let new = (change old))
+                             (if (== new old) (pure Unit) (write-set path new))))))
+    (match result
+      ((Ok _) (Ok Unit))
+      ((Err why) (Err (mconcat (make-list "cannot save " path ": " why))))))
+
+  (declare newline String)
+  (define newline (into #\Newline))
+
+  (declare appended (String * String -> String))
+  (define (appended text line)
+    "TEXT with LINE as a new last line."
+    (let ended? = (or (== text "") (some? (string:strip-suffix newline text))))
+    (mconcat (make-list text (if ended? "" newline) line newline)))
+
+  (declare add-line (String * policy:Rule -> Result String Unit))
+  (define (add-line path r)
+    "Append R's text to the set file PATH. (R10)"
+    (save path (fn (text) (appended text (policy:rule-text r)))))
+
+  (declare drop-first ((String -> Boolean) * List String -> List String))
+  (define (drop-first match? lines)
+    (match lines
+      ((Nil) Nil)
+      ((Cons line rest) (if (match? line) rest (Cons line (drop-first match? rest))))))
+
+  (declare join-lines (List String -> String))
+  (define (join-lines lines)
+    (match lines
+      ((Nil) "")
+      ((Cons first rest) (<> first (mconcat (map (fn (line) (<> newline line)) rest))))))
+
+  (declare drop-line (String * policy:Rule -> Result String Unit))
+  (define (drop-line path r)
+    "Remove the last line of the set file PATH whose rule is R, and keep every
+other line as it is. Without such a line, leave the file alone. (R10)"
+    (let holds? = (fn (line) (and (not (skipped? line)) (== (Ok r) (policy:parse-rule line)))))
+    (save path (fn (text)
+                 (join-lines (list:reverse (drop-first holds? (list:reverse (string:split #\Newline text)))))))))

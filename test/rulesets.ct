@@ -75,3 +75,130 @@
       (is (string:substring? (<> base "/.dakusui/rules/s line 3:") why))
       (is (string:substring? "\"x\"" why)))
     (remove-tree base)))
+
+;;; Spec 0004 T4: saving a rule set under the lock. (R10, R11)
+
+(cl:defun file-text (path)
+  (cl:if (cl:probe-file path) (uiop:read-file-string path :external-format :utf-8) "none"))
+
+(cl:defun write-raw-file (path text)
+  (cl:ensure-directories-exist path)
+  (cl:with-open-file (out path :direction :output :external-format :utf-8)
+    (cl:write-string text out)))
+
+(coalton-toplevel
+  (declare set-text (String -> String))
+  (define (set-text path)
+    "The text of the file at PATH, or \"none\"."
+    (lisp (-> String) (path) (file-text path)))
+
+  (declare set-file (String -> String))
+  (define (set-file base)
+    (<> base "/.dakusui/rules/s"))
+
+  (declare raw-set (String -> String))
+  (define (raw-set text)
+    "A fresh project whose set s holds exactly TEXT."
+    (let base = (temp-tree Nil Nil Nil))
+    (let path = (set-file base))
+    (lisp (-> Unit) (path text) (write-raw-file path text) Unit)
+    base)
+
+  (declare adds-in-two-threads (String * UFix -> Boolean))
+  (define (adds-in-two-threads path count)
+    "Two threads at once each add COUNT different rules to PATH. True if
+every add succeeded. (A11)"
+    (let ((adds (fn (dir)
+                  (fn ()
+                    (list:all (fn (n) (== (Ok Unit) (rulesets:add-line
+                                              path (rule-of (<> "allow read /" (<> dir (into n)))))))
+                              (list:range 1 count))))))
+      (let ((a (adds "a/")) (b (adds "b/")))
+        (lisp (-> Boolean) (a b)
+          (cl:every (cl:lambda (thread) (sb-thread:join-thread thread))
+                    (cl:list (sb-thread:make-thread (cl:lambda () (call-coalton-function a)))
+                             (sb-thread:make-thread (cl:lambda () (call-coalton-function b))))))))))
+
+(define-test rulesets-add-makes-the-directory ()
+  (let ((base (temp-tree Nil Nil Nil)))
+    (let ((path (set-file base)))
+      (is (== (Ok Unit) (rulesets:add-line path (rule-of "deny read,write /p/x"))))
+      (is (== (Ok Unit) (rulesets:add-line path (rule-of "allow read name:.env"))))
+      (is (== "deny read,write /p/x
+allow read name:.env
+" (set-text path))))
+    (remove-tree base)))
+
+(define-test rulesets-add-after-a-last-line-without-newline ()
+  (let ((base (raw-set "# mine
+deny read /p/x"))
+        (path (set-file base)))
+    (is (== (Ok Unit) (rulesets:add-line path (rule-of "allow write /q"))))
+    (is (== "# mine
+deny read /p/x
+allow write /q
+" (set-text path)))
+    (remove-tree base)))
+
+(define-test rulesets-a9-drop-keeps-comments ()
+  ;; Drops the last line that equals the rule, though spelled differently.
+  (let ((base (raw-set "# keep secrets out
+deny read /p/x
+  # indented note
+
+deny read /p/x/
+allow read /q
+"))
+        (path (set-file base)))
+    (is (== (Ok Unit) (rulesets:drop-line path (rule-of "deny read /p/x"))))
+    (is (== "# keep secrets out
+deny read /p/x
+  # indented note
+
+allow read /q
+" (set-text path)))
+    (is (== (Ok Unit) (rulesets:drop-line path (rule-of "deny read /p/x"))))
+    (is (== "# keep secrets out
+  # indented note
+
+allow read /q
+" (set-text path)))
+    (remove-tree base)))
+
+(define-test rulesets-drop-of-a-missing-rule-changes-nothing ()
+  (let ((base (raw-set "# only a comment
+allow read /q"))
+        (path (set-file base)))
+    (is (== (Ok Unit) (rulesets:drop-line path (rule-of "deny read /p/x"))))
+    (is (== "# only a comment
+allow read /q" (set-text path)))
+    (remove-tree base))
+  (let ((base (temp-tree Nil Nil Nil)))
+    (let ((path (set-file base)))
+      (is (== (Ok Unit) (rulesets:drop-line path (rule-of "deny read /p/x"))))
+      (is (== "none" (set-text path))))
+    (remove-tree base)))
+
+(define-test rulesets-save-failure-names-the-path ()
+  ;; The project is a file, so .dakusui cannot be made.
+  (let ((base (temp-tree Nil (make-list "file") Nil)))
+    (let ((path (<> base "/file/.dakusui/rules/s")))
+      (let ((fails? (fn (result)
+                      (match result
+                        ((Ok _) False)
+                        ((Err why) (string:substring? (<> "cannot save " path) why))))))
+        (is (fails? (rulesets:add-line path (rule-of "deny read /p/x"))))
+        (is (fails? (rulesets:drop-line path (rule-of "deny read /p/x"))))))
+    (remove-tree base)))
+
+(define-test rulesets-a11-two-threads-lose-nothing ()
+  (let ((base (temp-tree Nil Nil Nil)))
+    (let ((path (set-file base)))
+      (is (adds-in-two-threads path 100))
+      (let ((lines (list:filter (fn (line) (/= line "")) (string:split #\Newline (set-text path))))
+            (wanted (fn (dir) (map (fn (n) (<> "allow read /" (<> dir (into n))))
+                                   (list:range 1 100)))))
+        (is (== 200 (list:length lines)))
+        (is (== (list:sort (<> (wanted "a/") (wanted "b/"))) (list:sort lines))))
+      (is (== (Ok 200) (map list:length (rulesets:load-set path)))))
+    (remove-tree base)))
