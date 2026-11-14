@@ -6,19 +6,23 @@
                     (#:terminal #:dakusui/terminal)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
-  (:export #:Conversation #:system-prompt #:new-conversation
+  (:export #:Conversation #:Gate #:system-prompt #:new-conversation
            #:max-calls #:run-turn #:short-form))
 (in-package #:dakusui/loop)
 
 ;;; One turn of the conversation. (Spec 0002 R1, R3, R5, R6, R7, R8)
 ;;;
-;;; The turn is handed its provider, tools, and terminal, so tests script all
-;;; three. Every call of a reply runs before the next request, so the
+;;; The turn is handed its provider, tools, gate, and terminal, so tests
+;;; script all four. Every call of a reply runs before the next request, so the
 ;;; conversation never holds a tool call without its result.
 
 (coalton-toplevel
   (define-type-alias Conversation (List chat:Message)
     "The messages so far, the system prompt first.")
+
+  (define-type-alias Gate (chat:ToolCall * Conversation -> Result String Unit)
+    "Says whether a call may run, given the conversation that led to it. Err
+holds the reason it may not. (Spec 0005 R1)")
 
   (declare system-prompt (String -> String))
   (define (system-prompt project)
@@ -58,20 +62,26 @@ Call show_policy to see the policy in force. Only the user can change it.")))
                    (cl:> (cl:length first) 100)
                    more))))
 
-  (declare run-calls (tools:Tools * terminal:Terminal * List chat:ToolCall -> List chat:Message))
-  (define (run-calls tools say calls)
-    "Run CALLS in order. Show each before it runs, and its result after. (R3, R8)"
+  (declare run-calls (tools:Tools * Gate * terminal:Terminal * Conversation * List chat:ToolCall
+                      -> List chat:Message))
+  (define (run-calls tools gate say conversation calls)
+    "Run CALLS in order. Show each before it runs, and its result after. A
+call to a gated tool runs only if GATE says yes; else the reason is its
+result. (R3, R8; spec 0005 R1)"
     (match calls
       ((Nil) Nil)
       ((Cons c rest)
        (say (mconcat (make-list "[" (chat:call-name c) "] " (chat:call-arguments c))))
-       (let result = (tools:call tools c))
+       (let allowed = (if (tools:gated? tools c) (gate c conversation) (Ok Unit)))
+       (let result = (match allowed
+                       ((Ok _) (tools:call tools c))
+                       ((Err reason) reason)))
        (say (<> "  = " (short-form result)))
-       (Cons (chat:ToolResult (chat:call-id c) result) (run-calls tools say rest)))))
+       (Cons (chat:ToolResult (chat:call-id c) result) (run-calls tools gate say conversation rest)))))
 
-  (declare turn-loop (provider:Provider * tools:Tools * terminal:Terminal * Conversation * UFix
+  (declare turn-loop (provider:Provider * tools:Tools * Gate * terminal:Terminal * Conversation * UFix
                       -> Tuple Conversation (Result String Unit)))
-  (define (turn-loop ask tools say conversation made)
+  (define (turn-loop ask tools gate say conversation made)
     (if (>= made max-calls)
         (progn
           (say "dakusui: the turn stopped after 50 model calls")
@@ -86,16 +96,16 @@ Call show_policy to see the policy in force. Only the user can change it.")))
            (match text
              ((Some words) (if (== words "") Unit (say words)))
              ((None) Unit))
-           (let results = (run-calls tools say calls))
-           (let next = (<> conversation (Cons (chat:Assistant text calls) results)))
+           (let asked = (<> conversation (make-list (chat:Assistant text calls))))
+           (let next = (<> asked (run-calls tools gate say asked calls)))
            (if (list:null? calls)
                (Tuple next (Ok Unit))
-               (turn-loop ask tools say next (+ made 1)))))))
+               (turn-loop ask tools gate say next (+ made 1)))))))
 
-  (declare run-turn (provider:Provider * tools:Tools * terminal:Terminal * Conversation * String
+  (declare run-turn (provider:Provider * tools:Tools * Gate * terminal:Terminal * Conversation * String
                      -> Tuple Conversation (Result String Unit)))
-  (define (run-turn ask tools say conversation text)
-    "Send TEXT, then run the tools the model asks for, until a reply asks for
-none. Stop after 50 model calls. On a provider error, print it and return the
+  (define (run-turn ask tools gate say conversation text)
+    "Send TEXT, then run the tools the model asks for, as GATE allows, until a
+reply asks for none. Stop after 50 model calls. On a provider error, print it and return the
 conversation as gathered. (R1, R3, R5, R6)"
-    (turn-loop ask tools say (<> conversation (make-list (chat:User text))) 0)))
+    (turn-loop ask tools gate say (<> conversation (make-list (chat:User text))) 0)))

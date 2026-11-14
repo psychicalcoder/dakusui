@@ -161,10 +161,10 @@ leaves the change in force. (Spec 0004 R10)"
       ((Help) (say help-text))
       (_ Unit)))
 
-  (declare prompt-loop (provider:Provider * tools:Tools * cell:Cell session:Session * String
+  (declare prompt-loop (provider:Provider * tools:Tools * turn:Gate * cell:Cell session:Session * String
                         * terminal:Terminal * (Void -> Optional String) * turn:Conversation
                         -> Unit))
-  (define (prompt-loop ask tools sessions set-file say read-line conversation)
+  (define (prompt-loop ask tools gate sessions set-file say read-line conversation)
     "Read a line, and run it as a command or a turn, until /quit or the end of
 input. Changes to the rule set are saved to SET-FILE. (R1, R9; spec 0004 R10)"
     (match (read-line)
@@ -175,17 +175,17 @@ input. Changes to the rule set are saved to SET-FILE. (R1, R9; spec 0004 R10)"
           (match (parse-command line)
             ((Err why)
              (say (<> "dakusui: " why))
-             (prompt-loop ask tools sessions set-file say read-line conversation))
+             (prompt-loop ask tools gate sessions set-file say read-line conversation))
             ((Ok (Quit)) Unit)
             ((Ok (Clear))
              (say "The conversation is cleared.")
-             (prompt-loop ask tools sessions set-file say read-line
+             (prompt-loop ask tools gate sessions set-file say read-line
                           (turn:new-conversation (session:session-project (cell:read sessions)))))
             ((Ok command)
              (run-command sessions set-file say command)
-             (prompt-loop ask tools sessions set-file say read-line conversation))))
+             (prompt-loop ask tools gate sessions set-file say read-line conversation))))
          ((None)
           (if (== "" line)
-              (prompt-loop ask tools sessions set-file say read-line conversation)
-              (prompt-loop ask tools sessions set-file say read-line
-                           (fst (turn:run-turn ask tools say conversation line))))))))))
+              (prompt-loop ask tools gate sessions set-file say read-line conversation)
+              (prompt-loop ask tools gate sessions set-file say read-line
+                           (fst (turn:run-turn ask tools gate say conversation line))))))))))

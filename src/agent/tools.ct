@@ -8,15 +8,16 @@
                     (#:cell #:coalton/cell)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
-  (:export #:Tool #:Tools #:tool-spec #:specs #:call
+  (:export #:Tool #:Tools #:tool-spec #:specs #:call #:gated?
            #:Arguments #:parse-arguments #:with-arguments
            #:required-string #:optional-integer
            #:max-result #:shorten
            #:bash-tool #:show-policy-tool #:builtin-tools))
 (in-package #:dakusui/tools)
 
-;;; Spec 0003: the tools the model may call. A tool is its spec and a function
-;;; from the raw argument text to a result text. A result never fails: a
+;;; Spec 0003: the tools the model may call. A tool is its spec, whether a
+;;; call needs a go-ahead first (spec 0005 R1), and a function from the raw
+;;; argument text to a result text. A result never fails: a
 ;;; problem comes back as text that starts with "error: ". (Spec 0002 R4)
 ;;;
 ;;; No tool here opens a file. bash and, later, MCP servers spawn through the
@@ -40,6 +41,7 @@
 (coalton-toplevel
   (define-struct Tool
     (spec chat:ToolSpec)
+    (gated Boolean)
     (run (String -> String)))
 
   (define-type-alias Tools (List Tool))
@@ -73,12 +75,24 @@
                           (cl:subseq text 0 keep) (cl:- n (cl:* 2 keep))
                           (cl:subseq text (cl:- n keep)))))))
 
+  (declare named (Tools * String -> Optional Tool))
+  (define (named tools name)
+    (list:find (fn (tool) (== name (chat:spec-name (.spec tool)))) tools))
+
+  (declare gated? (Tools * chat:ToolCall -> Boolean))
+  (define (gated? tools c)
+    "True if C names a tool that needs a go-ahead. A call to an unknown tool
+cannot run, so it needs none. (Spec 0005 R1)"
+    (match (named tools (chat:call-name c))
+      ((Some tool) (.gated tool))
+      ((None) False)))
+
   (declare call (Tools * chat:ToolCall -> String))
   (define (call tools c)
     "Run the tool C names on its arguments. (R1, spec 0002 R4)"
     (let name = (chat:call-name c))
     (shorten
-     (match (list:find (fn (tool) (== name (chat:spec-name (.spec tool)))) tools)
+     (match (named tools name)
        ((Some tool) ((.run tool) (chat:call-arguments c)))
        ((None)
         (mconcat (make-list "error: unknown tool " (chat:quoted name) "; the tools are "
@@ -221,6 +235,7 @@ command has reached the log. (R6)"
            "bash"
            "Run a command with sh in the project directory. The kernel confines it to the file access policy. Stdin is /dev/null. The result holds stdout and stderr together, the exit code when it is not 0, and each access the policy denied."
            bash-schema)
+          True
           (with-arguments
               (fn (args)
                 (do
@@ -236,6 +251,7 @@ arguments, so empty text passes too."
            "show_policy"
            "Show the file access policy in force, one rule per line, in order. The last rule that matches an access decides it. An access no rule matches is denied."
            "{\"type\":\"object\",\"properties\":{}}")
+          False
           (fn (text)
             (let policy = (fn (_) (Ok (session:policy-text (cell:read sessions)))))
             ((with-arguments policy) (if (== "" text) "{}" text)))))

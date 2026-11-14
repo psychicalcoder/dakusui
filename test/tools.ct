@@ -108,6 +108,16 @@ returns the request lines once the agent closes its end."
   (let requests = (unrig r))
   (is (== 0 (op-count "flag" requests))))
 
+(define-test tools-bash-is-gated-and-show-policy-is-not ()
+  ;; Spec 0005 R1. An unknown tool cannot run, so it needs no gate.
+  (let r = (make-rig Nil))
+  (let gated = (fn (name) (tools:gated? (rig-tools r) (chat:ToolCall "c1" name "{}"))))
+  (is (gated "bash"))
+  (is (not (gated "show_policy")))
+  (is (not (gated "nosuch")))
+  (unrig r)
+  Unit)
+
 (define-test tools-an-unknown-tool-is-an-error-result ()
   (let r = (make-rig Nil))
   (is (== "error: unknown tool \"nosuch\"; the tools are bash, show_policy"

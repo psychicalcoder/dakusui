@@ -26,7 +26,7 @@
     "Run the prompt loop on INPUT, saving rule changes to SET-FILE. Return the
 terminal's lines."
     (let (Tuple lines say) = (capture))
-    (commands:prompt-loop (scripted sc) (rig-tools r) (.sessions r) set-file say (typed input)
+    (commands:prompt-loop (scripted sc) (rig-tools r) yes-gate (.sessions r) set-file say (typed input)
                           (turn:new-conversation (rig-project r)))
     (captured lines))
 

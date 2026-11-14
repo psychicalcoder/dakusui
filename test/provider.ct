@@ -94,7 +94,7 @@ Return the port and a thread that returns the request's text."
     "Run one turn with the provider ASK. Return the outcome and the terminal's lines."
     (let (Tuple lines say) = (capture))
     (let (Tuple _ outcome) =
-      (turn:run-turn ask (rig-tools r) say (turn:new-conversation (rig-project r)) text))
+      (turn:run-turn ask (rig-tools r) yes-gate say (turn:new-conversation (rig-project r)) text))
     (Tuple outcome (captured lines))))
 
 (define-test provider-a1-the-provider-posts-the-conversation-and-shows-the-reply ()

@@ -55,6 +55,11 @@ each request it got, newest first."
                   (_ True)))
               messages))
 
+  (declare yes-gate turn:Gate)
+  (define yes-gate
+    "A gate that lets every call run."
+    (fn (_ _) (Ok Unit)))
+
   (declare turn-of (Rig * Script * String
                     -> Tuple3 (List chat:Message) (Result String Unit) (List String)))
   (define (turn-of r sc text)
@@ -62,7 +67,7 @@ each request it got, newest first."
 the outcome, and the terminal's lines."
     (let (Tuple lines say) = (capture))
     (let (Tuple conversation outcome) =
-      (turn:run-turn (scripted sc) (rig-tools r) say (turn:new-conversation (rig-project r)) text))
+      (turn:run-turn (scripted sc) (rig-tools r) yes-gate say (turn:new-conversation (rig-project r)) text))
     (Tuple3 conversation outcome (captured lines))))
 
 (define-test turn-a2-a-tool-call-runs-and-the-model-sees-its-result ()
@@ -135,6 +140,31 @@ the outcome, and the terminal's lines."
   (is (== (Some (chat:ToolResult "c1" "one")) (list:last conversation)))
   (is (all-answered? conversation))
   (unrig r)
+  Unit)
+
+(define-test turn-a-gate-that-says-no-keeps-bash-from-running ()
+  ;; Spec 0005 T1 (R1): the gate is asked for bash only, its reason is the
+  ;; result and shows on the terminal, and show_policy runs unasked.
+  (let r = (make-rig Nil))
+  (let asked = (cell:new Nil))
+  (let no-gate = (fn (c conversation)
+                   (cell:push! asked (Tuple (chat:call-name c) (list:last conversation)))
+                   (Err "the user declined")))
+  (let calls = (make-list (bash-call "c1" "echo one") (chat:ToolCall "c2" "show_policy" "{}")))
+  (let sc = (make-script (make-list (Ok (calls-reply calls)) (Ok (text-reply "done")))))
+  (let (Tuple lines say) = (capture))
+  (let (Tuple _ outcome) =
+    (turn:run-turn (scripted sc) (rig-tools r) no-gate say (turn:new-conversation (rig-project r)) "hi"))
+  (is (== (Ok Unit) outcome))
+  ;; The gate sees the reply that made the call.
+  (is (== (make-list (Tuple "bash" (Some (chat:Assistant None calls)))) (cell:read asked)))
+  (let results = (list:drop 3 (with-default Nil (list:index 1 (requests sc)))))
+  (is (== (Some (chat:ToolResult "c1" "the user declined")) (list:index 0 results)))
+  (is (== (Some (chat:ToolResult "c2" (session:policy-text (cell:read (.sessions r)))))
+          (list:index 1 results)))
+  (is (list:member "  = the user declined" (captured lines)))
+  ;; bash never ran: the helper got no flag.
+  (is (== 0 (op-count "flag" (unrig r))))
   Unit)
 
 (define-test turn-a7-the-system-prompt-names-the-project-and-show-policy ()
