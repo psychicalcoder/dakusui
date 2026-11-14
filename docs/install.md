@@ -41,6 +41,23 @@ mount itself looks like this, with `1000` as the user's uid and group id:
 
     mount -t bpf -o uid=1000,gid=1000,mode=0700 bpffs /run/dakusui/1000
 
+## 4. A model
+
+Dakusui talks to an OpenAI-compatible server. Name it in the environment:
+
+    export OPENAI_BASE_URL=http://localhost:8080/v1
+    export OPENAI_MODEL=qwen3-coder
+    export OPENAI_API_KEY=...        # if the server wants one
+
+Or write roles in `~/.config/dakusui/config.json`, which no command can read:
+
+    {"roles": {"agent": {"model": "qwen3-coder",
+                         "base_url": "http://localhost:8080/v1"},
+               "judge": {"model": "qwen3-small"}}}
+
+Spec 0004 lists every key. `dakusui --role NAME` picks a role, and
+`--rules NAME` a rule set from `.dakusui/rules` in the project.
+
 ## Check
 
 The mount must show as `bpf`, owned by the user, mode `drwx------`:

@@ -1,6 +1,6 @@
 # 0004: Roles and configuration
 
-Status: Approved
+Status: Implemented
 
 ## Summary
 
@@ -115,15 +115,18 @@ None.
 
 | Requirement | Verified by | State |
 |-------------|-------------|-------|
-| R1 | A1 | Not started |
-| R2 | A2, A3 | Not started |
-| R3 | A1, A2 | Not started |
-| R4 | A4 | Not started |
-| R5 | A3 | Not started |
-| R6 | A5, A7 | Not started |
-| R7 | A5 | Not started |
-| R8 | A6 | Not started |
-| R9 | A8 | Not started |
-| R10 | A9, A10 | Not started |
-| R11 | A11 | Not started |
-| R12 | A12 | Not started |
+| R1 | A1 | Passes (unit) |
+| R2 | A2, A3 | Passes (unit) |
+| R3 | A1, A2 | Passes (unit) |
+| R4 | A4 | Passes (unit, agent-check) |
+| R5 | A3 | Passes (unit) |
+| R6 | A5, A7 | Passes (unit, agent-check) |
+| R7 | A5 | Passes (unit, agent-check) |
+| R8 | A6 | Passes (unit) |
+| R9 | A8 | Passes (unit, agent-check) |
+| R10 | A9, A10 | Passes (unit, agent-check) |
+| R11 | A11 | Passes (unit, agent-check) |
+| R12 | A12 | Passes (unit) |
+
+"Unit" is `make test`; "agent-check" is `make agent-check`, the agent under
+a stand-in helper. Checked 2026-11-14.

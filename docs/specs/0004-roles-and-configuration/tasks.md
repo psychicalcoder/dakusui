@@ -16,5 +16,5 @@ Write each test first or alongside its code.
   set, the start-up listing, and saving. (R4, R7, R9, R10) Done when A5, A8,
   A9, and A10 pass, and `make agent-check` starts the agent with `--role`
   and `--rules`.
-- [ ] T6 Describe the configuration file in `docs/install.md`. Fill in the
+- [x] T6 Describe the configuration file in `docs/install.md`. Fill in the
   verification table.

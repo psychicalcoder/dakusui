@@ -1,6 +1,6 @@
 # Plan for 0004: Roles and configuration
 
-Status: Approved
+Status: Implemented
 Spec: ./spec.md
 Tasks: ./tasks.md
 
@@ -86,6 +86,11 @@ change, and print a warning if the save fails (R10).
 - **A key in the file.** The file is the user's to protect. The default
   policy keeps commands out; other users are kept out by its mode, which
   Dakusui does not check.
+
+- **A rule written by hand through a symlink.** The session holds the rule
+  resolved, so `/remove` finds no equal line in the file and leaves it. The
+  rule is gone for the session and back at the next start. Rules saved by
+  the commands are already resolved.
 
 ## Testing
 
