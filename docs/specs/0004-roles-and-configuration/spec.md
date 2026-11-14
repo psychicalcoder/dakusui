@@ -21,7 +21,8 @@ MCP servers; the command line picks a role, a rule set, and the mode.
   base URL from `OPENAI_BASE_URL`, else `https://api.openai.com/v1`; the key
   from `OPENAI_API_KEY`; the model from `OPENAI_MODEL`. Every other role
   fills its missing fields from `agent`. So `judge` exists with no
-  configuration at all.
+  configuration at all. A role that gives its own base URL does not take the
+  agent's key: a key goes only to the server it was given for.
 - R4: `--role NAME` MUST pick the role the loop talks to; the default is
   `agent`. A role that is not defined, or that ends with no model, stops
   Dakusui before any request, with a message that names the role and the fix.
@@ -71,7 +72,8 @@ Example:
   same.
 - A2 (R2, R3): Given the example above and `OPENAI_API_KEY=k`, then `judge`
   has model `qwen3-small` and the agent's base URL, and `cloud` has key `k`
-  and the set `strict`.
+  and the set `strict`. A role with only `"base_url": "http://other/v1"` has
+  no key.
 - A3 (R2, R5): Given a role with both `api_key` and `api_key_env`, a key
   `modle`, or `"model": 5`, then Dakusui stops with a message that names the
   key.

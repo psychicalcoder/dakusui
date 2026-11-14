@@ -56,6 +56,7 @@
                (:ct-file "loop")
                (:ct-file "commands")
                (:ct-file "options")
+               (:ct-file "config")
                (:ct-file "main")))
 
 (defsystem "dakusui/check-agent"
@@ -97,4 +98,5 @@ Run it with `make attach-check`."
                (:ct-file "loop")
                (:ct-file "provider")
                (:ct-file "commands")
-               (:ct-file "options")))
+               (:ct-file "options")
+               (:ct-file "config")))

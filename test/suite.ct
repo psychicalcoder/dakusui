@@ -19,6 +19,7 @@
                     (#:turn #:dakusui/loop)
                     (#:commands #:dakusui/commands)
                     (#:options #:dakusui/options)
+                    (#:config #:dakusui/config)
                     (#:cell #:coalton/cell)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))

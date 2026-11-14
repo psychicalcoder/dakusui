@@ -1,0 +1,330 @@
+(defpackage #:dakusui/config
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:list #:coalton/list))
+  (:export #:Role #:role-model #:role-base-url #:role-api-key #:role-rules
+           #:McpServer #:server-name #:server-command #:server-env
+           #:Config #:config-servers
+           #:parse-config #:role #:default-base-url))
+(in-package #:dakusui/config)
+
+;;; The configuration file: roles and MCP servers. (Spec 0004 R1-R5, R12)
+;;;
+;;; The file's text is parsed at the edge into a typed Config, or into an
+;;; error that names the key at fault. Reading the file is main's job.
+
+(coalton-toplevel
+  (repr :native cl:t)
+  (define-type LispValue)
+
+  (define-type Json
+    "A parsed JSON value. Numbers carry no value, since no key takes one."
+    JNull
+    (JBool Boolean)
+    JNumber
+    (JString String)
+    (JArray (List Json))
+    (JObject (List (Tuple String Json))))
+
+  (define-type Role
+    "The model a session talks to: its model, base URL, key, and rule set. It
+prints without its key. (R2; spec 0002 R10) The constructor is not `Role`,
+which would take the name of the function `role`."
+    (MakeRole String String (Optional String) (Optional String)))
+
+  (declare role-model (Role -> String))
+  (define (role-model (MakeRole model _ _ _)) model)
+
+  (declare role-base-url (Role -> String))
+  (define (role-base-url (MakeRole _ url _ _)) url)
+
+  (declare role-api-key (Role -> Optional String))
+  (define (role-api-key (MakeRole _ _ key _)) key)
+
+  (declare role-rules (Role -> Optional String))
+  (define (role-rules (MakeRole _ _ _ rules)) rules)
+
+  (define-struct Draft
+    "A role as far as it is known. KEY is None when nothing gave a key, and
+Some of the key, if any, when something did: an `api_key_env` that names an
+unset variable gives Some None, so the role does not take the agent's key."
+    (model (Optional String))
+    (base-url (Optional String))
+    (key (Optional (Optional String)))
+    (rules (Optional String)))
+
+  (derive Eq)
+  (define-struct McpServer
+    "An MCP server: its name, its command, and the variables to add to its
+environment. (R12; spec 0003 R9)"
+    (name String)
+    (command String)
+    (env (List (Tuple String String))))
+
+  (declare server-name (McpServer -> String))
+  (define (server-name s) (.name s))
+
+  (declare server-command (McpServer -> String))
+  (define (server-command s) (.command s))
+
+  (declare server-env (McpServer -> List (Tuple String String)))
+  (define (server-env s) (.env s))
+
+  (define-struct Config
+    "Every role, resolved as R3 says, and the MCP servers."
+    (roles (List (Tuple String Draft)))
+    (servers (List McpServer)))
+
+  (declare config-servers (Config -> List McpServer))
+  (define (config-servers c) (.servers c))
+
+  (declare default-base-url String)
+  (define default-base-url "https://api.openai.com/v1")
+
+  (declare config-file String)
+  (define config-file "~/.config/dakusui/config.json")
+
+  ;; JSON
+
+  (declare max-depth UFix)
+  (define max-depth 8)
+
+  (declare to-json (LispValue -> Json))
+  (define (to-json v)
+    "Convert what jzon returns. Its objects are hash tables, which keep the
+file's order, and its arrays vectors. true is T, false is NIL, and null is the
+symbol NULL."
+    (let kind =
+      (lisp (-> UFix) (v)
+        (cl:typecase v
+          (cl:string 0)
+          (cl:real 1)
+          (cl:vector 2)
+          (cl:hash-table 3)
+          (cl:t (cl:cond ((cl:eq v cl:t) 4)
+                         ((cl:null v) 5)
+                         (cl:t 6))))))
+    (match kind
+      (0 (JString (lisp (-> String) (v)
+                    (cl:coerce v '(cl:simple-array cl:character (cl:*))))))
+      (1 JNumber)
+      (2 (JArray (map to-json (lisp (-> (List LispValue)) (v) (cl:coerce v 'cl:list)))))
+      (3 (JObject
+          (list:zip
+           (lisp (-> (List String)) (v)
+             (cl:loop :for k :being :the :hash-keys :of v
+                      :collect (cl:coerce k '(cl:simple-array cl:character (cl:*)))))
+           (map to-json (lisp (-> (List LispValue)) (v)
+                          (cl:loop :for x :being :the :hash-values :of v :collect x))))))
+      (4 (JBool True))
+      (5 (JBool False))
+      (_ JNull)))
+
+  (declare parse-json (String -> Result String Json))
+  (define (parse-json text)
+    (let parsed =
+      (lisp (-> (Result String LispValue)) (text max-depth)
+        (cl:handler-case
+            (cl:let ((value (com.inuoe.jzon:parse text :max-depth max-depth)))
+              (coalton (Ok (lisp (-> LispValue) () value))))
+          (cl:error (e)
+            (cl:let ((why (cl:let ((cl:*print-pretty* cl:nil)) (cl:princ-to-string e))))
+              (coalton (Err (lisp (-> String) () why))))))))
+    (match parsed
+      ((Ok value) (Ok (to-json value)))
+      ((Err why) (Err (<> "the configuration is not JSON: " why)))))
+
+  (declare quoted (String -> String))
+  (define (quoted text)
+    (lisp (-> String) (text) (com.inuoe.jzon:stringify text)))
+
+  ;; Keys. AT names where a value sits, such as roles.cloud.model.
+
+  (declare as-object (String * Json -> Result String (List (Tuple String Json))))
+  (define (as-object at json)
+    (match json
+      ((JObject fields) (Ok fields))
+      (_ (Err (<> at " must be an object")))))
+
+  (declare as-string (String * Json -> Result String String))
+  (define (as-string at json)
+    (match json
+      ((JString s) (Ok s))
+      (_ (Err (<> at " must be a string")))))
+
+  (declare inside (String * String -> String))
+  (define (inside at key)
+    (if (== at "") key (<> at (<> "." key))))
+
+  (declare only-keys (String * List String * List (Tuple String Json) -> Result String Unit))
+  (define (only-keys at allowed fields)
+    "Unknown keys are errors, so a typo is not ignored. (R5)"
+    (match (list:find (fn ((Tuple name _)) (not (list:member name allowed))) fields)
+      ((Some (Tuple name _)) (Err (<> "unknown key " (inside at name))))
+      ((None) (Ok Unit))))
+
+  (declare lookup (String * List (Tuple String :a) -> Optional :a))
+  (define (lookup name fields)
+    (map snd (list:find (fn ((Tuple key _)) (== key name)) fields)))
+
+  (declare optional-string (String * String * List (Tuple String Json)
+                            -> Result String (Optional String)))
+  (define (optional-string at key fields)
+    (match (lookup key fields)
+      ((None) (Ok None))
+      ((Some json) (map Some (as-string (inside at key) json)))))
+
+  (declare object-or-empty (String * String * List (Tuple String Json)
+                            -> Result String (List (Tuple String Json))))
+  (define (object-or-empty at key fields)
+    (match (lookup key fields)
+      ((None) (Ok Nil))
+      ((Some json) (as-object (inside at key) json))))
+
+  ;; Roles
+
+  (declare read-role ((String -> Optional String) * Tuple String Json
+                      -> Result String (Tuple String Draft)))
+  (define (read-role env entry)
+    "One role of the file. `api_key_env` is read at once. (R2)"
+    (match entry
+      ((Tuple name json)
+       (let at = (inside "roles" name))
+       (do
+        (fields <- (as-object at json))
+        (only-keys at (make-list "model" "base_url" "api_key" "api_key_env" "rules") fields)
+        (model <- (optional-string at "model" fields))
+        (base-url <- (optional-string at "base_url" fields))
+        (key <- (optional-string at "api_key" fields))
+        (key-env <- (optional-string at "api_key_env" fields))
+        (rules <- (optional-string at "rules" fields))
+        (given <- (match (Tuple key key-env)
+                    ((Tuple (Some _) (Some _))
+                     (Err (<> at " has both api_key and api_key_env; keep one")))
+                    ((Tuple (Some k) (None)) (Ok (Some (Some k))))
+                    ((Tuple (None) (Some variable)) (Ok (Some (env variable))))
+                    ((Tuple (None) (None)) (Ok None))))
+        (pure (Tuple name (Draft model base-url given rules)))))))
+
+  (declare either (Optional :a * Optional :a -> Optional :a))
+  (define (either a b)
+    (match a
+      ((Some _) a)
+      ((None) b)))
+
+  (declare fill (Draft * Draft -> Draft))
+  (define (fill f from)
+    "F with its missing fields taken FROM another."
+    (Draft (either (.model f) (.model from))
+           (either (.base-url f) (.base-url from))
+           (either (.key f) (.key from))
+           (either (.rules f) (.rules from))))
+
+  (declare from-environment ((String -> Optional String) -> Draft))
+  (define (from-environment env)
+    "What the agent role takes from the environment. (R3)"
+    (Draft (env "OPENAI_MODEL")
+           (Some (with-default default-base-url (env "OPENAI_BASE_URL")))
+           (Some (env "OPENAI_API_KEY"))
+           None))
+
+  (declare resolve-roles ((String -> Optional String) * List (Tuple String Draft)
+                          -> List (Tuple String Draft)))
+  (define (resolve-roles env given)
+    "Fill `agent` from the environment, and every other role from `agent`.
+`judge` exists even when the file does not name it. (R3)"
+    (let empty = (Draft None None None None))
+    (let agent = (fill (with-default empty (lookup "agent" given)) (from-environment env)))
+    (let others = (list:filter (fn ((Tuple name _)) (/= name "agent")) given))
+    (let others* = (if (list:any (fn ((Tuple name _)) (== name "judge")) others)
+                       others
+                       (<> others (make-list (Tuple "judge" empty)))))
+    (Cons (Tuple "agent" agent)
+          (map (fn ((Tuple name f)) (Tuple name (fill (own-server-own-key f) agent))) others*)))
+
+  (declare own-server-own-key (Draft -> Draft))
+  (define (own-server-own-key f)
+    "F, keyless if it gives its own base URL and no key, so that it does not
+take the agent's key: a key goes only to the server it was given for. (R3)"
+    (match (Tuple (.base-url f) (.key f))
+      ((Tuple (Some _) (None)) (Draft (.model f) (.base-url f) (Some None) (.rules f)))
+      (_ f)))
+
+  ;; MCP servers
+
+  (declare server-name? (String -> Boolean))
+  (define (server-name? name)
+    "Lowercase letters, digits, -, or _, at least one. (R12)"
+    (lisp (-> Boolean) (name)
+      (cl:and (cl:plusp (cl:length name))
+              (cl:every (cl:lambda (c)
+                          (cl:or (cl:char<= #\a c #\z) (cl:char<= #\0 c #\9)
+                                 (cl:char= c #\-) (cl:char= c #\_)))
+                        name))))
+
+  (declare read-variable (String * Tuple String Json -> Result String (Tuple String String)))
+  (define (read-variable at entry)
+    (match entry
+      ((Tuple name json) (map (fn (value) (Tuple name value)) (as-string (inside at name) json)))))
+
+  (declare read-server (Tuple String Json -> Result String McpServer))
+  (define (read-server entry)
+    (match entry
+      ((Tuple name json)
+       (let at = (inside "mcp" name))
+       (do
+        (if (server-name? name)
+            (Ok Unit)
+            (Err (<> "bad MCP server name " (<> (quoted name)
+                                                " under mcp; use lowercase letters, digits, -, or _"))))
+        (fields <- (as-object at json))
+        (only-keys at (make-list "command" "env") fields)
+        (command <- (match (lookup "command" fields)
+                      ((Some c) (as-string (inside at "command") c))
+                      ((None) (Err (<> at " needs a command")))))
+        (variables <- (object-or-empty at "env" fields))
+        (env <- (traverse (fn (v) (read-variable (inside at "env") v)) variables))
+        (pure (McpServer name command env))))))
+
+  ;; The whole file
+
+  (declare parse-config (String * (String -> Optional String) -> Result String Config))
+  (define (parse-config text env)
+    "Parse the configuration file's TEXT. ENV reads the environment, for
+OPENAI_* and each `api_key_env`. An unknown key, a value of the wrong type, or
+both kinds of key in a role is an error that names the key. (R2, R3, R5, R12)"
+    (do
+     (json <- (parse-json text))
+     (top <- (as-object "the configuration" json))
+     (only-keys "" (make-list "roles" "mcp") top)
+     (roles <- (object-or-empty "" "roles" top))
+     (given <- (traverse (fn (r) (read-role env r)) roles))
+     (servers <- (object-or-empty "" "mcp" top))
+     (typed <- (traverse read-server servers))
+     (pure (Config (resolve-roles env given) typed))))
+
+  (declare role (Config * String -> Result String Role))
+  (define (role config name)
+    "The role NAME, or why there is none to talk to. (R4)"
+    (match (lookup name (.roles config))
+      ((None)
+       (Err (<> "no role " (<> (quoted name)
+                               (<> "; define it under \"roles\" in " config-file)))))
+      ((Some f)
+       (match (.model f)
+         ((None)
+          (Err (<> "the role " (<> (quoted name)
+                                   (<> " has no model; set \"model\" for it in "
+                                       (<> config-file ", or set OPENAI_MODEL"))))))
+         ((Some model)
+          (Ok (MakeRole model
+                        (with-default default-base-url (.base-url f))
+                        (with-default None (.key f))
+                        (.rules f)))))))))
+
+;;; Neither a Role nor what a Config holds may print its key. (Spec 0002 R10)
+(cl:defmethod cl:print-object ((r Role/MakeRole) stream)
+  (cl:print-unreadable-object (r stream :type cl:t)
+    (cl:format stream "~S" (coalton (role-model (lisp (-> Role) () r))))))
+
+(cl:defmethod cl:print-object ((f Draft/Draft) stream)
+  (cl:print-unreadable-object (f stream :type cl:t)))
