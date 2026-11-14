@@ -51,7 +51,7 @@ returns the request lines once the agent closes its end."
                     (coalton (Tuple (lisp (-> I32) () fd) (lisp (-> LispThread) () thread))))))
     (let dlog = (denials:open-log (<> base "/denials.log")))
     (let c = (client:connect (fst pair) (denials:on-event dlog)))
-    (let s = (unwrap (session:start c (<> base "/p") base)))
+    (let s = (unwrap (session:start c (<> base "/p") base Nil)))
     (Rig c (cell:new s) dlog base (snd pair)))
 
   (declare rig-project (Rig -> String))

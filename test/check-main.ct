@@ -52,7 +52,7 @@
        (let dlog = (denials:open-log log-file))
        (let record = (denials:on-event dlog))
        (let helper = (client:connect 3 (fn (line) (on-event record line))))
-       (s <- (session:start helper project (<> base "/homelink")))
+       (s <- (session:start helper project (<> base "/homelink") Nil))
        (let c = (Ctx helper base project (<> base "/home") (<> base "/homelink") log-file dlog))
        (match (lisp (-> (Optional String)) ()
                 (cl:let ((v (sb-ext:posix-getenv "DAKUSUI_CHECK_VICTIMS")))

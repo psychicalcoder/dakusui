@@ -1,0 +1,120 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0004 T5: the options, role, and set wired into the session and the
+;;; commands. (R4, R7, R9, R10) The steps are main's, on temp files and a fake
+;;; helper.
+
+(coalton-toplevel
+  (declare chosen-set (List String * String -> Result String String))
+  (define (chosen-set args config-text)
+    "The set name main chooses for the command line ARGS and the
+configuration CONFIG-TEXT, with OPENAI_MODEL set."
+    (do
+     (opts <- (options:parse-options args))
+     (c <- (config:parse-config config-text (env-of (make-list (Tuple "OPENAI_MODEL" "m")))))
+     (r <- (config:role c (.role opts)))
+     (pure (agent:set-name opts r))))
+
+  (declare started-set (String * String * List String * String -> List policy:Rule))
+  (define (started-set base project args config-text)
+    "Load the set main chooses from PROJECT, start a session on a fake helper
+with it, and return the session's set. BASE is the home."
+    (let fake = (fake-helper (ok-replies 1) False))
+    (let c = (client:connect (.agent fake) ignore-event))
+    (let rules = (do
+                  (name <- (chosen-set args config-text))
+                  (file <- (rulesets:set-path project name))
+                  (set <- (rulesets:load-set file))
+                  (s <- (session:start c project base set))
+                  (pure (session:set-rules s))))
+    (requests-of fake c)
+    (unwrap rules))
+
+  (declare home-with-config (String -> String))
+  (define (home-with-config text)
+    "A fresh home whose configuration file holds TEXT."
+    (let base = (temp-tree Nil Nil Nil))
+    (let path = (<> base "/.config/dakusui/config.json"))
+    (lisp (-> Unit) (path text) (write-raw-file path text) Unit)
+    base)
+
+  (declare why-of (Result String :a -> String))
+  (define (why-of result)
+    (match result
+      ((Ok _) "no error")
+      ((Err why) why))))
+
+(define-test wiring-a5-the-session-holds-the-chosen-set ()
+  (let base = (set-tree "strict" (make-list "# keep secrets out" "" "deny read,write /p/secret")))
+  (let strict = (make-list (rule-of "deny read,write /p/secret")))
+  (is (== strict (started-set base base (make-list "--rules" "strict") "{}")))
+  ;; No --rules and no set in the role: `default`, which is missing, so empty.
+  (is (== (Ok "default") (chosen-set Nil "{}")))
+  (is (== Nil (started-set base base Nil "{}")))
+  ;; The role's set, unless --rules names another. (R7)
+  (let roles = "{\"roles\": {\"cloud\": {\"rules\": \"strict\"}}}")
+  (is (== strict (started-set base base (make-list "--role" "cloud") roles)))
+  (is (== (Ok "other") (chosen-set (make-list "--role" "cloud" "--rules" "other") roles)))
+  (remove-tree base))
+
+(define-test wiring-a4-a-bad-role-stops-start-up ()
+  (is (string:substring? "\"nosuch\"" (why-of (chosen-set (make-list "--role" "nosuch") "{}"))))
+  ;; A missing file is an empty configuration; a bad one names the file.
+  (let empty = (temp-tree Nil Nil Nil))
+  (is (string:substring? "no role \"nosuch\""
+                         (why-of (>>= (agent:read-config empty)
+                                        (fn (c) (config:role c "nosuch"))))))
+  (let bad = (home-with-config "{\"roles\": {\"agent\": {\"modle\": \"m\"}}}"))
+  (let why = (why-of (agent:read-config bad)))
+  (is (string:substring? (<> bad "/.config/dakusui/config.json") why))
+  (is (string:substring? "roles.agent.modle" why))
+  (remove-tree empty)
+  (remove-tree bad))
+
+(define-test wiring-a8-the-start-up-listing-shows-the-set ()
+  (let base = (temp-tree (make-list "p" "real/.ssh") Nil (make-list (Tuple "home" "real"))))
+  (let fake = (fake-helper (ok-replies 1) False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (let s = (unwrap (session:start c (<> base "/p") (<> base "/home")
+                                  (make-list (rule-of (<> "allow read " (<> base "/home/.ssh")))))))
+  (let listing = (commands:set-listing "keys" s))
+  (is (== listing (<> "The rule set \"keys\":
+  1 allow read " (<> base "/real/.ssh"))))
+  (requests-of fake c)
+  (remove-tree base))
+
+(define-test wiring-a9-commands-save-the-set ()
+  (let r = (make-rig Nil))
+  (let file = (rig-set r))
+  (lisp (-> Unit) (file) (write-raw-file file (cl:format cl:nil "# mine~%")) Unit)
+  (let sc = (make-script (make-list (Ok (text-reply "never")))))
+  (let lines = (typed-session r (make-list "/deny read /p/x") sc))
+  (is (== (make-list "added rule 1: deny read /p/x") lines))
+  (is (== "# mine
+deny read /p/x
+" (set-text file)))
+  ;; A new session loads it.
+  (let loaded = (unwrap (rulesets:load-set file)))
+  (let fresh = (unwrap (session:start (.client r) (rig-project r) (.base r) loaded)))
+  (is (== (make-list (rule-of "deny read /p/x")) (session:set-rules fresh)))
+  (let removed = (typed-session r (make-list "/remove 1") sc))
+  (is (== (make-list "removed rule 1") removed))
+  (is (== "# mine
+" (set-text file)))
+  (is (== Nil (requests sc)))
+  (unrig r)
+  Unit)
+
+(define-test wiring-a10-a-failed-save-keeps-the-rule ()
+  (let r = (make-rig Nil))
+  ;; The set's directory cannot be made: a file stands in its way.
+  (let blocker = (<> (rig-project r) "/.dakusui"))
+  (lisp (-> Unit) (blocker) (write-raw-file blocker "x") Unit)
+  (let sc = (make-script (make-list (Ok (text-reply "never")))))
+  (let lines = (typed-session r (make-list "/deny read /p/x" "/policy") sc))
+  (is (== (Some "added rule 1: deny read /p/x") (list:index 0 lines)))
+  (is (string:substring? "not saved" (with-default "" (list:index 1 lines))))
+  (is (string:substring? "The session's rule set; later rules win:
+  1 deny read /p/x" (with-default "" (list:index 2 lines))))
+  (unrig r)
+  Unit)

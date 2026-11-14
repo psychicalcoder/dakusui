@@ -21,6 +21,7 @@
                     (#:options #:dakusui/options)
                     (#:config #:dakusui/config)
                     (#:rulesets #:dakusui/rulesets)
+                    (#:agent #:dakusui/agent)
                     (#:cell #:coalton/cell)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))

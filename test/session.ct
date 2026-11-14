@@ -96,7 +96,7 @@ of a link and its target. Every name is relative to the new directory."
 
   (declare started (client:Client * String * String -> session:Session))
   (define (started c project home)
-    (unwrap (session:start c project home))))
+    (unwrap (session:start c project home Nil))))
 
 ;;; The request text.
 

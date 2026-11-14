@@ -94,17 +94,19 @@ judge. (R8, A14)"
   (define (resolve-all rules)
     (traverse (fn (r) (policy:resolve-rule resolve-path r)) rules))
 
-  (declare start (client:Client * String * String -> Result String Session))
-  (define (start helper project home)
-    "Resolve PROJECT and HOME, and send the session policy with an empty rule
-set. Spec 0004 will supply a set. (R3, R13, R14)"
+  (declare start (client:Client * String * String * List policy:Rule
+                  -> Result String Session))
+  (define (start helper project home rules)
+    "Resolve PROJECT, HOME, and the path of each of RULES, and send the
+session policy with RULES as its rule set. (R3, R13, R14; spec 0004 R7)"
     ;; A relative directory stays as it is, so the default policy rejects it
     ;; with a message that names it.
     (let resolve-dir = (fn (dir)
                          (match (string:strip-prefix "/" dir)
                            ((Some _) (resolve-path dir))
                            ((None) dir))))
-    (install helper (resolve-dir project) (resolve-dir home) Nil))
+    (>>= (resolve-all rules)
+         (fn (resolved) (install helper (resolve-dir project) (resolve-dir home) resolved))))
 
   (declare replace-rules (Session * List policy:Rule -> Result String Session))
   (define (replace-rules s rules)

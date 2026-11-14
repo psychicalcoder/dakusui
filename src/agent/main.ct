@@ -8,8 +8,11 @@
                     (#:terminal #:dakusui/terminal)
                     (#:turn #:dakusui/loop)
                     (#:commands #:dakusui/commands)
+                    (#:options #:dakusui/options)
+                    (#:config #:dakusui/config)
+                    (#:rulesets #:dakusui/rulesets)
                     (#:cell #:coalton/cell))
-  (:export #:main #:harden))
+  (:export #:main #:harden #:read-config #:set-name))
 (in-package #:dakusui/agent)
 
 (coalton-toplevel
@@ -55,23 +58,11 @@ memory through /proc. Then keep the helper socket on fd 3 from commands."
     (lisp (-> String) ()
       (cl:or (sb-ext:posix-getenv "HOME") "")))
 
-  (define-type Mode
-    "What the command line asks for. (R11)"
-    Interactive
-    (OneTurn String))
-
   (declare arguments (Void -> List String))
   (define (arguments)
     (lisp (-> (List String)) ()
       (cl:mapcar (cl:lambda (a) (cl:coerce a '(cl:simple-array cl:character (cl:*))))
                  (cl:rest sb-ext:*posix-argv*))))
-
-  (declare parse-mode (List String -> Result String Mode))
-  (define (parse-mode args)
-    (match args
-      ((Nil) (Ok Interactive))
-      ((Cons "-p" (Cons text (Nil))) (Ok (OneTurn text)))
-      (_ (Err "usage: dakusui [-p TEXT]"))))
 
   (declare variable (String -> Optional String))
   (define (variable name)
@@ -83,50 +74,102 @@ memory through /proc. Then keep the helper socket on fd 3 from commands."
                  (coalton (Some (lisp (-> String) () v))))
                (coalton None)))))
 
-  (declare role-provider (Void -> Result String provider:Provider))
-  (define (role-provider)
-    "The provider of the role. Until spec 0004 brings roles, it comes from
-OPENAI_BASE_URL, OPENAI_API_KEY, and OPENAI_MODEL. (R2)"
-    (match (variable "OPENAI_MODEL")
-      ((None) (Err "set OPENAI_MODEL to the model's name"))
-      ((Some model)
-       (Ok (provider:http-provider
-            (with-default "https://api.openai.com/v1" (variable "OPENAI_BASE_URL"))
-            (variable "OPENAI_API_KEY")
-            model)))))
+  (declare read-text (String -> Result String (Optional String)))
+  (define (read-text path)
+    "The text of the file at PATH, or None if there is no such file."
+    (lisp (-> (Result String (Optional String))) (path)
+      (cl:handler-case
+          (cl:with-open-file (in (sb-ext:parse-native-namestring path)
+                                 :external-format :utf-8 :if-does-not-exist cl:nil)
+            (cl:if in
+                   (cl:let ((text (cl:make-string (cl:file-length in))))
+                     (cl:setf text (cl:subseq text 0 (cl:read-sequence text in)))
+                     (coalton (Ok (Some (lisp (-> String) () text)))))
+                   (coalton (Ok None))))
+        (cl:error (e)
+          (cl:let ((why (cl:format cl:nil "cannot read ~A: ~A" path e)))
+            (coalton (Err (lisp (-> String) () why))))))))
 
-  (declare run (Mode * provider:Provider * session:Session * denials:DenialLog -> UFix))
-  (define (run mode ask s dlog)
+  (declare read-config (String -> Result String config:Config))
+  (define (read-config home)
+    "The configuration in HOME. A missing file is an empty configuration; an
+error names the file. (Spec 0004 R1, R5)"
+    (let path = (<> home "/.config/dakusui/config.json"))
+    (let in-file = (fn (why) (<> path (<> ": " why))))
+    (do
+     (text <- (read-text path))
+     (match (config:parse-config (with-default "{}" text) variable)
+       ((Ok c) (Ok c))
+       ((Err why) (Err (in-file why))))))
+
+  (declare set-name (options:Options * config:Role -> String))
+  (define (set-name opts r)
+    "The set --rules names, else the role's, else `default`. (Spec 0004 R7)"
+    (with-default "default" (alt (.rules opts) (config:role-rules r))))
+
+  (declare role-provider (config:Role -> provider:Provider))
+  (define (role-provider r)
+    "The provider the role names. The key goes only into the request. (Spec
+0004 R2; spec 0002 R10)"
+    (provider:http-provider (config:role-base-url r) (config:role-api-key r)
+                            (config:role-model r)))
+
+  (define-struct Started
+    "What main has once every start-up step succeeds."
+    (opts options:Options)
+    (ask provider:Provider)
+    (session session:Session)
+    (dlog denials:DenialLog)
+    (set-name String)
+    (set-file String))
+
+  (declare start-up (Void -> Result String Started))
+  (define (start-up)
+    "Read the command line, the configuration, the role, and the rule set, and
+start the session with that set. Stop at the first failure, before any
+request to the model. (Spec 0004 R4, R5, R7, R8)"
+    (let project = (project-directory))
+    (let home = (home-directory))
+    (do
+     (opts <- (options:parse-options (arguments)))
+     (harden)
+     (cfg <- (read-config home))
+     (r <- (config:role cfg (.role opts)))
+     (let name = (set-name opts r))
+     (file <- (rulesets:set-path project name))
+     (rules <- (rulesets:load-set file))
+     (let dlog = (denials:open-log (denials:log-path)))
+     (let helper = (client:connect 3 (denials:on-event dlog)))
+     (s <- (session:start helper project home rules))
+     (pure (Started opts (role-provider r) s dlog name file))))
+
+  (declare run (Started -> UFix))
+  (define (run st)
     "The prompt loop, or one turn for -p: 0 if it ended with a reply. (R1, R11)"
+    (let s = (.session st))
     (let sessions = (cell:new s))
-    (let tools = (tools:builtin-tools sessions dlog))
+    (let tools = (tools:builtin-tools sessions (.dlog st)))
     (let conversation = (turn:new-conversation (session:session-project s)))
-    (match mode
-      ((Interactive)
+    (match (.prompt (.opts st))
+      ((None)
        (terminal:say "Dakusui. Type a message, or /help for the commands.")
-       (commands:prompt-loop ask tools sessions terminal:say terminal:ask conversation)
+       (commands:prompt-loop (.ask st) tools sessions (.set-file st)
+                             terminal:say terminal:ask conversation)
        0)
-      ((OneTurn text)
-       (match (snd (turn:run-turn ask tools terminal:say conversation text))
+      ((Some text)
+       (match (snd (turn:run-turn (.ask st) tools terminal:say conversation text))
          ((Ok _) 0)
          ((Err _) 1)))))
 
   (declare main (Void -> UFix))
   (define (main)
-    (let started =
-      (do
-       (mode <- (parse-mode (arguments)))
-       (harden)
-       (ask <- (role-provider))
-       (let dlog = (denials:open-log (denials:log-path)))
-       (let helper = (client:connect 3 (denials:on-event dlog)))
-       (s <- (session:start helper (project-directory) (home-directory)))
-       (pure (Tuple3 mode ask (Tuple s dlog)))))
-    (match started
+    (match (start-up)
       ((Err why)
        (complain why)
        1)
-      ((Ok (Tuple3 mode ask (Tuple s dlog)))
-       (let code = (run mode ask s dlog))
-       (client:disconnect (session:session-helper s))
+      ((Ok st)
+       ;; Show what the set grants before any command runs. (Spec 0004 R9)
+       (terminal:say (commands:set-listing (.set-name st) (.session st)))
+       (let code = (run st))
+       (client:disconnect (session:session-helper (.session st)))
        code))))

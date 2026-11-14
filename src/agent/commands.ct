@@ -2,6 +2,7 @@
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:policy #:dakusui/policy)
                     (#:session #:dakusui/session)
+                    (#:rulesets #:dakusui/rulesets)
                     (#:provider #:dakusui/provider)
                     (#:tools #:dakusui/tools)
                     (#:terminal #:dakusui/terminal)
@@ -10,11 +11,13 @@
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
   (:export #:Command #:ShowPolicy #:AddRule #:RemoveRule #:Clear #:Help #:Quit
-           #:parse-command #:policy-listing #:help-text #:prompt-loop))
+           #:parse-command #:policy-listing #:set-listing #:help-text #:prompt-loop))
 (in-package #:dakusui/commands)
 
 ;;; The commands the user types at the prompt, and the prompt loop. (Spec 0002
-;;; R1, R9) A line that starts with / never reaches the model.
+;;; R1, R9) A line that starts with / never reaches the model. A change to the
+;;; rule set is saved to the set's file once the helper accepts it. (Spec 0004
+;;; R10)
 
 (cl:defun split-word (text)
   "TEXT's first word and the rest, trimmed, as a list of two strings."
@@ -112,16 +115,29 @@ their numbers, and the fixed last rule. (R9)"
                  (make-list "The fixed last rule:")
                  (plain fixed)))))
 
-  (declare run-command (cell:Cell session:Session * terminal:Terminal * Command -> Unit))
-  (define (run-command sessions say command)
+  (declare set-listing (String * session:Session -> String))
+  (define (set-listing name s)
+    "The start-up listing: the set's NAME and its rules as the session
+enforces them, symlinks resolved. (Spec 0004 R9)"
+    (let set = (session:set-rules s))
+    (lines
+     (Cons (mconcat (make-list "The rule set \"" name "\":"))
+           (if (list:null? set) (make-list "  (none)") (numbered 1 set)))))
+
+  (declare run-command (cell:Cell session:Session * String * terminal:Terminal * Command -> Unit))
+  (define (run-command sessions set-file say command)
     "Run a command that changes or shows the policy. A change is recorded only
-once the helper has accepted it."
+once the helper has accepted it, and then saved to SET-FILE. A failed save
+leaves the change in force. (Spec 0004 R10)"
     (let change =
-      (fn (changed what)
+      (fn (changed what save)
         (match changed
           ((Ok s)
            (cell:write! sessions s)
-           (say what))
+           (say what)
+           (match (save Unit)
+             ((Ok _) Unit)
+             ((Err why) (say (<> "dakusui: the change holds for this session but is not saved; " why)))))
           ((Err why) (say (<> "dakusui: " why))))))
     (let s = (cell:read sessions))
     (match command
@@ -129,17 +145,28 @@ once the helper has accepted it."
       ((AddRule r)
        (change (session:add-rule s r)
                (mconcat (make-list "added rule " (show-n (+ 1 (list:length (session:set-rules s))))
-                                   ": " (policy:rule-text r)))))
-      ((RemoveRule n) (change (session:remove-rule s n) (<> "removed rule " (show-n n))))
+                                   ": " (policy:rule-text r)))
+               ;; Save the rule as the session recorded it, symlinks resolved.
+               (fn (_)
+                 (match (list:last (session:set-rules (cell:read sessions)))
+                   ((Some added) (rulesets:add-line set-file added))
+                   ((None) (Ok Unit))))))
+      ((RemoveRule n)
+       (change (session:remove-rule s n)
+               (<> "removed rule " (show-n n))
+               (fn (_)
+                 (match (list:index (- n 1) (session:set-rules s))
+                   ((Some removed) (rulesets:drop-line set-file removed))
+                   ((None) (Ok Unit))))))
       ((Help) (say help-text))
       (_ Unit)))
 
-  (declare prompt-loop (provider:Provider * tools:Tools * cell:Cell session:Session
+  (declare prompt-loop (provider:Provider * tools:Tools * cell:Cell session:Session * String
                         * terminal:Terminal * (Void -> Optional String) * turn:Conversation
                         -> Unit))
-  (define (prompt-loop ask tools sessions say read-line conversation)
+  (define (prompt-loop ask tools sessions set-file say read-line conversation)
     "Read a line, and run it as a command or a turn, until /quit or the end of
-input. (R1, R9)"
+input. Changes to the rule set are saved to SET-FILE. (R1, R9; spec 0004 R10)"
     (match (read-line)
       ((None) Unit)
       ((Some line)
@@ -148,17 +175,17 @@ input. (R1, R9)"
           (match (parse-command line)
             ((Err why)
              (say (<> "dakusui: " why))
-             (prompt-loop ask tools sessions say read-line conversation))
+             (prompt-loop ask tools sessions set-file say read-line conversation))
             ((Ok (Quit)) Unit)
             ((Ok (Clear))
              (say "The conversation is cleared.")
-             (prompt-loop ask tools sessions say read-line
+             (prompt-loop ask tools sessions set-file say read-line
                           (turn:new-conversation (session:session-project (cell:read sessions)))))
             ((Ok command)
-             (run-command sessions say command)
-             (prompt-loop ask tools sessions say read-line conversation))))
+             (run-command sessions set-file say command)
+             (prompt-loop ask tools sessions set-file say read-line conversation))))
          ((None)
           (if (== "" line)
-              (prompt-loop ask tools sessions say read-line conversation)
-              (prompt-loop ask tools sessions say read-line
+              (prompt-loop ask tools sessions set-file say read-line conversation)
+              (prompt-loop ask tools sessions set-file say read-line
                            (fst (turn:run-turn ask tools say conversation line))))))))))

@@ -16,13 +16,25 @@
          (Some line))
         ((Nil) None))))
 
-  (declare typed-session (Rig * List String * Script -> List String))
-  (define (typed-session r input sc)
-    "Run the prompt loop on INPUT. Return the terminal's lines."
+  (declare rig-set (Rig -> String))
+  (define (rig-set r)
+    "The file of the set `default` in the rig's project."
+    (<> (rig-project r) "/.dakusui/rules/default"))
+
+  (declare typed-session-to (Rig * String * List String * Script -> List String))
+  (define (typed-session-to r set-file input sc)
+    "Run the prompt loop on INPUT, saving rule changes to SET-FILE. Return the
+terminal's lines."
     (let (Tuple lines say) = (capture))
-    (commands:prompt-loop (scripted sc) (rig-tools r) (.sessions r) say (typed input)
+    (commands:prompt-loop (scripted sc) (rig-tools r) (.sessions r) set-file say (typed input)
                           (turn:new-conversation (rig-project r)))
     (captured lines))
+
+  (declare typed-session (Rig * List String * Script -> List String))
+  (define (typed-session r input sc)
+    "Run the prompt loop on INPUT, with the rig's own set. Return the
+terminal's lines."
+    (typed-session-to r (rig-set r) input sc))
 
   (declare printed? (String * List String -> Boolean))
   (define (printed? part lines)
