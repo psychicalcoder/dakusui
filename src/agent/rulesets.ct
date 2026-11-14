@@ -1,0 +1,87 @@
+(defpackage #:dakusui/rulesets
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:policy #:dakusui/policy)
+                    (#:string #:coalton/string))
+  (:export #:set-path #:load-set))
+(in-package #:dakusui/rulesets)
+
+;;; Rule sets: named files of rules in the project. (Spec 0004 R6, R8)
+;;;
+;;; A set is the file `.dakusui/rules/NAME`, one rule per line. Loading gives
+;;; the rules as written; the session resolves their symlinks later.
+
+(coalton-toplevel
+  (declare quoted (String -> String))
+  (define (quoted text)
+    (<> "\"" (<> text "\"")))
+
+  (declare set-name? (String -> Boolean))
+  (define (set-name? name)
+    "1 to 64 letters, digits, -, or _. (R6)"
+    (lisp (-> Boolean) (name)
+      (cl:and (cl:<= 1 (cl:length name) 64)
+              (cl:every (cl:lambda (c)
+                          (cl:or (cl:char<= #\a c #\z) (cl:char<= #\A c #\Z)
+                                 (cl:char<= #\0 c #\9)
+                                 (cl:char= c #\-) (cl:char= c #\_)))
+                        name))))
+
+  (declare set-path (String * String -> Result String String))
+  (define (set-path project name)
+    "The file of the set NAME in the directory PROJECT. A NAME that could
+leave `.dakusui/rules` is an error. (R6, A7)"
+    (if (set-name? name)
+        (Ok (<> (with-default project (string:strip-suffix "/" project))
+                (<> "/.dakusui/rules/" name)))
+        (Err (<> "bad rule set name " (<> (quoted name)
+                                          ": use 1 to 64 letters, digits, -, or _")))))
+
+  (declare read-file (String -> Result String (Optional String)))
+  (define (read-file path)
+    "The text of the file at PATH, or None if it does not exist."
+    (lisp (-> (Result String (Optional String))) (path)
+      (cl:handler-case
+          (cl:with-open-file (in (sb-ext:parse-native-namestring path)
+                                 :external-format :utf-8 :if-does-not-exist cl:nil)
+            (cl:if in
+                   (cl:let ((text (cl:make-string (cl:file-length in))))
+                     (cl:setf text (cl:subseq text 0 (cl:read-sequence text in)))
+                     (coalton (Ok (Some (lisp (-> String) () text)))))
+                   (coalton (Ok None))))
+        (cl:error (e)
+          (cl:let ((why (cl:format cl:nil "cannot read ~A: ~A" path e)))
+            (coalton (Err (lisp (-> String) () why))))))))
+
+  (declare skipped? (String -> Boolean))
+  (define (skipped? line)
+    "True for a blank line or one that starts with #."
+    (lisp (-> Boolean) (line)
+      (cl:or (cl:zerop (cl:length (cl:string-trim '(#\Space #\Tab #\Return) line)))
+             (cl:char= (cl:char line 0) #\#))))
+
+  (declare number-text (UFix -> String))
+  (define (number-text n)
+    (lisp (-> String) (n) (cl:format cl:nil "~D" n)))
+
+  (declare parse-lines (String * UFix * List String -> Result String (List policy:Rule)))
+  (define (parse-lines path number lines)
+    "The rules of LINES, the first of which is line NUMBER of PATH. (R8)"
+    (match lines
+      ((Nil) (Ok Nil))
+      ((Cons line rest)
+       (let more = (parse-lines path (+ number 1) rest))
+       (if (skipped? line)
+           more
+           (match (policy:parse-rule line)
+             ((Err why) (Err (mconcat (make-list path " line " (number-text number) ": " why))))
+             ((Ok r) (map (fn (rules) (Cons r rules)) more)))))))
+
+  (declare load-set (String -> Result String (List policy:Rule)))
+  (define (load-set path)
+    "The rules in the set file PATH, in order. A missing file is an empty set;
+a line that is not a rule is an error that names PATH and the line. (R6, R8)"
+    (do
+     (text <- (read-file path))
+     (match text
+       ((None) (pure Nil))
+       ((Some lines) (parse-lines path 1 (string:split #\Newline lines)))))))

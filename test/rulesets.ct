@@ -1,0 +1,77 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0004 T3: naming and loading rule sets. (R6, R8)
+
+(cl:defun write-set-file (base name lines)
+  "Write LINES, each ending in a newline, to BASE/.dakusui/rules/NAME."
+  (cl:let ((path (cl:format cl:nil "~A/.dakusui/rules/~A" base name)))
+    (cl:ensure-directories-exist path)
+    (cl:with-open-file (out path :direction :output :external-format :utf-8)
+      (cl:format out "~{~A~%~}" lines))))
+
+(coalton-toplevel
+  (declare set-tree (String * List String -> String))
+  (define (set-tree name lines)
+    "A fresh project directory whose set NAME holds LINES."
+    (let base = (temp-tree Nil Nil Nil))
+    (lisp (-> Unit) (base name lines) (write-set-file base name lines) Unit)
+    base)
+
+  (declare load-named (String * String -> Result String (List policy:Rule)))
+  (define (load-named project name)
+    (>>= (rulesets:set-path project name) rulesets:load-set))
+
+  (declare load-error (String * String -> String))
+  (define (load-error project name)
+    (match (load-named project name)
+      ((Ok _) "no error")
+      ((Err why) why))))
+
+(define-test rulesets-set-path-names-the-file ()
+  (is (== (Ok "/p/.dakusui/rules/strict") (rulesets:set-path "/p" "strict")))
+  (is (== (Ok "/p/.dakusui/rules/a-B_9") (rulesets:set-path "/p/" "a-B_9")))
+  (is (== (Ok (<> "/p/.dakusui/rules/" (into (list:repeat 64 #\x))))
+          (rulesets:set-path "/p" (into (list:repeat 64 #\x))))))
+
+(define-test rulesets-a7-bad-name ()
+  (let ((bad? (fn (name)
+                (match (rulesets:set-path "/p" name)
+                  ((Ok _) False)
+                  ((Err why) (string:substring? "bad rule set name" why))))))
+    (is (bad? "../x"))
+    (is (bad? ""))
+    (is (bad? "a/b"))
+    (is (bad? "."))
+    (is (bad? "a b"))
+    (is (bad? (into (list:repeat 65 #\x))))))
+
+(define-test rulesets-a5-loads-one-rule ()
+  (let ((base (set-tree "strict" (make-list "# keep secrets out" "" "deny read,write /p/secret"))))
+    (is (== (Ok (make-list (rule-of "deny read,write /p/secret")))
+            (load-named base "strict")))
+    (remove-tree base)))
+
+(define-test rulesets-a5-missing-set-is-empty ()
+  ;; No .dakusui directory at all, and a directory without the set.
+  (let ((bare (temp-tree Nil Nil Nil))
+        (other (set-tree "strict" (make-list "deny read /p/x"))))
+    (is (== (Ok Nil) (load-named bare "default")))
+    (is (== (Ok Nil) (load-named other "default")))
+    (remove-tree bare)
+    (remove-tree other)))
+
+(define-test rulesets-keeps-the-order ()
+  (let ((base (set-tree "s" (make-list "allow read /a" "#" "  " "deny write name:.env"
+                                       "allow read,write /my\\ dir/"))))
+    (is (== (Ok (make-list (rule-of "allow read /a") (rule-of "deny write name:.env")
+                           (rule-of "allow read,write /my\\ dir")))
+            (load-named base "s")))
+    (remove-tree base)))
+
+(define-test rulesets-a6-names-file-and-line ()
+  (let ((base (set-tree "s" (make-list "# a set" "deny read /p/secret" "allow read x"
+                                       "also bad"))))
+    (let ((why (load-error base "s")))
+      (is (string:substring? (<> base "/.dakusui/rules/s line 3:") why))
+      (is (string:substring? "\"x\"" why)))
+    (remove-tree base)))

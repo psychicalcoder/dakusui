@@ -8,7 +8,7 @@ Write each test first or alongside its code.
   each option, a missing value, and an unknown option.
 - [x] T2 Parse the configuration and resolve roles. (R1, R2, R3, R4, R5, R12)
   Done when A1 through A4 and A12 pass.
-- [ ] T3 Name and load rule sets. (R6, R8) Done when A5's loading, A6, and A7
+- [x] T3 Name and load rule sets. (R6, R8) Done when A5's loading, A6, and A7
   pass.
 - [ ] T4 Save a rule set under the lock. (R10, R11) Done when the add, drop,
   and comment cases pass, and A11 passes with two threads.
