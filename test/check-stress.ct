@@ -139,7 +139,8 @@ the evaluator, or why the case could not run."
      (let pol = (policy:Policy rules))
      (client:send-policy (.helper c) pol)
      (o <- (launch:run-command (.helper c) root
-                               (lisp (-> String) (paths modes) (probe-script paths modes))))
+                               (lisp (-> String) (paths modes) (probe-script paths modes))
+                               check-limit))
      (let out = (launch:outcome-output o))
      (let got = (lisp (-> (List Boolean)) (out) (probe-bits out)))
      (let wanted = (map (fn (pm) (match pm ((Tuple p m) (policy:allows? pol (mode-kinds m) p))))
@@ -234,7 +235,7 @@ Four confined readers try for five seconds; none may open the secret."
       (with-rules c s "T23" (make-list (<> "deny read,write " a) (<> "deny read,write " b))
         (fn (_)
           (lisp (-> Unit) (a b) (start-renamer a b) Unit)
-          (let ran = (launch:run-command (.helper c) (.project c) command))
+          (let ran = (run-in c command))
           (let renames = (lisp (-> UFix) (a b) (stop-renamer a b)))
           (let output = (match ran ((Ok o) (launch:outcome-output o)) ((Err why) why)))
           (let counts = (lisp (-> (List UFix)) (output)

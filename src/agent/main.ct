@@ -2,17 +2,20 @@
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:client #:dakusui/client)
                     (#:session #:dakusui/session)
-                    (#:denials #:dakusui/denials))
+                    (#:denials #:dakusui/denials)
+                    (#:provider #:dakusui/provider)
+                    (#:tools #:dakusui/tools)
+                    (#:terminal #:dakusui/terminal)
+                    (#:turn #:dakusui/loop)
+                    (#:commands #:dakusui/commands)
+                    (#:cell #:coalton/cell))
   (:export #:main #:harden))
 (in-package #:dakusui/agent)
 
 (coalton-toplevel
   (declare complain (String -> Unit))
   (define (complain text)
-    (lisp (-> Unit) (text)
-      (cl:format cl:*error-output* "dakusui-agent: ~A~%" text)
-      (cl:finish-output cl:*error-output*)
-      Unit))
+    (terminal:warn (<> "dakusui-agent: " text)))
 
   (declare harden (Void -> Result String Unit))
   (define (harden)
@@ -52,15 +55,78 @@ memory through /proc. Then keep the helper socket on fd 3 from commands."
     (lisp (-> String) ()
       (cl:or (sb-ext:posix-getenv "HOME") "")))
 
+  (define-type Mode
+    "What the command line asks for. (R11)"
+    Interactive
+    (OneTurn String))
+
+  (declare arguments (Void -> List String))
+  (define (arguments)
+    (lisp (-> (List String)) ()
+      (cl:mapcar (cl:lambda (a) (cl:coerce a '(cl:simple-array cl:character (cl:*))))
+                 (cl:rest sb-ext:*posix-argv*))))
+
+  (declare parse-mode (List String -> Result String Mode))
+  (define (parse-mode args)
+    (match args
+      ((Nil) (Ok Interactive))
+      ((Cons "-p" (Cons text (Nil))) (Ok (OneTurn text)))
+      (_ (Err "usage: dakusui [-p TEXT]"))))
+
+  (declare variable (String -> Optional String))
+  (define (variable name)
+    "The environment variable NAME, or None if it is unset or empty."
+    (lisp (-> (Optional String)) (name)
+      (cl:let ((v (sb-ext:posix-getenv name)))
+        (cl:if (cl:and v (cl:plusp (cl:length v)))
+               (cl:let ((v (cl:coerce v '(cl:simple-array cl:character (cl:*)))))
+                 (coalton (Some (lisp (-> String) () v))))
+               (coalton None)))))
+
+  (declare role-provider (Void -> Result String provider:Provider))
+  (define (role-provider)
+    "The provider of the role. Until spec 0004 brings roles, it comes from
+OPENAI_BASE_URL, OPENAI_API_KEY, and OPENAI_MODEL. (R2)"
+    (match (variable "OPENAI_MODEL")
+      ((None) (Err "set OPENAI_MODEL to the model's name"))
+      ((Some model)
+       (Ok (provider:http-provider
+            (with-default "https://api.openai.com/v1" (variable "OPENAI_BASE_URL"))
+            (variable "OPENAI_API_KEY")
+            model)))))
+
+  (declare run (Mode * provider:Provider * session:Session * denials:DenialLog -> UFix))
+  (define (run mode ask s dlog)
+    "The prompt loop, or one turn for -p: 0 if it ended with a reply. (R1, R11)"
+    (let sessions = (cell:new s))
+    (let tools = (tools:builtin-tools sessions dlog))
+    (let conversation = (turn:new-conversation (session:session-project s)))
+    (match mode
+      ((Interactive)
+       (terminal:say "Dakusui. Type a message, or /help for the commands.")
+       (commands:prompt-loop ask tools sessions terminal:say terminal:ask conversation)
+       0)
+      ((OneTurn text)
+       (match (snd (turn:run-turn ask tools terminal:say conversation text))
+         ((Ok _) 0)
+         ((Err _) 1)))))
+
   (declare main (Void -> UFix))
   (define (main)
-    (match (do
-            (harden)
-            (let helper = (client:connect 3 (denials:open-log (denials:log-path))))
-            (session:start helper (project-directory) (home-directory)))
+    (let started =
+      (do
+       (mode <- (parse-mode (arguments)))
+       (harden)
+       (ask <- (role-provider))
+       (let dlog = (denials:open-log (denials:log-path)))
+       (let helper = (client:connect 3 (denials:on-event dlog)))
+       (s <- (session:start helper (project-directory) (home-directory)))
+       (pure (Tuple3 mode ask (Tuple s dlog)))))
+    (match started
       ((Err why)
        (complain why)
        1)
-      ((Ok _)
-       (complain "not implemented")
-       1))))
+      ((Ok (Tuple3 mode ask (Tuple s dlog)))
+       (let code = (run mode ask s dlog))
+       (client:disconnect (session:session-helper s))
+       code))))

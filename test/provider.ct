@@ -1,0 +1,162 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0002 T4: the real provider against a test server on a loopback
+;;; port. (R2, R6, R10) The server answers one request with a canned status
+;;; and body, and hands back the request it got.
+
+(cl:defun read-request (stream)
+  "Read one HTTP request from STREAM: the head, then Content-Length bytes."
+  (cl:let ((bytes (cl:make-array 0 :element-type '(cl:unsigned-byte 8) :adjustable cl:t :fill-pointer 0)))
+    (cl:loop :for b := (cl:read-byte stream cl:nil)
+             :while b
+             :do (cl:vector-push-extend b bytes)
+             :until (cl:and (cl:>= (cl:length bytes) 4)
+                            (cl:equalp (cl:subseq bytes (cl:- (cl:length bytes) 4)) #(13 10 13 10))))
+    (cl:let* ((top (sb-ext:octets-to-string (cl:coerce bytes '(cl:vector (cl:unsigned-byte 8)))
+                                             :external-format :latin-1))
+              (at (cl:search "content-length:" (cl:string-downcase top)))
+              (size (cl:if at (cl:parse-integer top :start (cl:+ at 15) :junk-allowed cl:t) 0))
+              (body (cl:make-array size :element-type '(cl:unsigned-byte 8))))
+      (cl:read-sequence body stream)
+      (cl:concatenate 'cl:string top (sb-ext:octets-to-string body :external-format :utf-8)))))
+
+(cl:defun serve-once (status body)
+  "Listen on a loopback port and answer one request with STATUS and BODY.
+Return the port and a thread that returns the request's text."
+  (cl:let ((server (cl:make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (cl:setf (sb-bsd-sockets:sockopt-reuse-address server) cl:t)
+    (sb-bsd-sockets:socket-bind server #(127 0 0 1) 0)
+    (sb-bsd-sockets:socket-listen server 4)
+    (cl:list
+     (cl:nth-value 1 (sb-bsd-sockets:socket-name server))
+     (sb-thread:make-thread
+      (cl:lambda ()
+        (cl:unwind-protect
+             (cl:let* ((conn (sb-bsd-sockets:socket-accept server))
+                       (stream (sb-bsd-sockets:socket-make-stream conn :input cl:t :output cl:t
+                                                                       :element-type '(cl:unsigned-byte 8))))
+               (cl:unwind-protect
+                    (cl:let ((request (read-request stream))
+                             (octets (sb-ext:string-to-octets body :external-format :utf-8)))
+                      (cl:write-sequence
+                       (sb-ext:string-to-octets
+                        (cl:format cl:nil "HTTP/1.1 ~D Test~C~CContent-Type: application/json~C~CContent-Length: ~D~C~CConnection: close~C~C~C~C"
+                                   status #\Return #\Newline #\Return #\Newline (cl:length octets)
+                                   #\Return #\Newline #\Return #\Newline #\Return #\Newline)
+                        :external-format :latin-1)
+                       stream)
+                      (cl:write-sequence octets stream)
+                      (cl:finish-output stream)
+                      request)
+                 (cl:close stream)))
+          (sb-bsd-sockets:socket-close server)))
+      :name "test server"))))
+
+(cl:defun closed-port ()
+  "A loopback port that nothing listens on."
+  (cl:let ((s (cl:make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (sb-bsd-sockets:socket-bind s #(127 0 0 1) 0)
+    (cl:prog1 (cl:nth-value 1 (sb-bsd-sockets:socket-name s))
+      (sb-bsd-sockets:socket-close s))))
+
+(coalton-toplevel
+  (define-struct Server
+    (url String)
+    (thread LispThread))
+
+  (declare test-server (UFix * String -> Server))
+  (define (test-server status body)
+    (lisp (-> Server) (status body)
+      (cl:destructuring-bind (port thread) (serve-once status body)
+        (cl:let ((url (cl:format cl:nil "http://127.0.0.1:~D/v1" port)))
+          (coalton (Server (lisp (-> String) () url) (lisp (-> LispThread) () thread)))))))
+
+  (declare server-request (Server -> String))
+  (define (server-request s)
+    "The request the server got, or \"\" if none came in ten seconds."
+    (let thread = (.thread s))
+    (lisp (-> String) (thread)
+      (cl:let ((r (sb-thread:join-thread thread :default "" :timeout 10)))
+        (simple-string r))))
+
+  (declare request-body (String -> String))
+  (define (request-body request)
+    (lisp (-> String) (request)
+      (cl:let ((at (cl:search (cl:format cl:nil "~C~C~C~C" #\Return #\Newline #\Return #\Newline) request)))
+        (simple-string (cl:if at (cl:subseq request (cl:+ at 4)) "")))))
+
+  (declare closed-url (Void -> String))
+  (define (closed-url)
+    (lisp (-> String) () (cl:format cl:nil "http://127.0.0.1:~D/v1" (closed-port))))
+
+  (declare http-turn (Rig * provider:Provider * String -> Tuple (Result String Unit) (List String)))
+  (define (http-turn r ask text)
+    "Run one turn with the provider ASK. Return the outcome and the terminal's lines."
+    (let (Tuple lines say) = (capture))
+    (let (Tuple _ outcome) =
+      (turn:run-turn ask (rig-tools r) say (turn:new-conversation (rig-project r)) text))
+    (Tuple outcome (captured lines))))
+
+(define-test provider-a1-the-provider-posts-the-conversation-and-shows-the-reply ()
+  (let r = (make-rig Nil))
+  (let server = (test-server 200 (reply-body (text-reply "hello"))))
+  (let ask = (provider:http-provider (.url server) (Some "sk-test") "test-model"))
+  (let (Tuple outcome lines) = (http-turn r ask "hi"))
+  (let request = (server-request server))
+  (let body = (request-body request))
+  (is (== (Ok Unit) outcome))
+  (is (== (make-list "hello") lines))
+  (is (has? request "POST /v1/chat/completions HTTP/1.1"))
+  (is (has? request "Authorization: Bearer sk-test"))
+  (is (== "test-model" (sent-field body "model")))
+  (is (== (make-list (chat:System (turn:system-prompt (rig-project r))) (chat:User "hi"))
+          (sent-messages body)))
+  (is (== (make-list "bash" "show_policy") (sent-tools body)))
+  (unrig r)
+  Unit)
+
+(define-test provider-a1-no-key-sends-no-authorization ()
+  (let server = (test-server 200 (reply-body (text-reply "hello"))))
+  (let ask = (provider:http-provider (<> (.url server) "/") None "m"))
+  (is (== (Ok (text-reply "hello")) (ask (make-list (chat:User "hi")) Nil)))
+  (let request = (server-request server))
+  (is (has? request "POST /v1/chat/completions HTTP/1.1"))
+  (is (not (has? request "Authorization"))))
+
+(define-test provider-a6-a-failing-provider-names-the-status-and-the-error ()
+  (let r = (make-rig Nil))
+  (let server = (test-server 401 "{\"error\":{\"message\":\"bad key\"}}"))
+  (let ask = (provider:http-provider (.url server) (Some "sk-test") "m"))
+  (let (Tuple outcome lines) = (http-turn r ask "hi"))
+  (server-request server)
+  (is (== (Err "the provider answered 401: bad key") outcome))
+  (is (== (make-list "dakusui: the provider answered 401: bad key") lines))
+  (let refused = (provider:http-provider (closed-url) None "m"))
+  (let (Tuple outcome2 lines2) = (http-turn r refused "hi"))
+  (is (match outcome2
+        ((Err why) (and (has? why "cannot reach the provider") (has? why "onnect")))
+        ((Ok _) False)))
+  (is (== 1 (list:length lines2)))
+  (let garbled = (test-server 200 "not json"))
+  (is (match ((provider:http-provider (.url garbled) None "m") (make-list (chat:User "hi")) Nil)
+        ((Err why) (has? why "cannot decode the provider's reply: the reply is not JSON"))
+        ((Ok _) False)))
+  (server-request garbled)
+  (is (== "the provider answered 500: <html>oops</html>"
+          (provider:failure-text 500 "<html>oops</html>")))
+  (unrig r)
+  Unit)
+
+(define-test provider-a10-the-key-never-reaches-the-terminal-or-the-log ()
+  (let r = (make-rig Nil))
+  ;; The server echoes the key, as some do in their error text.
+  (let server = (test-server 401 "{\"error\":{\"message\":\"Incorrect API key provided: sk-secret.\"}}"))
+  (let ask = (provider:http-provider (.url server) (Some "sk-secret") "m"))
+  (let (Tuple _ lines) = (http-turn r ask "hi"))
+  (let request = (server-request server))
+  (is (has? request "Authorization: Bearer sk-secret"))
+  (is (== (make-list "dakusui: the provider answered 401: Incorrect API key provided: [key].") lines))
+  (is (not (list:any (fn (line) (has? line "sk-secret")) lines)))
+  (is (not (list:any (fn (line) (has? line "sk-secret")) (file-lines (<> (.base r) "/denials.log")))))
+  (unrig r)
+  Unit)

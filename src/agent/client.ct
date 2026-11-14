@@ -2,7 +2,7 @@
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:policy #:dakusui/policy))
   (:export #:Client #:connect #:disconnect #:closed?
-           #:send-policy #:send-flag
+           #:send-policy #:send-flag #:send-sync
            #:policy-line))
 (in-package #:dakusui/client)
 
@@ -186,4 +186,11 @@ event line on the reader thread."
   (declare send-flag (Client * I32 -> Result String Unit))
   (define (send-flag c pid)
     "Ask the helper to confine the process PID. (R1)"
-    (request c (lisp (-> String) (pid) (cl:format cl:nil "{\"op\":\"flag\",\"pid\":~D}" pid)))))
+    (request c (lisp (-> String) (pid) (cl:format cl:nil "{\"op\":\"flag\",\"pid\":~D}" pid))))
+
+  (declare send-sync (Client -> Result String Unit))
+  (define (send-sync c)
+    "Wait until the helper has sent every denial the kernel has logged so far.
+The helper answers only after it drains the ring buffer, and the reader
+thread hands each event to the log before it takes the reply. (Spec 0003 R6)"
+    (request c "{\"op\":\"sync\"}")))

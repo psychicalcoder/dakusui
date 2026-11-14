@@ -6,6 +6,9 @@
                     (#:session #:dakusui/session)
                     (#:launch #:dakusui/launch)
                     (#:denials #:dakusui/denials)
+                    (#:chat #:dakusui/chat)
+                    (#:tools #:dakusui/tools)
+                    (#:cell #:coalton/cell)
                     (#:string #:coalton/string)
                     (#:list #:coalton/list))
   (:export #:main))
@@ -120,7 +123,8 @@ through the symlink BASE/homelink (A17)."
     (project String)
     (home String)
     (homelink String)
-    (log-file String))
+    (log-file String)
+    (dlog denials:DenialLog))
 
   (declare in-base (Ctx * String -> String))
   (define (in-base c sub) (mconcat (make-list (.base c) "/" sub)))
@@ -197,11 +201,21 @@ so the policy, not the file mode, refused it."
     (Fails String)
     (Denied String))
 
+  (declare check-limit UFix)
+  (define check-limit
+    "No check runs this long, so none should reach the limit."
+    600)
+
+  (declare run-in (Ctx * String -> Result String launch:Outcome))
+  (define (run-in c command)
+    "Run COMMAND confined in the project."
+    (launch:run-command (.helper c) (.project c) command check-limit))
+
   (declare check (Ctx * String * String * Wanted -> Boolean))
   (define (check c label command wanted)
     "Run COMMAND in the project, and report whether it ended as WANTED says."
     (let before = (list:length (log-lines (.log-file c))))
-    (match (launch:run-command (.helper c) (.project c) command)
+    (match (run-in c command)
       ((Err why) (verdict False label why))
       ((Ok o)
        (let code = (launch:outcome-code o))
@@ -249,7 +263,7 @@ the session's policy again."
   (define (background c script)
     "Start SCRIPT confined, in the background, and return once it is started."
     (map (fn (_) Unit)
-         (launch:run-command (.helper c) (.project c)
+         (run-in c
                              (mconcat (make-list "sh -c '" script "' </dev/null >/dev/null 2>&1 &"))))))
 
 ;;; A13, A1, A2: the default policy.
@@ -262,7 +276,7 @@ event comes on the reader thread, so wait for it, then a little more, in case
 a second line follows."
     (let log-file = (.log-file c))
     (let before = (list:length (log-lines log-file)))
-    (let ran = (launch:run-command (.helper c) (.project c) "cat .env"))
+    (let ran = (run-in c "cat .env"))
     (let _ = (log-grew? log-file before))
     (lisp (-> Unit) () (cl:sleep 0.3) Unit)
     (let new = (list:drop before (log-lines log-file)))
@@ -413,7 +427,7 @@ covers. Report what happens."
     (let anc = (in-base c "anc"))
     (let _ = (with-rules c s "R6 note" (make-list (mconcat (make-list "deny read,write " anc "/sub")))
       (fn (_)
-        (let ran = (launch:run-command (.helper c) (.project c)
+        (let ran = (run-in c
                                        (mconcat (make-list "mv " anc " " anc "2 && cat " anc "2/sub/secret"))))
         (say (<> "note R6 rename an ancestor of a denied directory, then read it: "
                  (match ran
@@ -471,8 +485,8 @@ policy."
        (verdict (readable? environ) "A8 the agent can read its own sleeper's environ" environ)
        (check c "A8 read an unconfined process's environ" (<> "cat " environ) (Denied ""))
        (let ((before (exists? marker)))
-         (match (launch:run-command
-                 (.helper c) (.project c)
+         (match (run-in
+                 c
                  (mconcat (make-list "'" helper-binary "' --eval '(progn (close (open \"" marker
                                      "\" :direction :output)) (sb-ext:exit :code 42))'")))
            ((Err why) (verdict False "A8 run dakusui with --eval" why))
@@ -615,6 +629,64 @@ exist yet, names BASE/data/s/new, and denies it once it exists."
                 (Denied "Permission denied"))
          (check c "A18 but .dakusui stays readable" "cat .dakusui/rules/x" (Succeeds "rule")))))))
 
+;;; Spec 0003 A3, A4, A6: the bash tool, confined.
+
+(cl:defun live-with (token)
+  "How many live processes, not zombies, have TOKEN in their command line."
+  (cl:loop :for dir :in (cl:directory "/proc/[0-9]*/")
+           :for pid := (cl:car (cl:last (cl:pathname-directory dir)))
+           :for cmdline := (cl:ignore-errors
+                            (cl:with-open-file (in (cl:format cl:nil "/proc/~A/cmdline" pid)
+                                                   :element-type '(cl:unsigned-byte 8))
+                              (cl:let ((bytes (cl:make-array 4096 :element-type '(cl:unsigned-byte 8))))
+                                (cl:map 'cl:string #'cl:code-char
+                                        (cl:subseq bytes 0 (cl:read-sequence bytes in))))))
+           :for stat := (cl:ignore-errors (uiop:read-file-string (cl:format cl:nil "/proc/~A/stat" pid)))
+           :for close := (cl:and stat (cl:position #\) stat :from-end cl:t))
+           :count (cl:and cmdline (cl:search token cmdline) close
+                          (cl:not (cl:member (cl:char stat (cl:+ 2 close)) '(#\Z #\X))))))
+
+(coalton-toplevel
+  (declare bash-with (tools:Tools * String * UFix -> String))
+  (define (bash-with tools command limit)
+    (tools:call tools (chat:ToolCall "c" "bash"
+                                     (mconcat (make-list "{\"command\":" (chat:quoted command)
+                                                         ",\"timeout\":" (show-n limit) "}")))))
+
+  (declare check-tools (Ctx * session:Session -> List Boolean))
+  (define (check-tools c s)
+    "Spec 0003 A3, A4, and A6, through the bash tool as the model calls it."
+    (let tools = (tools:builtin-tools (cell:new s) (.dlog c)))
+    (let bash = (fn (command) (bash-with tools command 120)))
+    (let has = (fn (text part) (string:substring? part text)))
+    (let a3 = (bash "echo out; echo err >&2; exit 3"))
+    (let pwd = (bash "pwd"))
+    (let start = (lisp (-> UFix) () (cl:get-internal-real-time)))
+    (let a4 = (bash-with tools "sleep 100.0417 & sleep 100.0417" 1))
+    (let took = (lisp (-> UFix) (start)
+                  (cl:floor (cl:* 1000 (cl:- (cl:get-internal-real-time) start))
+                            cl:internal-time-units-per-second)))
+    (let left = (lisp (-> UFix) ()
+                  (cl:loop :repeat 100
+                           :for n := (live-with "100.0417")
+                           :until (cl:zerop n)
+                           :do (cl:sleep 0.01)
+                           :finally (cl:return n))))
+    (let a6 = (bash "cat .env"))
+    (let quiet = (bash "cat /nonexistent"))
+    (make-list
+     (verdict (and (has a3 "out") (has a3 "err") (has a3 "exit code 3"))
+              "0003 A3 bash gives stdout, stderr, and the exit code" a3)
+     (verdict (== pwd (.project c)) "0003 A3 bash starts in the project directory" pwd)
+     (verdict (and (has a4 "timed out") (< took 3000) (== left 0))
+              "0003 A4 a timeout ends the command's whole group"
+              (mconcat (make-list a4 " (" (show-n took) " ms, " (show-n left) " sleeps left)")))
+     (verdict (and (has a6 "Permission denied")
+                   (has a6 (mconcat (make-list "denied read of " (.project c) "/.env by cat (pid ")))
+                   (has a6 "denied by rule"))
+              "0003 A6 bash lists the denials of its command" a6)
+     (verdict (not (has quiet "denials")) "0003 A6 a missing file lists no denial" quiet))))
+
 ;;; A6 and A19: the helper ends. These come last.
 
 (coalton-toplevel
@@ -632,7 +704,7 @@ refuse, and the command must not run. This ends the helper, so it comes last."
                :until (call-coalton-function gone?)
                :do (cl:sleep 0.01))
       Unit)
-    (let ran = (launch:run-command helper (.project c) (<> "touch " marker)))
+    (let ran = (run-in c (<> "touch " marker)))
     (verdict (and (client:closed? helper)
                   (match ran
                     ((Err why) (string:substring? "refused" why))
@@ -659,7 +731,7 @@ helper sooner could stop the victim before it starts."
     (let command =
       (mconcat (make-list "setsid sh -c '" a19-script "' sh " (show-i32 helper-pid)
                           " </dev/null >/dev/null 2>&1 &")))
-    (match (launch:run-command (.helper c) (.project c) command)
+    (match (run-in c command)
       ((Err why) (verdict False "A19 cannot start the victim" why))
       ((Ok _)
        (let lines = (wait-lines (in-project c "a19") 1))
@@ -699,7 +771,7 @@ normal exit must end, and print its pid and the helper's."
     (let pids = (list:filter (fn (p) (/= p "")) (string:split #\Space victims)))
     (let ended = (verdict (and (not (list:null? pids)) (list:all pid-gone? pids))
                           "A19 the next start ended the victim" victims))
-    (let nohup = (launch:run-command (.helper c) (.project c)
+    (let nohup = (run-in c
                                      "nohup sleep 600 </dev/null >/dev/null 2>&1 & echo $!"))
     (let started =
       (match nohup

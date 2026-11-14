@@ -1,0 +1,31 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0002 T2: one writer for the terminal. (R8) Two threads print lines,
+;;; one through say and one through warn, as the denial log does, into one
+;;; stream that is not safe for two writers. No line may mix.
+
+(cl:defun print-from-two-threads (count width)
+  "Return the lines two threads printed, COUNT each, WIDTH characters long."
+  (cl:let ((out (cl:make-string-output-stream))
+           (a (cl:make-string width :initial-element #\a))
+           (b (cl:make-string width :initial-element #\b)))
+    (cl:setf dakusui/terminal::*streams* (cl:list out out))
+    (cl:unwind-protect
+         (cl:let ((threads
+                    (cl:list (sb-thread:make-thread
+                              (cl:lambda ()
+                                (cl:dotimes (i count) (coalton (terminal:say (lisp (-> String) () a))))))
+                             (sb-thread:make-thread
+                              (cl:lambda ()
+                                (cl:dotimes (i count) (coalton (terminal:warn (lisp (-> String) () b)))))))))
+           (cl:mapc #'sb-thread:join-thread threads))
+      (cl:setf dakusui/terminal::*streams* cl:nil))
+    (cl:with-input-from-string (in (cl:get-output-stream-string out))
+      (cl:loop :for line := (cl:read-line in cl:nil) :while line :collect line))))
+
+(define-test terminal-lines-never-mix ()
+  (let printed = (lisp (-> (List String)) () (print-from-two-threads 2000 200)))
+  (let a = (lisp (-> String) () (cl:make-string 200 :initial-element #\a)))
+  (let b = (lisp (-> String) () (cl:make-string 200 :initial-element #\b)))
+  (is (== 4000 (list:length printed)))
+  (is (list:all (fn (line) (or (== line a) (== line b))) printed)))

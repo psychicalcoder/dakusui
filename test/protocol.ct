@@ -144,3 +144,10 @@
   (is (== (Some "{\"ok\":true}") (list:index 5 replies)))
   ;; The last element is the empty text after the final newline.
   (is (== (Some "") (list:index 6 replies))))
+
+;;; Spec 0003 T3: sync, which the helper answers after it drains the denial
+;;; ring buffer. (Spec 0003 R6)
+
+(define-test decode-takes-a-sync ()
+  (is (== (Ok protocol:SyncRequest) (decoded "{\"op\":\"sync\"}")))
+  (is (== "unknown field \"pid\"" (error-of "{\"op\":\"sync\",\"pid\":1}"))))

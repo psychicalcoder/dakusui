@@ -2,7 +2,7 @@
   (:use #:coalton #:coalton-prelude)
   (:local-nicknames (#:policy #:dakusui/policy)
                     (#:list #:coalton/list))
-  (:export #:Request #:PolicyRequest #:FlagRequest
+  (:export #:Request #:PolicyRequest #:FlagRequest #:SyncRequest
            #:decode-request
            #:reply-ok #:reply-error #:reply-error-text
            #:denial-event))
@@ -30,7 +30,8 @@
   (derive Eq)
   (define-type Request
     (PolicyRequest policy:Policy)
-    (FlagRequest I32))
+    (FlagRequest I32)
+    SyncRequest)
 
   (declare max-depth UFix)
   (define max-depth 8)
@@ -186,6 +187,10 @@ vectors. true is T, false is NIL, and null is the symbol NULL."
          (only-fields (make-list "op" "pid") fields)
          (pid <- (>>= (field "pid" fields) as-pid))
          (pure (FlagRequest pid))))
+       ("sync"
+        (do
+         (only-fields (make-list "op") fields)
+         (pure SyncRequest)))
        (_ (Err (<> "unknown op " (quoted op)))))))
 
   (declare reply-ok String)

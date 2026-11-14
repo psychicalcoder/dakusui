@@ -1,0 +1,154 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0002 T3: the loop, against a scripted provider and a captured
+;;; terminal. (R1, R3, R4, R5, R6, R7, R8) The tools are the real ones on a
+;;; live fake helper, so bash runs unconfined.
+
+(coalton-toplevel
+  (define-struct Script
+    "A scripted provider: the answers it gives, in order, and the messages of
+each request it got, newest first."
+    (answers (cell:Cell (List (Result String chat:Reply))))
+    (seen (cell:Cell (List (List chat:Message)))))
+
+  (declare make-script (List (Result String chat:Reply) -> Script))
+  (define (make-script answers)
+    (Script (cell:new answers) (cell:new Nil)))
+
+  (declare scripted (Script -> provider:Provider))
+  (define (scripted sc)
+    "Answer each request with the next answer. Past the last, repeat it."
+    (fn (messages _)
+      (cell:push! (.seen sc) messages)
+      (match (cell:read (.answers sc))
+        ((Cons answer (Nil)) answer)
+        ((Cons answer rest)
+         (cell:write! (.answers sc) rest)
+         answer)
+        ((Nil) (Err "the script has no answer")))))
+
+  (declare requests (Script -> List (List chat:Message)))
+  (define (requests sc)
+    "The messages of each request, in order."
+    (list:reverse (cell:read (.seen sc))))
+
+  (declare capture (Void -> Tuple (cell:Cell (List String)) terminal:Terminal))
+  (define (capture)
+    (let lines = (cell:new Nil))
+    (Tuple lines (fn (line) (cell:push! lines line) Unit)))
+
+  (declare captured (cell:Cell (List String) -> List String))
+  (define (captured lines)
+    (list:reverse (cell:read lines)))
+
+  (declare all-answered? (List chat:Message -> Boolean))
+  (define (all-answered? messages)
+    "True if every tool call in MESSAGES has a result with its id."
+    (let results = (list:concatMap (fn (m) (match m
+                                              ((chat:ToolResult id _) (make-list id))
+                                              (_ Nil)))
+                                    messages))
+    (list:all (fn (m)
+                (match m
+                  ((chat:Assistant _ calls)
+                   (list:all (fn (c) (list:member (chat:call-id c) results)) calls))
+                  (_ True)))
+              messages))
+
+  (declare turn-of (Rig * Script * String
+                    -> Tuple3 (List chat:Message) (Result String Unit) (List String)))
+  (define (turn-of r sc text)
+    "Run one turn of TEXT from a fresh conversation. Return the conversation,
+the outcome, and the terminal's lines."
+    (let (Tuple lines say) = (capture))
+    (let (Tuple conversation outcome) =
+      (turn:run-turn (scripted sc) (rig-tools r) say (turn:new-conversation (rig-project r)) text))
+    (Tuple3 conversation outcome (captured lines))))
+
+(define-test turn-a2-a-tool-call-runs-and-the-model-sees-its-result ()
+  (let r = (make-rig Nil))
+  (let call = (bash-call "c1" "echo one"))
+  (let sc = (make-script (make-list (Ok (calls-reply (make-list call))) (Ok (text-reply "done")))))
+  (let (Tuple3 conversation outcome lines) = (turn-of r sc "hi"))
+  (let system = (chat:System (turn:system-prompt (rig-project r))))
+  (is (== (Ok Unit) outcome))
+  (is (== (make-list (make-list system (chat:User "hi"))
+                     (make-list system (chat:User "hi")
+                                (chat:Assistant None (make-list call))
+                                (chat:ToolResult "c1" "one")))
+          (requests sc)))
+  (is (== (Some (chat:Assistant (Some "done") Nil)) (list:last conversation)))
+  ;; R8: the call shows before it runs, a short result after.
+  (is (== (make-list "[bash] {\"command\":\"echo one\"}" "  = one" "done") lines))
+  (unrig r)
+  Unit)
+
+(define-test turn-a3-two-calls-run-in-order ()
+  (let r = (make-rig Nil))
+  (let sc = (make-script (make-list (Ok (calls-reply (make-list (bash-call "c1" "echo one")
+                                                           (bash-call "c2" "echo two"))))
+                               (Ok (text-reply "done")))))
+  (let (Tuple3 _ outcome _) = (turn-of r sc "hi"))
+  (is (== (Ok Unit) outcome))
+  (is (== (make-list (chat:ToolResult "c1" "one") (chat:ToolResult "c2" "two"))
+          (list:drop 3 (with-default Nil (list:index 1 (requests sc))))))
+  (unrig r)
+  Unit)
+
+(define-test turn-a4-a-bad-call-gets-a-result-and-the-turn-goes-on ()
+  (let r = (make-rig Nil))
+  (let sc = (make-script (make-list (Ok (calls-reply (make-list (chat:ToolCall "c1" "nosuch" "{}")
+                                                           (chat:ToolCall "c2" "bash" "{\"command\":")
+                                                           (chat:ToolCall "c3" "bash" "{\"command\": 5}"))))
+                               (Ok (text-reply "sorry")))))
+  (let (Tuple3 _ outcome _) = (turn-of r sc "hi"))
+  (is (== (Ok Unit) outcome))
+  (let results = (list:drop 3 (with-default Nil (list:index 1 (requests sc)))))
+  (let text-of = (fn (i) (match (list:index i results)
+                           ((Some (chat:ToolResult _ text)) text)
+                           (_ ""))))
+  (is (== 3 (list:length results)))
+  (is (has? (text-of 0) "unknown tool \"nosuch\""))
+  (is (has? (text-of 1) "the arguments are not JSON"))
+  (is (== "error: argument \"command\" must be a string, not an integer" (text-of 2)))
+  (unrig r)
+  Unit)
+
+(define-test turn-a5-a-turn-stops-after-50-model-calls ()
+  (let r = (make-rig Nil))
+  (let sc = (make-script (make-list (Ok (calls-reply (make-list (chat:ToolCall "c" "show_policy" "{}")))))))
+  (let (Tuple3 conversation outcome lines) = (turn-of r sc "loop"))
+  (is (== 50 (list:length (requests sc))))
+  (is (== (Err "the turn stopped after 50 model calls") outcome))
+  (is (== (Some "dakusui: the turn stopped after 50 model calls") (list:last lines)))
+  (is (all-answered? conversation))
+  (unrig r)
+  Unit)
+
+(define-test turn-a6-a-provider-error-keeps-what-the-turn-gathered ()
+  (let r = (make-rig Nil))
+  (let sc = (make-script (make-list (Ok (calls-reply (make-list (bash-call "c1" "echo one"))))
+                               (Err "the provider answered 500: down"))))
+  (let (Tuple3 conversation outcome lines) = (turn-of r sc "hi"))
+  (is (== (Err "the provider answered 500: down") outcome))
+  (is (== (Some "dakusui: the provider answered 500: down") (list:last lines)))
+  (is (== (Some (chat:ToolResult "c1" "one")) (list:last conversation)))
+  (is (all-answered? conversation))
+  (unrig r)
+  Unit)
+
+(define-test turn-a7-the-system-prompt-names-the-project-and-show-policy ()
+  (let prompt = (turn:system-prompt "/home/u/proj"))
+  (is (has? prompt "/home/u/proj"))
+  (is (has? prompt "show_policy"))
+  (is (has? prompt "kernel confines every command"))
+  (is (== (make-list (chat:System prompt)) (turn:new-conversation "/home/u/proj"))))
+
+(define-test short-form-shows-the-first-line ()
+  (is (== "one" (turn:short-form "one
+")))
+  (is (== "one (2 more lines)" (turn:short-form "one
+two
+three")))
+  (is (== (<> (lisp (-> String) () (cl:make-string 100 :initial-element #\z)) "...")
+          (turn:short-form (lisp (-> String) () (cl:make-string 150 :initial-element #\z))))))

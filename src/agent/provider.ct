@@ -1,0 +1,165 @@
+(defpackage #:dakusui/provider
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:chat #:dakusui/chat)
+                    (#:string #:coalton/string))
+  (:export #:Provider #:http-provider #:failure-text))
+(in-package #:dakusui/provider)
+
+;;; The chat completions client. (Spec 0002 R2, R6, R10)
+;;;
+;;; One POST per model call, through libcurl's easy interface, with no
+;;; streaming. The API key goes only into the Authorization header. No
+;;; message is built from a header, and curl prints nothing, so the key
+;;; cannot reach the terminal or a log.
+
+;;; A bare soname, as for libbpf.
+(cffi:define-foreign-library libcurl
+  (cl:t "libcurl.so.4"))
+
+(cffi:use-foreign-library libcurl)
+
+(cl:defconstant +curlopt-writedata+ 10001)
+(cl:defconstant +curlopt-url+ 10002)
+(cl:defconstant +curlopt-errorbuffer+ 10010)
+(cl:defconstant +curlopt-httpheader+ 10023)
+(cl:defconstant +curlopt-copypostfields+ 10165)
+(cl:defconstant +curlopt-writefunction+ 20011)
+(cl:defconstant +curlopt-timeout+ 13)
+(cl:defconstant +curlopt-nosignal+ 99)
+(cl:defconstant +curlinfo-response-code+ #x200002)
+
+(cl:defvar *body* cl:nil
+  "The response body of the request in progress on this thread.")
+
+(cl:defvar *curl-ready* cl:nil)
+
+(cffi:defcallback collect-body :size ((data :pointer) (size :size) (count :size) (user :pointer))
+  (cl:declare (cl:ignore user))
+  (cl:let ((n (cl:* size count)))
+    (cl:dotimes (i n)
+      (cl:vector-push-extend (cffi:mem-aref data :uint8 i) *body*))
+    n))
+
+(cl:defun set-pointer (handle option value)
+  (cffi:foreign-funcall-varargs "curl_easy_setopt" (:pointer handle :int option) :pointer value :int))
+
+(cl:defun set-long (handle option value)
+  (cffi:foreign-funcall-varargs "curl_easy_setopt" (:pointer handle :int option) :long value :int))
+
+(cl:defun post (url key body seconds)
+  "POST BODY to URL as JSON. Return (status text), or a string that names
+why no answer came."
+  (cl:unless *curl-ready*
+    ;; CURL_GLOBAL_ALL (3).
+    (cffi:foreign-funcall "curl_global_init" :long 3 :int)
+    (cl:setf *curl-ready* cl:t))
+  (cl:let ((handle (cffi:foreign-funcall "curl_easy_init" :pointer))
+           (headers (cffi:null-pointer))
+           (*body* (cl:make-array 0 :element-type '(cl:unsigned-byte 8)
+                                    :adjustable cl:t :fill-pointer 0)))
+    (cl:when (cffi:null-pointer-p handle)
+      (cl:return-from post "cannot start libcurl"))
+    (cffi:with-foreign-object (errors :char 256)
+      (cl:setf (cffi:mem-aref errors :char 0) 0)
+      (cl:unwind-protect
+           (cl:progn
+             ;; "Expect:" stops curl from waiting for a 100 Continue.
+             (cl:dolist (h (cl:append (cl:list "Content-Type: application/json" "Expect:")
+                                      (cl:when key (cl:list (cl:format cl:nil "Authorization: Bearer ~A" key)))))
+               (cl:setf headers (cffi:foreign-funcall "curl_slist_append" :pointer headers
+                                                      :string h :pointer)))
+             (cffi:with-foreign-strings ((c-url url) (c-body body :encoding :utf-8))
+               (set-pointer handle +curlopt-url+ c-url)
+               (set-pointer handle +curlopt-httpheader+ headers)
+               (set-pointer handle +curlopt-copypostfields+ c-body)
+               (set-pointer handle +curlopt-writefunction+ (cffi:callback collect-body))
+               (set-pointer handle +curlopt-writedata+ (cffi:null-pointer))
+               (set-pointer handle +curlopt-errorbuffer+ errors)
+               (set-long handle +curlopt-timeout+ seconds)
+               ;; Signals would reach other threads of SBCL.
+               (set-long handle +curlopt-nosignal+ 1)
+               (cl:let ((code (cffi:foreign-funcall "curl_easy_perform" :pointer handle :int)))
+                 (cl:if (cl:/= code 0)
+                        (cl:let ((reason (cffi:foreign-string-to-lisp errors)))
+                          (cl:format cl:nil "cannot reach the provider: ~A"
+                                     (cl:if (cl:plusp (cl:length reason))
+                                            reason
+                                            (cffi:foreign-funcall "curl_easy_strerror" :int code :string))))
+                        (cffi:with-foreign-object (status :long)
+                          (cffi:foreign-funcall-varargs "curl_easy_getinfo"
+                                                        (:pointer handle :int +curlinfo-response-code+)
+                                                        :pointer status :int)
+                          (cl:list (cffi:mem-ref status :long)
+                                   (sb-ext:octets-to-string
+                                    (cl:coerce *body* '(cl:vector (cl:unsigned-byte 8)))
+                                    :external-format '(:utf-8 :replacement #\?))))))))
+        (cffi:foreign-funcall "curl_slist_free_all" :pointer headers :void)
+        (cffi:foreign-funcall "curl_easy_cleanup" :pointer handle :void)))))
+
+(cl:defun server-error (text)
+  "The server's error.message, or the start of TEXT."
+  (cl:let* ((value (cl:ignore-errors (com.inuoe.jzon:parse text :max-depth 32)))
+            (problem (cl:and (cl:hash-table-p value) (cl:gethash "error" value)))
+            (message (cl:cond ((cl:hash-table-p problem) (cl:gethash "message" problem))
+                              ((cl:stringp problem) problem))))
+    (cl:if (cl:stringp message)
+           message
+           (cl:subseq text 0 (cl:min 200 (cl:length text))))))
+
+(cl:defun redact (text key)
+  "TEXT with each copy of KEY replaced. A server could echo the key. (R10)"
+  (cl:if (cl:or (cl:null key) (cl:zerop (cl:length key)))
+         text
+         (cl:with-output-to-string (out)
+           (cl:loop :with start := 0
+                    :for at := (cl:search key text :start2 start)
+                    :do (cl:write-string text out :start start :end (cl:or at (cl:length text)))
+                    :while at
+                    :do (cl:write-string "[key]" out)
+                        (cl:setf start (cl:+ at (cl:length key)))))))
+
+(coalton-toplevel
+  (repr :native cl:t)
+  (define-type LispValue)
+
+  (define-type-alias Provider (List chat:Message * List chat:ToolSpec -> Result String chat:Reply)
+    "One model call: the conversation and the tool list in, a reply out.")
+
+  (declare failure-text (Integer * String -> String))
+  (define (failure-text status body)
+    "What to say when the server answers STATUS with BODY. (R6)"
+    (lisp (-> String) (status body)
+      (cl:let ((why (server-error body)))
+        (cl:if (cl:plusp (cl:length why))
+               (cl:format cl:nil "the provider answered ~D: ~A" status why)
+               (cl:format cl:nil "the provider answered ~D" status)))))
+
+  (declare http-provider (String * Optional String * String -> Provider))
+  (define (http-provider base-url key model)
+    "Call POST BASE-URL/chat/completions with MODEL, and KEY as a bearer token
+when there is one. Allow 600 seconds for each call. (R2, R6, R10)"
+    (let url = (<> (with-default base-url (string:strip-suffix "/" base-url))
+                   "/chat/completions"))
+    ;; The key as Lisp sees it: a string, or NIL.
+    (let lisp-key = (match key
+                      ((Some k) (lisp (-> LispValue) (k) k))
+                      ((None) (lisp (-> LispValue) () cl:nil))))
+    (let redacted = (fn (text) (lisp (-> String) (text lisp-key) (redact text lisp-key))))
+    (fn (messages tools)
+      (let body = (chat:request-json model messages tools))
+      (let answer =
+        (lisp (-> (Result String (Tuple Integer String))) (url lisp-key body)
+          (cl:let ((r (post url lisp-key body 600)))
+            (cl:if (cl:stringp r)
+                   (coalton (Err (lisp (-> String) () r)))
+                   (cl:destructuring-bind (status text) r
+                     (coalton (Ok (Tuple (lisp (-> Integer) () status)
+                                         (lisp (-> String) () text)))))))))
+      (match answer
+        ((Err why) (Err (redacted why)))
+        ((Ok (Tuple status text))
+         (if (and (>= status 200) (< status 300))
+             (match (chat:decode-reply text)
+               ((Ok reply) (Ok reply))
+               ((Err why) (Err (<> "cannot decode the provider's reply: " why))))
+             (Err (redacted (failure-text status text)))))))))

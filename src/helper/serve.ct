@@ -115,13 +115,16 @@ agent's, but it still gets a reply instead of ending the helper."
       ((Some line) (lisp (-> Unit) (fd line) (write-line-to fd line) Unit))
       ((None) Unit)))
 
-  (declare handle-request (libbpf:BpfObject * String -> String))
-  (define (handle-request obj line)
+  (declare handle-request (libbpf:BpfObject * (Void -> Unit) * String -> String))
+  (define (handle-request obj drain line)
+    "Answer one request. sync drains the ring buffer first, so its reply comes
+after every denial logged before it. (Spec 0003 R6)"
     (let outcome =
       (match (protocol:decode-request line)
         ((Err why) (Err why))
         ((Ok (protocol:PolicyRequest pol)) (enforcer:install-policy obj pol))
-        ((Ok (protocol:FlagRequest pid)) (enforcer:flag-process obj pid))))
+        ((Ok (protocol:FlagRequest pid)) (enforcer:flag-process obj pid))
+        ((Ok (protocol:SyncRequest)) (Ok (drain)))))
     (match outcome
       ((Ok _) protocol:reply-ok)
       ((Err why) (protocol:reply-error why))))
@@ -136,7 +139,7 @@ agent's, but it still gets a reply instead of ending the helper."
      (let drain = (fn ()
                     (libbpf:ring-buffer-poll ring 0)
                     Unit))
-     (let handle = (fn (line) (handle-request obj line)))
+     (let handle = (fn (line) (handle-request obj drain line)))
      (pure (lisp (-> Unit) (fd events-fd drain handle max-line)
              (serve-loop fd events-fd
                          (cl:lambda () (call-coalton-function drain))

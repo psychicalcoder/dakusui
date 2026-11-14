@@ -1,0 +1,246 @@
+(defpackage #:dakusui/tools
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:chat #:dakusui/chat)
+                    (#:client #:dakusui/client)
+                    (#:session #:dakusui/session)
+                    (#:launch #:dakusui/launch)
+                    (#:denials #:dakusui/denials)
+                    (#:cell #:coalton/cell)
+                    (#:list #:coalton/list)
+                    (#:string #:coalton/string))
+  (:export #:Tool #:Tools #:tool-spec #:specs #:call
+           #:Arguments #:parse-arguments #:with-arguments
+           #:required-string #:optional-integer
+           #:max-result #:shorten
+           #:bash-tool #:show-policy-tool #:builtin-tools))
+(in-package #:dakusui/tools)
+
+;;; Spec 0003: the tools the model may call. A tool is its spec and a function
+;;; from the raw argument text to a result text. A result never fails: a
+;;; problem comes back as text that starts with "error: ". (Spec 0002 R4)
+;;;
+;;; No tool here opens a file. bash and, later, MCP servers spawn through the
+;;; launcher, so only confined processes touch files for the model. (R8)
+
+(cl:defun simple (s)
+  (cl:coerce s '(cl:simple-array cl:character (cl:*))))
+
+(cl:defun json-kind (v)
+  "What a jzon value is, in words."
+  (cl:typecase v
+    (cl:string "a string")
+    (cl:integer "an integer")
+    (cl:real "a number")
+    (cl:hash-table "an object")
+    (cl:vector "a list")
+    (cl:t (cl:cond ((cl:eq v cl:t) "a boolean")
+                   ((cl:null v) "a boolean")
+                   (cl:t "null")))))
+
+(coalton-toplevel
+  (define-struct Tool
+    (spec chat:ToolSpec)
+    (run (String -> String)))
+
+  (define-type-alias Tools (List Tool))
+
+  (declare tool-spec (Tool -> chat:ToolSpec))
+  (define (tool-spec tool) (.spec tool))
+
+  (declare joined (String * List String -> String))
+  (define (joined between items)
+    (match items
+      ((Nil) "")
+      ((Cons first rest) (mconcat (Cons first (map (fn (s) (<> between s)) rest))))))
+
+  (declare specs (Tools -> List chat:ToolSpec))
+  (define (specs tools)
+    "The tool list for the model, in order. (R1)"
+    (map .spec tools))
+
+  (declare max-result UFix)
+  (define max-result 30000)
+
+  (declare shorten (String -> String))
+  (define (shorten text)
+    "TEXT, or its first and last 15,000 characters and the count cut. (R5)"
+    (lisp (-> String) (text max-result)
+      (cl:let* ((n (cl:length text))
+                (keep (cl:floor max-result 2)))
+        (cl:if (cl:<= n max-result)
+               text
+               (cl:format cl:nil "~A~%[... ~D characters cut ...]~%~A"
+                          (cl:subseq text 0 keep) (cl:- n (cl:* 2 keep))
+                          (cl:subseq text (cl:- n keep)))))))
+
+  (declare call (Tools * chat:ToolCall -> String))
+  (define (call tools c)
+    "Run the tool C names on its arguments. (R1, spec 0002 R4)"
+    (let name = (chat:call-name c))
+    (shorten
+     (match (list:find (fn (tool) (== name (chat:spec-name (.spec tool)))) tools)
+       ((Some tool) ((.run tool) (chat:call-arguments c)))
+       ((None)
+        (mconcat (make-list "error: unknown tool " (chat:quoted name) "; the tools are "
+                            (joined ", " (map (fn (tool) (chat:spec-name (.spec tool))) tools)))))))))
+
+;;; Arguments. (R2) Each tool reads its arguments with these, so a wrong type
+;;; is an error result that names the argument and what was expected.
+
+(coalton-toplevel
+  (repr :native cl:hash-table)
+  (define-type Arguments
+    "A tool's arguments: a parsed JSON object.")
+
+  (declare parse-arguments (String -> Result String Arguments))
+  (define (parse-arguments text)
+    (lisp (-> (Result String Arguments)) (text)
+      (cl:multiple-value-bind (value problem)
+          (cl:handler-case (cl:values (com.inuoe.jzon:parse text :max-depth 64) cl:nil)
+            (cl:error (e)
+              (cl:values cl:nil (cl:let ((cl:*print-pretty* cl:nil))
+                                  (cl:format cl:nil "the arguments are not JSON: ~A" e)))))
+        (cl:cond
+          (problem (coalton (Err (lisp (-> String) () problem))))
+          ((cl:hash-table-p value) (coalton (Ok (lisp (-> Arguments) () value))))
+          (cl:t (coalton (Err "the arguments must be a JSON object")))))))
+
+  (declare with-arguments ((Arguments -> Result String String) -> String -> String))
+  (define (with-arguments body)
+    "A tool's run: decode the argument text and run BODY on it. An error
+becomes the result's text."
+    (fn (text)
+      (match (>>= (parse-arguments text) body)
+        ((Ok result) result)
+        ((Err why) (<> "error: " why)))))
+
+  (declare required-string (String * Arguments -> Result String String))
+  (define (required-string name args)
+    (lisp (-> (Result String String)) (name args)
+      (cl:multiple-value-bind (v present) (cl:gethash name args)
+        (cl:cond
+          ((cl:not present)
+           (cl:let ((why (cl:format cl:nil "missing argument ~S, a string" name)))
+             (coalton (Err (lisp (-> String) () why)))))
+          ((cl:stringp v)
+           (cl:let ((v (simple v)))
+             (coalton (Ok (lisp (-> String) () v)))))
+          (cl:t
+           (cl:let ((why (cl:format cl:nil "argument ~S must be a string, not ~A" name (json-kind v))))
+             (coalton (Err (lisp (-> String) () why)))))))))
+
+  (declare optional-integer (String * Arguments -> Result String (Optional Integer)))
+  (define (optional-integer name args)
+    "The integer NAME, or None if it is missing or null."
+    (lisp (-> (Result String (Optional Integer))) (name args)
+      (cl:multiple-value-bind (v present) (cl:gethash name args)
+        (cl:cond
+          ((cl:or (cl:not present) (cl:eq v 'cl:null)) (coalton (Ok None)))
+          ((cl:integerp v) (coalton (Ok (Some (lisp (-> Integer) () v)))))
+          (cl:t
+           (cl:let ((why (cl:format cl:nil "argument ~S must be an integer, not ~A" name (json-kind v))))
+             (coalton (Err (lisp (-> String) () why))))))))))
+
+;;; bash. (R3, R4, R6)
+
+(coalton-toplevel
+  (declare bash-schema String)
+  (define bash-schema
+    "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The command, for sh.\"},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600,\"description\":\"Seconds before the command is killed. 120 by default, 600 at most.\"}},\"required\":[\"command\"]}")
+
+  (declare show-integer (Integer -> String))
+  (define (show-integer n)
+    (lisp (-> String) (n) (cl:format cl:nil "~D" n)))
+
+  (declare timeout-of (Arguments -> Result String UFix))
+  (define (timeout-of args)
+    "The limit in seconds: 120 by default, from 1 to 600. (R4)"
+    (>>= (optional-integer "timeout" args)
+         (fn (given)
+           (match given
+             ((None) (Ok 120))
+             ((Some n)
+              (if (and (>= n 1) (<= n 600))
+                  (Ok (lisp (-> UFix) (n) n))
+                  (Err "argument \"timeout\" must be from 1 to 600 seconds")))))))
+
+  (declare without-final-newline (String -> String))
+  (define (without-final-newline text)
+    (lisp (-> String) (text)
+      (cl:let ((n (cl:length text)))
+        (cl:if (cl:and (cl:plusp n) (cl:char= #\Newline (cl:char text (cl:1- n))))
+               (cl:subseq text 0 (cl:1- n))
+               text))))
+
+  (declare bash-result (launch:Outcome * UFix * List String * Optional String -> String))
+  (define (bash-result o limit found sync-problem)
+    "The output, then how the command ended, then its denials. (R3, R4, R6)"
+    (let code = (launch:outcome-code o))
+    (let ending =
+      (cond
+        ((launch:outcome-timed-out? o)
+         (make-list (lisp (-> String) (limit)
+                      (cl:format cl:nil "the command timed out after ~D seconds; its process group was killed" limit))))
+        ((/= code 0) (make-list (<> "exit code " (show-integer (into code)))))
+        (True Nil)))
+    (let denied =
+      (if (list:null? found)
+          Nil
+          (Cons "denials while this ran:" (map (fn (line) (<> "  " line)) found))))
+    (let missing =
+      (match sync-problem
+        ((Some why) (make-list (<> "the denials may be incomplete: " why)))
+        ((None) Nil)))
+    (let parts = (list:filter (fn (p) (/= p ""))
+                              (mconcat (make-list (make-list (without-final-newline (launch:outcome-output o)))
+                                                  ending denied missing))))
+    (if (list:null? parts)
+        "(no output)"
+        (joined (into #\Newline) parts)))
+
+  (declare run-bash (session:Session * denials:DenialLog * String * UFix -> String))
+  (define (run-bash s dlog command limit)
+    "Run COMMAND confined, then sync with the helper, so every denial of the
+command has reached the log. (R6)"
+    (let helper = (session:session-helper s))
+    (denials:mark dlog)
+    (let ran = (launch:run-command helper (session:session-project s) command limit))
+    (let synced = (client:send-sync helper))
+    (let found = (denials:marked dlog))
+    (match ran
+      ((Err why) (<> "error: " why))
+      ((Ok o)
+       (bash-result o limit found
+                    (match synced
+                      ((Ok _) None)
+                      ((Err why) (Some why)))))))
+
+  (declare bash-tool (cell:Cell session:Session * denials:DenialLog -> Tool))
+  (define (bash-tool sessions dlog)
+    (Tool (chat:ToolSpec
+           "bash"
+           "Run a command with sh in the project directory. The kernel confines it to the file access policy. Stdin is /dev/null. The result holds stdout and stderr together, the exit code when it is not 0, and each access the policy denied."
+           bash-schema)
+          (with-arguments
+              (fn (args)
+                (do
+                 (command <- (required-string "command" args))
+                 (limit <- (timeout-of args))
+                 (pure (run-bash (cell:read sessions) dlog command limit)))))))
+
+  (declare show-policy-tool (cell:Cell session:Session -> Tool))
+  (define (show-policy-tool sessions)
+    "The policy in force, as spec 0001 R8 shows it. (R7) It takes no
+arguments, so empty text passes too."
+    (Tool (chat:ToolSpec
+           "show_policy"
+           "Show the file access policy in force, one rule per line, in order. The last rule that matches an access decides it. An access no rule matches is denied."
+           "{\"type\":\"object\",\"properties\":{}}")
+          (fn (text)
+            (let policy = (fn (_) (Ok (session:policy-text (cell:read sessions)))))
+            ((with-arguments policy) (if (== "" text) "{}" text)))))
+
+  (declare builtin-tools (cell:Cell session:Session * denials:DenialLog -> Tools))
+  (define (builtin-tools sessions dlog)
+    "Dakusui's own tools, first in the list. (R1)"
+    (make-list (bash-tool sessions dlog) (show-policy-tool sessions))))

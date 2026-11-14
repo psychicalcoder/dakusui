@@ -32,6 +32,14 @@ gone. (R9)"
        1)
       ((Ok _) (lisp (-> UFix) (code) code))))
 
+  (declare arguments (Void -> List String))
+  (define (arguments)
+    "Our arguments, which go to the agent unread: the helper takes no option
+of its own. (R11, spec 0002 R11)"
+    (lisp (-> (List String)) ()
+      (cl:mapcar (cl:lambda (a) (cl:coerce a '(cl:simple-array cl:character (cl:*))))
+                 (cl:rest sb-ext:*posix-argv*))))
+
   (declare main (Void -> UFix))
   (define (main)
     "Start enforcement and then the agent, or exit non-zero before anything
@@ -43,7 +51,7 @@ session."
             (pins:check-system-pins)
             (let _ = (cleanup:clear-stale-sessions (pins:pin-root (pins:real-uid))))
             (obj <- (enforcer:start lsm-list))
-            (agent <- (spawn:start-agent (spawn:agent-path) Nil))
+            (agent <- (spawn:start-agent (spawn:agent-path) (arguments)))
             (pure (Tuple obj agent)))
       ((Err why)
        (complain why)

@@ -45,15 +45,22 @@
   :defsystem-depends-on ("coalton-asdf")
   :pathname "src/agent/"
   :serial t
-  :components ((:ct-file "client")
+  :components ((:ct-file "chat")
+               (:ct-file "terminal")
+               (:ct-file "client")
                (:ct-file "denials")
                (:ct-file "session")
                (:ct-file "launch")
+               (:ct-file "tools")
+               (:ct-file "provider")
+               (:ct-file "loop")
+               (:ct-file "commands")
                (:ct-file "main")))
 
 (defsystem "dakusui/check-agent"
   :description "The acceptance harness: a stand-in agent that runs A1 through
-A19, the random-policy test, and the torn-walk test under the real helper.
+A19, the random-policy test, the torn-walk test, and spec 0003 A3, A4, and A6
+under the real helper.
 Run it with `make attach-check`."
   :depends-on ("coalton" "cffi" "dakusui/policy" "dakusui/agent")
   :defsystem-depends-on ("coalton-asdf")
@@ -65,7 +72,7 @@ Run it with `make attach-check`."
 
 (defsystem "dakusui/test"
   :description "Unit tests. Run them with `make test`."
-  :depends-on ("coalton" "coalton/testing" "fiasco"
+  :depends-on ("coalton" "coalton/testing" "fiasco" "sb-bsd-sockets"
                "dakusui/policy" "dakusui/helper" "dakusui/agent")
   :defsystem-depends-on ("coalton-asdf")
   :pathname "test/"
@@ -82,4 +89,10 @@ Run it with `make attach-check`."
                (:ct-file "session")
                (:ct-file "launch")
                (:ct-file "denials")
-               (:ct-file "pins")))
+               (:ct-file "pins")
+               (:ct-file "chat")
+               (:ct-file "terminal")
+               (:ct-file "tools")
+               (:ct-file "loop")
+               (:ct-file "provider")
+               (:ct-file "commands")))

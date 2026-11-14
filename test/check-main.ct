@@ -26,6 +26,7 @@
                   (check-a17 c s)
                   (check-a18 c s)
                   (check-spike c)
+                  (check-tools c s)
                   (make-list (check-random c s)
                              (check-torn c s)))))
     (let victim = (start-a19 c))
@@ -48,10 +49,11 @@
     (let outcome =
       (do
        (agent:harden)
-       (let log = (denials:open-log log-file))
-       (let helper = (client:connect 3 (fn (line) (on-event log line))))
+       (let dlog = (denials:open-log log-file))
+       (let record = (denials:on-event dlog))
+       (let helper = (client:connect 3 (fn (line) (on-event record line))))
        (s <- (session:start helper project (<> base "/homelink")))
-       (let c = (Ctx helper base project (<> base "/home") (<> base "/homelink") log-file))
+       (let c = (Ctx helper base project (<> base "/home") (<> base "/homelink") log-file dlog))
        (match (lisp (-> (Optional String)) ()
                 (cl:let ((v (sb-ext:posix-getenv "DAKUSUI_CHECK_VICTIMS")))
                   (cl:if v (coalton (Some (lisp (-> String) () v))) (coalton None))))

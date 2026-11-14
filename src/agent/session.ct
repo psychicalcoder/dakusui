@@ -4,7 +4,8 @@
                     (#:client #:dakusui/client)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
-  (:export #:Session #:start #:current-policy #:policy-text #:set-rules
+  (:export #:Session #:start #:session-helper #:session-project
+           #:current-policy #:policy-text #:set-rules
            #:replace-rules #:add-rule #:remove-rule
            #:resolve-path))
 (in-package #:dakusui/session)
@@ -54,6 +55,14 @@ absolute, with no trailing slash and no . or .. component."
     (home String)
     (rules (List policy:Rule))
     (policy policy:Policy))
+
+  (declare session-helper (Session -> client:Client))
+  (define (session-helper s) (.helper s))
+
+  (declare session-project (Session -> String))
+  (define (session-project s)
+    "The project directory, resolved. Commands start there."
+    (.project s))
 
   (declare current-policy (Session -> policy:Policy))
   (define (current-policy s)

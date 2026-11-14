@@ -1,0 +1,164 @@
+(defpackage #:dakusui/commands
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:policy #:dakusui/policy)
+                    (#:session #:dakusui/session)
+                    (#:provider #:dakusui/provider)
+                    (#:tools #:dakusui/tools)
+                    (#:terminal #:dakusui/terminal)
+                    (#:turn #:dakusui/loop)
+                    (#:cell #:coalton/cell)
+                    (#:list #:coalton/list)
+                    (#:string #:coalton/string))
+  (:export #:Command #:ShowPolicy #:AddRule #:RemoveRule #:Clear #:Help #:Quit
+           #:parse-command #:policy-listing #:help-text #:prompt-loop))
+(in-package #:dakusui/commands)
+
+;;; The commands the user types at the prompt, and the prompt loop. (Spec 0002
+;;; R1, R9) A line that starts with / never reaches the model.
+
+(cl:defun split-word (text)
+  "TEXT's first word and the rest, trimmed, as a list of two strings."
+  (cl:let* ((blank '(#\Space #\Tab))
+            (text (cl:string-trim blank text))
+            (end (cl:or (cl:position-if (cl:lambda (c) (cl:member c blank)) text)
+                        (cl:length text))))
+    (cl:list (cl:subseq text 0 end)
+             (cl:string-trim blank (cl:subseq text end)))))
+
+(coalton-toplevel
+  (derive Eq)
+  (define-type Command
+    ShowPolicy
+    (AddRule policy:Rule)
+    (RemoveRule UFix)
+    Clear
+    Help
+    Quit)
+
+  (declare help-text String)
+  (define help-text
+    "/policy            show the policy in force
+/allow KINDS PATH  add an allow rule to the session's rule set
+/deny KINDS PATH   add a deny rule
+/remove N          remove rule N of the set, as /policy numbers it
+/clear             forget the conversation
+/help              list these commands
+/quit              leave; so does the end of input")
+
+  (declare parse-command (String -> Result String Command))
+  (define (parse-command line)
+    "Parse LINE, which starts with /. A rule is the rule text of spec 0001 R10
+with the slash before it. (R9)"
+    (let body = (with-default line (string:strip-prefix "/" line)))
+    (let parts = (lisp (-> (Tuple String String)) (body)
+                   (cl:destructuring-bind (word rest) (split-word body)
+                     (coalton (Tuple (lisp (-> String) () word) (lisp (-> String) () rest))))))
+    (let word = (fst parts))
+    (let rest = (snd parts))
+    (let alone = (fn (command)
+                   (if (== rest "")
+                       (Ok command)
+                       (Err (mconcat (make-list "/" word " takes nothing after it"))))))
+    (match word
+      ("policy" (alone ShowPolicy))
+      ("allow" (map AddRule (policy:parse-rule body)))
+      ("deny" (map AddRule (policy:parse-rule body)))
+      ("remove"
+       (match (string:parse-int rest)
+         ((Some n)
+          (if (>= n 1)
+              (Ok (RemoveRule (lisp (-> UFix) (n) n)))
+              (Err "/remove takes a rule number, as /policy shows it")))
+         ((None) (Err "/remove takes a rule number, as /policy shows it"))))
+      ("clear" (alone Clear))
+      ("help" (alone Help))
+      ("quit" (alone Quit))
+      (_ (Err (mconcat (make-list "unknown command /" word "; /help lists the commands"))))))
+
+  (declare lines (List String -> String))
+  (define (lines items)
+    "ITEMS as lines, without a final newline."
+    (match items
+      ((Nil) "")
+      ((Cons first rest) (mconcat (Cons first (map (fn (s) (<> (into #\Newline) s)) rest))))))
+
+  (declare show-n (UFix -> String))
+  (define (show-n n)
+    (lisp (-> String) (n) (cl:format cl:nil "~D" n)))
+
+  (declare numbered (UFix * List policy:Rule -> List String))
+  (define (numbered n rules)
+    (match rules
+      ((Nil) Nil)
+      ((Cons r rest)
+       (Cons (mconcat (make-list "  " (show-n n) " " (policy:rule-text r)))
+             (numbered (+ n 1) rest)))))
+
+  (declare policy-listing (session:Session -> String))
+  (define (policy-listing s)
+    "The policy in force for /policy: the default rules, the set's rules with
+their numbers, and the fixed last rule. (R9)"
+    (let all = (match (session:current-policy s) ((policy:Policy rules) rules)))
+    (let set = (session:set-rules s))
+    (let defaults = (list:take (- (list:length all) (+ 1 (list:length set))) all))
+    (let fixed = (list:drop (+ (list:length defaults) (list:length set)) all))
+    (let plain = (fn (rules) (map (fn (r) (<> "  " (policy:rule-text r))) rules)))
+    (lines
+     (mconcat
+      (make-list (make-list "The default rules:")
+                 (plain defaults)
+                 (make-list "The session's rule set; later rules win:")
+                 (if (list:null? set) (make-list "  (none)") (numbered 1 set))
+                 (make-list "The fixed last rule:")
+                 (plain fixed)))))
+
+  (declare run-command (cell:Cell session:Session * terminal:Terminal * Command -> Unit))
+  (define (run-command sessions say command)
+    "Run a command that changes or shows the policy. A change is recorded only
+once the helper has accepted it."
+    (let change =
+      (fn (changed what)
+        (match changed
+          ((Ok s)
+           (cell:write! sessions s)
+           (say what))
+          ((Err why) (say (<> "dakusui: " why))))))
+    (let s = (cell:read sessions))
+    (match command
+      ((ShowPolicy) (say (policy-listing s)))
+      ((AddRule r)
+       (change (session:add-rule s r)
+               (mconcat (make-list "added rule " (show-n (+ 1 (list:length (session:set-rules s))))
+                                   ": " (policy:rule-text r)))))
+      ((RemoveRule n) (change (session:remove-rule s n) (<> "removed rule " (show-n n))))
+      ((Help) (say help-text))
+      (_ Unit)))
+
+  (declare prompt-loop (provider:Provider * tools:Tools * cell:Cell session:Session
+                        * terminal:Terminal * (Void -> Optional String) * turn:Conversation
+                        -> Unit))
+  (define (prompt-loop ask tools sessions say read-line conversation)
+    "Read a line, and run it as a command or a turn, until /quit or the end of
+input. (R1, R9)"
+    (match (read-line)
+      ((None) Unit)
+      ((Some line)
+       (match (string:strip-prefix "/" line)
+         ((Some _)
+          (match (parse-command line)
+            ((Err why)
+             (say (<> "dakusui: " why))
+             (prompt-loop ask tools sessions say read-line conversation))
+            ((Ok (Quit)) Unit)
+            ((Ok (Clear))
+             (say "The conversation is cleared.")
+             (prompt-loop ask tools sessions say read-line
+                          (turn:new-conversation (session:session-project (cell:read sessions)))))
+            ((Ok command)
+             (run-command sessions say command)
+             (prompt-loop ask tools sessions say read-line conversation))))
+         ((None)
+          (if (== "" line)
+              (prompt-loop ask tools sessions say read-line conversation)
+              (prompt-loop ask tools sessions say read-line
+                           (fst (turn:run-turn ask tools say conversation line))))))))))

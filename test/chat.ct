@@ -1,0 +1,138 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0002 T1: the chat types and their JSON. (R2, R3) A request decodes
+;;; back to the messages it was built from, and a reply as a server sends it
+;;; decodes to the Reply it came from.
+
+(cl:defun json-get (value cl:&rest keys)
+  (cl:dolist (k keys value)
+    (cl:setf value (cl:if (cl:integerp k)
+                          (cl:and (cl:vectorp value) (cl:< k (cl:length value)) (cl:aref value k))
+                          (cl:and (cl:hash-table-p value) (cl:gethash k value))))))
+
+(cl:defun simple-string (s)
+  (cl:coerce s '(cl:simple-array cl:character (cl:*))))
+
+(cl:defun calls-of (calls)
+  "The ToolCall values of a tool_calls array."
+  (cl:loop :for c :across (cl:if (cl:vectorp calls) calls #())
+           :collect (cl:let ((ident (simple-string (json-get c "id")))
+                             (name (simple-string (json-get c "function" "name")))
+                             (arguments (simple-string (json-get c "function" "arguments"))))
+                      (coalton (chat:ToolCall (lisp (-> String) () ident)
+                                              (lisp (-> String) () name)
+                                              (lisp (-> String) () arguments))))))
+
+(cl:defun message-of (m)
+  "The Message a request's JSON message stands for."
+  (cl:let ((role (json-get m "role"))
+           (content (json-get m "content")))
+    (cl:flet ((text () (simple-string content)))
+      (cl:cond
+        ((cl:equal role "system") (cl:let ((c (text))) (coalton (chat:System (lisp (-> String) () c)))))
+        ((cl:equal role "user") (cl:let ((c (text))) (coalton (chat:User (lisp (-> String) () c)))))
+        ((cl:equal role "tool")
+         (cl:let ((c (text)) (ident (simple-string (json-get m "tool_call_id"))))
+           (coalton (chat:ToolResult (lisp (-> String) () ident) (lisp (-> String) () c)))))
+        (cl:t
+         (cl:let ((c (cl:and (cl:stringp content) (text)))
+                  (calls (calls-of (json-get m "tool_calls"))))
+           (coalton (chat:Assistant
+                     (lisp (-> (Optional String)) ()
+                       (cl:if c (coalton (Some (lisp (-> String) () c))) (coalton None)))
+                     (lisp (-> (List chat:ToolCall)) () calls)))))))))
+
+(coalton-toplevel
+  (declare sent-messages (String -> List chat:Message))
+  (define (sent-messages body)
+    "The messages of the request BODY."
+    (lisp (-> (List chat:Message)) (body)
+      (cl:map 'cl:list #'message-of
+              (json-get (com.inuoe.jzon:parse body) "messages"))))
+
+  (declare sent-field (String * String -> String))
+  (define (sent-field body key)
+    "The text of BODY's top-level KEY, or \"\"."
+    (lisp (-> String) (body key)
+      (cl:let ((v (json-get (com.inuoe.jzon:parse body) key)))
+        (cl:if (cl:stringp v) (simple-string v) ""))))
+
+  (declare sent-tools (String -> List String))
+  (define (sent-tools body)
+    "The names of the tools in BODY, if each has an object schema."
+    (lisp (-> (List String)) (body)
+      (cl:loop :for spec :across (cl:or (json-get (com.inuoe.jzon:parse body) "tools") #())
+               :when (cl:and (cl:equal "function" (json-get spec "type"))
+                             (cl:equal "object" (json-get spec "function" "parameters" "type")))
+                 :collect (simple-string (json-get spec "function" "name")))))
+
+  (declare has-tools? (String -> Boolean))
+  (define (has-tools? body)
+    (lisp (-> Boolean) (body)
+      (cl:nth-value 1 (cl:gethash "tools" (com.inuoe.jzon:parse body)))))
+
+  (declare reply-body (chat:Reply -> String))
+  (define (reply-body r)
+    "A chat completions response for R, as a server sends it."
+    (let calls = (chat:reply-calls r))
+    (let message = (chat:Assistant (chat:reply-text r) calls))
+    (let encoded = (chat:request-json "m" (make-list message) Nil))
+    ;; The request's one message is the reply's message.
+    (lisp (-> String) (encoded)
+      (cl:let ((m (json-get (com.inuoe.jzon:parse encoded) "messages" 0)))
+        (cl:remhash "role" m)
+        (cl:format cl:nil "{\"id\":\"x\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"message\":~A}]}"
+                   (com.inuoe.jzon:stringify m)))))
+
+  (declare text-reply (String -> chat:Reply))
+  (define (text-reply text)
+    (chat:Reply (Some text) Nil))
+
+  (declare calls-reply (List chat:ToolCall -> chat:Reply))
+  (define (calls-reply calls)
+    (chat:Reply None calls))
+
+  (declare bash-call (String * String -> chat:ToolCall))
+  (define (bash-call id command)
+    (chat:ToolCall id "bash" (<> "{\"command\":" (<> (chat:quoted command) "}"))))
+
+  (declare test-specs (List chat:ToolSpec))
+  (define test-specs
+    (make-list (chat:ToolSpec "bash" "Run a command."
+                              "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}"))))
+
+(define-test chat-request-round-trips-messages ()
+  (let messages =
+    (make-list (chat:System "the system")
+               (chat:User "say \"hi\"
+on two lines")
+               (chat:Assistant (Some "running") (make-list (bash-call "c1" "echo one")))
+               (chat:ToolResult "c1" "one
+")
+               (chat:Assistant None (make-list (bash-call "c2" "a") (bash-call "c3" "b")))
+               (chat:ToolResult "c2" "")
+               (chat:ToolResult "c3" "ü")
+               (chat:Assistant (Some "done") Nil)))
+  (let body = (chat:request-json "test-model" messages test-specs))
+  (is (== messages (sent-messages body)))
+  (is (== "test-model" (sent-field body "model")))
+  (is (== (make-list "bash") (sent-tools body)))
+  (is (not (has-tools? (chat:request-json "m" messages Nil)))))
+
+(define-test chat-reply-round-trips-text-and-calls ()
+  (let replies = (make-list (text-reply "hello")
+                            (calls-reply (make-list (bash-call "c1" "echo one")
+                                                    (chat:ToolCall "c2" "show_policy" "{}")))
+                            (chat:Reply (Some "and a call") (make-list (bash-call "c3" "ls")))))
+  (is (== (map Ok replies) (map (fn (r) (chat:decode-reply (reply-body r))) replies))))
+
+(define-test chat-reply-without-choices-is-an-error ()
+  (is (== (Err "the reply has no choices") (chat:decode-reply "{}")))
+  (is (== (Err "the reply has no choices") (chat:decode-reply "{\"choices\":[]}")))
+  (is (== (Err "the reply's first choice has no message")
+          (chat:decode-reply "{\"choices\":[{\"index\":0}]}")))
+  (is (== (Err "a tool call in the reply lacks an id or a name")
+          (chat:decode-reply "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"function\":{\"name\":\"bash\"}}]}}]}")))
+  (is (match (chat:decode-reply "not json")
+        ((Err why) (string:substring? "not JSON" why))
+        ((Ok _) False))))

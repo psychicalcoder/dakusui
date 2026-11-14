@@ -28,7 +28,7 @@
 there are none. Return the outcome and the requests the helper got."
     (let fake = (fake-helper replies (list:null? replies)))
     (let c = (client:connect (.agent fake) ignore-event))
-    (let outcome = (launch:run-command c directory command))
+    (let outcome = (launch:run-command c directory command 1))
     (Tuple outcome (requests-of fake c)))
 
   (declare outcome-or (Result String launch:Outcome -> Tuple I32 String))
@@ -103,8 +103,62 @@ there are none. Return the outcome and the requests the helper got."
   (let c = (client:connect (.agent fake) ignore-event))
   (is (wait-until (fn () (client:closed? c))))
   (is (== (Err "refused: the helper is gone, so no command can be confined")
-          (map (fn (_) Unit) (launch:run-command c "/" (<> "touch " marker)))))
+          (map (fn (_) Unit) (launch:run-command c "/" (<> "touch " marker) 10))))
   (is (not (exists? marker)))
   ;; It refused without asking the helper.
   (is (== Nil (requests-of fake c)))
   (remove-tree base))
+
+;;; Spec 0003 T2: the launcher leads its own process group, and a command
+;;; that outlives its limit ends with the whole group. (Spec 0003 R4)
+;;; make attach-check runs A4 confined.
+
+(cl:defun live-with (token)
+  "How many live processes, not zombies, have TOKEN in their command line."
+  (cl:loop :for dir :in (cl:directory "/proc/[0-9]*/")
+           :for pid := (cl:car (cl:last (cl:pathname-directory dir)))
+           :for cmdline := (cl:ignore-errors
+                            (cl:with-open-file (in (cl:format cl:nil "/proc/~A/cmdline" pid)
+                                                   :element-type '(cl:unsigned-byte 8))
+                              (cl:let ((bytes (cl:make-array 4096 :element-type '(cl:unsigned-byte 8))))
+                                (cl:map 'cl:string #'cl:code-char
+                                        (cl:subseq bytes 0 (cl:read-sequence bytes in))))))
+           :for stat := (cl:ignore-errors (uiop:read-file-string (cl:format cl:nil "/proc/~A/stat" pid)))
+           :for close := (cl:and stat (cl:position #\) stat :from-end cl:t))
+           :count (cl:and cmdline (cl:search token cmdline) close
+                          (cl:not (cl:member (cl:char stat (cl:+ 2 close)) '(#\Z #\X))))))
+
+(coalton-toplevel
+  (declare live-with-token (String -> UFix))
+  (define (live-with-token token)
+    (lisp (-> UFix) (token) (live-with token)))
+
+  (declare now-ms (Void -> Integer))
+  (define (now-ms)
+    (lisp (-> Integer) ()
+      (cl:floor (cl:* 1000 (cl:get-internal-real-time)) cl:internal-time-units-per-second))))
+
+(define-test run-command-starts-a-process-group ()
+  (match (fst (run-with (ok-replies 1) "/" "cut -d' ' -f5 /proc/$$/stat"))
+    ((Ok o)
+     (let pid = (launch:outcome-pid o))
+     (is (== (lisp (-> String) (pid) (cl:format cl:nil "~D~%" pid))
+             (launch:outcome-output o))))
+    ((Err why) (is (== "" why)))))
+
+(define-test tools-a4-the-launcher-ends-the-group-at-its-limit ()
+  (let start = (now-ms))
+  (let ran = (fst (run-with (ok-replies 1) "/" "sleep 99.0417 & sleep 99.0417")))
+  (let took = (- (now-ms) start))
+  (match ran
+    ((Ok o)
+     (is (launch:outcome-timed-out? o))
+     (is (== 137 (launch:outcome-code o))))
+    ((Err why) (is (== "" why))))
+  (is (< took 3000))
+  (is (wait-until (fn () (== 0 (live-with-token "99.0417"))))))
+
+(define-test run-command-within-its-limit-did-not-time-out ()
+  (match (fst (run-with (ok-replies 1) "/" "echo hi"))
+    ((Ok o) (is (not (launch:outcome-timed-out? o))))
+    ((Err why) (is (== "" why)))))

@@ -3,7 +3,7 @@
   (:local-nicknames (#:client #:dakusui/client)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
-  (:export #:Outcome #:outcome-pid #:outcome-code #:outcome-output
+  (:export #:Outcome #:outcome-pid #:outcome-code #:outcome-output #:outcome-timed-out?
            #:run-command #:scrub-environment #:launcher-script))
 (in-package #:dakusui/launch)
 
@@ -13,8 +13,12 @@
 ;;; pipe on fd 3. Once the helper has flagged it, write to the pipe, and the
 ;;; launcher execs the command. If anything fails first, close the pipe
 ;;; unwritten: the launcher's read fails and the command never runs. (R9)
+;;;
+;;; The launcher leads its own process group, so a command that outlives its
+;;; limit ends with every process of the group. (Spec 0003 R4)
 
 (cl:defconstant +o-cloexec+ #o2000000)
+(cl:defconstant +posix-spawn-setpgroup+ #x02)
 (cl:defconstant +posix-spawn-setsigdef+ #x04)
 (cl:defconstant +posix-spawn-setsigmask+ #x08)
 
@@ -36,7 +40,8 @@
   "Spawn /bin/sh running SCRIPT with COMMAND as $1, in DIRECTORY, with only
 ENVIRONMENT. Its fd 3 reads the gate, stdin is /dev/null, and stdout and
 stderr go to one pipe. Every other descriptor closes, and every signal starts
-at its default: SBCL ignores SIGPIPE, and exec would keep that.
+at its default: SBCL ignores SIGPIPE, and exec would keep that. The launcher
+leads a new process group.
 Return (pid gate-write output-read), or a string that names the problem."
   (cl:let ((gate (make-pipe))
            (output (make-pipe))
@@ -100,10 +105,14 @@ Return (pid gate-write output-read), or a string that names the problem."
                           (check-zero "setsigdefault"
                                       (cffi:foreign-funcall "posix_spawnattr_setsigdefault"
                                                             :pointer attr :pointer signals :int))
+                          (check-zero "setpgroup"
+                                      (cffi:foreign-funcall "posix_spawnattr_setpgroup"
+                                                            :pointer attr :int 0 :int))
                           (check-zero "setflags"
                                       (cffi:foreign-funcall "posix_spawnattr_setflags"
                                                             :pointer attr
-                                                            :short (cl:logior +posix-spawn-setsigdef+
+                                                            :short (cl:logior +posix-spawn-setpgroup+
+                                                                              +posix-spawn-setsigdef+
                                                                               +posix-spawn-setsigmask+)
                                                             :int))
                           (check-zero "posix_spawn /bin/sh"
@@ -126,36 +135,77 @@ Return (pid gate-write output-read), or a string that names the problem."
       (cffi:foreign-funcall "write" :int fd :pointer line :size 1 :long)))
   (close-fd fd))
 
-(cl:defun collect (fd pid)
-  "Read FD to its end, close it, and wait for PID. Return (code text)."
-  (cl:let ((bytes (cl:make-array 0 :element-type '(cl:unsigned-byte 8)
-                                   :adjustable cl:t :fill-pointer 0))
-           (chunk (cl:make-array 65536 :element-type '(cl:unsigned-byte 8))))
+(cl:defun now-ms ()
+  (cl:floor (cl:* 1000 (cl:get-internal-real-time)) cl:internal-time-units-per-second))
+
+(cl:defun reap (pid hang)
+  "Wait for PID. Return its status, or NIL if HANG is false and it still runs."
+  (cffi:with-foreign-object (s :int)
     (cl:loop
-      (cl:let ((n (cffi:with-pointer-to-vector-data (p chunk)
-                    (cffi:foreign-funcall "read" :int fd :pointer p :size 65536 :long))))
+      ;; WNOHANG (1).
+      (cl:let ((r (cffi:foreign-funcall "waitpid" :int pid :pointer s :int (cl:if hang 0 1) :int)))
         (cl:cond
-          ((cl:> n 0) (cl:loop :for i :below n :do (cl:vector-push-extend (cl:aref chunk i) bytes)))
-          ((cl:and (cl:< n 0) (cl:= (sb-alien:get-errno) sb-unix:eintr)))
-          (cl:t (cl:return)))))
+          ((cl:> r 0) (cl:return (cffi:mem-ref s :int)))
+          ((cl:= r 0) (cl:return cl:nil))
+          ((cl:= (sb-alien:get-errno) sb-unix:eintr))
+          ;; Not our child: nothing to wait for.
+          (cl:t (cl:return 0)))))))
+
+(cl:defun read-until (fd bytes deadline)
+  "Read FD into BYTES until its end. Return NIL then, or T at DEADLINE."
+  (cl:let ((chunk (cl:make-array 65536 :element-type '(cl:unsigned-byte 8))))
+    ;; struct pollfd { int fd; short events; short revents; }, POLLIN = 1.
+    (cffi:with-foreign-object (pfd :int 2)
+      (cl:loop
+        (cl:let ((left (cl:- deadline (now-ms))))
+          (cl:when (cl:<= left 0) (cl:return cl:t))
+          (cl:setf (cffi:mem-aref pfd :int 0) fd
+                   (cffi:mem-ref pfd :short 4) 1
+                   (cffi:mem-ref pfd :short 6) 0)
+          (cl:let ((ready (cffi:foreign-funcall "poll" :pointer pfd :unsigned-long 1
+                                                :int (cl:min left 1000000) :int)))
+            (cl:when (cl:> ready 0)
+              (cl:let ((n (cffi:with-pointer-to-vector-data (p chunk)
+                            (cffi:foreign-funcall "read" :int fd :pointer p :size 65536 :long))))
+                (cl:cond
+                  ((cl:> n 0) (cl:loop :for i :below n :do (cl:vector-push-extend (cl:aref chunk i) bytes)))
+                  ((cl:and (cl:< n 0) (cl:= (sb-alien:get-errno) sb-unix:eintr)))
+                  (cl:t (cl:return cl:nil)))))))))))
+
+(cl:defun collect (fd pid limit)
+  "Read FD to its end, close it, and wait for PID, all within LIMIT seconds.
+At the limit, kill PID's process group, stop reading, and reap PID. A process
+that left the group no longer holds up the call. Return (code text timed-out)."
+  (cl:let* ((bytes (cl:make-array 0 :element-type '(cl:unsigned-byte 8)
+                                    :adjustable cl:t :fill-pointer 0))
+            (deadline (cl:+ (now-ms) (cl:* 1000 limit)))
+            (timed-out (read-until fd bytes deadline))
+            (status cl:nil))
     (close-fd fd)
-    (cl:let ((status (cffi:with-foreign-object (s :int)
-                       (cl:loop :for r := (cffi:foreign-funcall "waitpid" :int pid :pointer s :int 0 :int)
-                                :while (cl:and (cl:< r 0) (cl:= (sb-alien:get-errno) sb-unix:eintr)))
-                       (cffi:mem-ref s :int))))
-      (cl:list (cl:if (cl:zerop (cl:logand status #x7f))
-                      (cl:ldb (cl:byte 8 8) status)
-                      (cl:+ 128 (cl:logand status #x7f)))
-               (sb-ext:octets-to-string (cl:coerce bytes '(cl:vector (cl:unsigned-byte 8)))
-                                        :external-format '(:utf-8 :replacement #\?))))))
+    (cl:loop :until (cl:or timed-out status)
+             :do (cl:setf status (reap pid cl:nil))
+                 (cl:unless status
+                   (cl:if (cl:>= (now-ms) deadline)
+                          (cl:setf timed-out cl:t)
+                          (cl:sleep 0.01))))
+    (cl:when timed-out
+      (cffi:foreign-funcall "kill" :int (cl:- pid) :int 9 :int)
+      (cl:setf status (reap pid cl:t)))
+    (cl:list (cl:if (cl:zerop (cl:logand status #x7f))
+                    (cl:ldb (cl:byte 8 8) status)
+                    (cl:+ 128 (cl:logand status #x7f)))
+             (sb-ext:octets-to-string (cl:coerce bytes '(cl:vector (cl:unsigned-byte 8)))
+                                      :external-format '(:utf-8 :replacement #\?))
+             timed-out)))
 
 (coalton-toplevel
   (define-struct Outcome
     "How a command ended: its pid, exit code (128 plus the signal that killed
-it), and its stdout and stderr together."
+it), its stdout and stderr together, and whether it outlived its limit."
     (pid I32)
     (code I32)
-    (output String))
+    (output String)
+    (timed-out Boolean))
 
   (declare outcome-pid (Outcome -> I32))
   (define (outcome-pid o) (.pid o))
@@ -165,6 +215,9 @@ it), and its stdout and stderr together."
 
   (declare outcome-output (Outcome -> String))
   (define (outcome-output o) (.output o))
+
+  (declare outcome-timed-out? (Outcome -> Boolean))
+  (define (outcome-timed-out? o) (.timed-out o))
 
   (declare launcher-script String)
   (define launcher-script
@@ -198,17 +251,18 @@ BASH_ENV, which would run code before the flag. (R11)"
       (cl:mapcar (cl:lambda (s) (cl:coerce s '(cl:simple-array cl:character (cl:*))))
                  (sb-ext:posix-environ))))
 
-  (declare run-command (client:Client * String * String -> Result String Outcome))
-  (define (run-command helper directory command)
-    "Run COMMAND with sh in DIRECTORY, confined by the helper. Return how it
-ended, or an error if it could not be confined, in which case it did not run.
-Once the helper is gone, refuse at once: nothing could flag the command. (R9)"
+  (declare run-command (client:Client * String * String * UFix -> Result String Outcome))
+  (define (run-command helper directory command limit)
+    "Run COMMAND with sh in DIRECTORY, confined by the helper, for at most
+LIMIT seconds. Return how it ended, or an error if it could not be confined,
+in which case it did not run. Once the helper is gone, refuse at once: nothing
+could flag the command. (R9, spec 0003 R4)"
     (if (client:closed? helper)
         (Err "refused: the helper is gone, so no command can be confined")
-        (run-flagged helper directory command)))
+        (run-flagged helper directory command limit)))
 
-  (declare run-flagged (client:Client * String * String -> Result String Outcome))
-  (define (run-flagged helper directory command)
+  (declare run-flagged (client:Client * String * String * UFix -> Result String Outcome))
+  (define (run-flagged helper directory command limit)
     (let env = (scrub-environment (environment)))
     (let spawned =
       (lisp (-> (Result String (Tuple3 I32 I32 I32))) (directory command env launcher-script)
@@ -225,12 +279,13 @@ Once the helper is gone, refuse at once: nothing could flag the command. (R9)"
        (let flagged = (client:send-flag helper pid))
        (let release = (match flagged ((Ok _) True) ((Err _) False)))
        (lisp (-> Unit) (gate release) (open-gate gate release) Unit)
-       (let ended = (lisp (-> (Tuple I32 String)) (out pid)
-                      (cl:destructuring-bind (code text) (collect out pid)
-                        (coalton (Tuple (lisp (-> I32) () code)
-                                        (lisp (-> String) () text))))))
+       (let ended = (lisp (-> (Tuple3 I32 String Boolean)) (out pid limit)
+                      (cl:destructuring-bind (code text timed-out) (collect out pid limit)
+                        (coalton (Tuple3 (lisp (-> I32) () code)
+                                         (lisp (-> String) () text)
+                                         (lisp (-> Boolean) () timed-out))))))
        (match flagged
          ((Err why) (Err (<> "the command did not run, since it could not be confined: " why)))
          ((Ok _)
           (match ended
-            ((Tuple code text) (Ok (Outcome pid code text))))))))))
+            ((Tuple3 code text timed-out) (Ok (Outcome pid code text timed-out))))))))))
