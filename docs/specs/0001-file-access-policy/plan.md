@@ -44,12 +44,17 @@ confined processes are denied everything (ADR 0008).
 An array-of-maps with one slot. Each inner map is a hash:
 
     key   { u32 tag; char s[256] }   tag 0 = path prefix, 1 = name; zero padded
-    value { u32 seq[2]; u8 effect[2] }   index 0 = read, 1 = write; seq 0 = none
+    value { u32 seq[2]; u8 effect[2]; u8 held }   index 0 = read, 1 = write; seq 0 = none
 
 Keys compare as exact bytes, so no hash collision can change a verdict. To
 change the policy, the helper builds a new inner map and swaps it into the
 slot. The swap is atomic, so a command never sees half a policy. For rules with
 the same pattern and kind, the compiler keeps the last one.
+
+`held` marks a path that a deny rule names, and every ancestor of one. The
+compiler adds an entry for each, with `seq` 0 where no rule names the path
+itself. The rename hook looks up the old and the new path, and denies when
+either is held (R6, A22). A swap rebuilds the marks with the rest.
 
 **3. Policy library** (Coalton, used by both programs)
 
@@ -230,7 +235,8 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
 - R3: library builds the default policy.
 - R4: policy swap; open descriptors are untouched because there is no read or
   write hook.
-- R5, R6: hook list; `path_link` always denies.
+- R5, R6: hook list; `path_link` always denies; the walk's sequence check;
+  the `held` marks at `path_rename`.
 - R7: `denials` ring buffer and the pushed event.
 - R8: `show_policy` tool.
 - R9: helper exits on any startup failure; the agent refuses to run commands if
@@ -261,20 +267,21 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
   enter it, since `main` turns it off only when it starts. No such error was
   found that an outside process can trigger: a starved address space ends the
   runtime with exit code 1. An SBCL built without `:sb-ldb` would close this.
-- **Torn walks.** Found by T23. The kernel's own path builder retries when a
-  rename races with it; ours does not. The walk reads a dentry's parent, then
-  its name, so a rename between the two reads joins names that were never one
-  path. T23 denies `t/a/s` and `t/b/t`, renames one to the other and back, and
-  has four confined readers open the secret under both names for five
-  seconds. Result (2026-11-09): fail. Of about 3.5 million opens during 1.09
-  million renames, 11,402 read the secret. Any concurrent rename can open the
-  hole, even one by an unconfined process. A fix is open (spec Q20).
-- **Moved ancestors.** Found while porting the spike. A rule covers a path,
-  not a file, so renaming an ancestor carries a denied directory out from
-  under its rule. Given `deny read,write /x/anc/sub`, a confined `mv /x/anc
-  /x/anc2` succeeds whenever `/x` is writable, and `/x/anc2/sub` is then
-  readable. The default policy has no such directory, but a rule set can make
-  one (spec Q21).
+- **Torn walks.** Found by T23: the walk reads a dentry's parent, then its
+  name, so a rename between the two reads joins names that were never one
+  path. On 2026-11-09, of about 3.5 million opens during 1.09 million
+  renames, 11,402 read a denied file. The fix (T33): every rename in the
+  kernel holds `rename_lock` for writing, so the walk reads its sequence
+  count before and after. An odd count, or a changed one, means a rename may
+  have torn the walk; the hook walks again, and denies after four tries.
+  A machine that renames without pause can so deny a confined open that the
+  policy allows. Mount changes are not covered: a confined process cannot
+  make one (R12).
+- **Moved ancestors.** Closed by T34 and the `held` marks: a confined process
+  cannot rename a deny rule's path or its ancestors. An unconfined process
+  still can, and the rule then no longer covers the files. The marks also
+  stop a command from renaming the project directory or the home directory,
+  which the default denies sit beneath.
 - **The unflagged launcher.** From its spawn until the helper flags it, the
   launcher runs unconfined. In that window it runs only `/bin/sh` up to its
   `read`, with an absolute path, and the command is still an argument. The

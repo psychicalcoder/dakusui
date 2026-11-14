@@ -1,6 +1,6 @@
 # 0001: File access policy and enforcement
 
-Status: Review
+Status: Approved
 
 ## Summary
 
@@ -37,7 +37,10 @@ enforces the policy, and the user can change it while commands run.
   and listing a directory count as read. Creating, deleting, renaming, and
   truncating count as write.
 - R6: A confined process MUST NOT create hard links. Symlinks, renames, and
-  io_uring MUST NOT bypass a rule.
+  io_uring MUST NOT bypass a rule. A rename that races a check MUST NOT make
+  the check allow a path that never existed. A confined process MUST NOT
+  rename a path that a deny rule names, or any ancestor of one, since the
+  move would carry the denied files out from under the rule.
 - R7: The system MUST log each denial with the process, path, and access kind.
 - R8: The agent and the judge MUST be able to read the current policy.
 - R9: If enforcement is not active, the system MUST NOT run commands.
@@ -132,6 +135,14 @@ enforces the policy, and the user can change it while commands run.
 - A19 (R9): Given a confined command in its own session that outlives the
   helper, when the helper is killed and the command then reads `src/a.c`, then
   the read fails. When Dakusui next starts, the command is gone.
+- A22 (R6): Given `deny read /p/anc/sub` in a writable `/p`, when a command
+  runs `mv /p/anc /p/anc2`, `mv /p/anc/sub /p/sub2`, or renames another
+  directory over `/p/anc`, then each fails with a permission error, and the
+  log gives the reason. Renaming `/p/other` succeeds. After the rule is
+  removed, `mv /p/anc /p/anc2` succeeds.
+- A23 (R6): Given denied `t/a/s` and `t/b/t`, renames of one to the other and
+  back, and four confined readers that open the secret under both names for
+  five seconds, then no open succeeds.
 - A20 (R15, deferred): Given a confined command, when it signals the helper, the agent,
   or another process of the user that is not confined, then the call fails
   with a permission error. Signalling its own child succeeds.
@@ -165,23 +176,20 @@ enforces the policy, and the user can change it while commands run.
 
 - Q9: Do chmod, chown, utimes, and xattr changes count as write? v0 leaves them
   out. (not blocking)
-- Q17: A rule set can override the denies of R3, and sets live in the project, so
-  a cloned repository can ship a set such as `allow read ~/.ssh`. How does a user
-  come to trust a set? (for spec 0004; must be settled before sets load)
 - Q19: A confined command can still reach an unconfined server over loopback
   TCP or UDP, such as `ssh localhost` or a language server, which is the
   escape R15 closes for Unix sockets. Network limits are a non-goal. Should
   loopback be the exception? (not blocking)
-- Q20: T23 found torn walks: a rename that races a confined open can make the
-  enforcer build a path that never existed, and allow it. R6 says renames
-  MUST NOT bypass a rule. Should the walk check `rename_lock` and deny or
-  retry when it changed, use `bpf_d_path` where the hook allows it, or
-  something else? (blocking for R6)
-- Q21: Renaming an ancestor moves a denied directory to a path no rule covers,
-  and the rename itself needs only write access to the ancestor. Does R6 forbid
-  this? If so, should the rename hook deny moving a directory that contains a
-  denied path, or should a deny also cover renames of its ancestors?
-  (blocking for R6)
+
+Settled:
+
+- Q17 (2026-11-14): v0 does not check whether the user trusts a rule set. A
+  cloned repository can ship one that grants access. Dakusui prints the set
+  at start (spec 0004 R9).
+- Q20 (2026-11-14): the walk reads the kernel's rename sequence count before
+  and after, and walks again if it changed. After four tries it denies, with
+  the reason "path changed". See R6 and A23.
+- Q21 (2026-11-14): R6 forbids it. See R6 and A22.
 
 ## Decisions
 
@@ -207,7 +215,7 @@ Design choices made while writing this spec live in the ADRs:
 | R3 | A1, A11 | Not started |
 | R4 | A4, A7 | Not started |
 | R5 | A12 | Not started |
-| R6 | A5, A9 | Not started |
+| R6 | A5, A9, A22, A23 | Not started |
 | R7 | A13 | Not started |
 | R8 | A14 | Not started |
 | R9 | A6, A19 | Not started |

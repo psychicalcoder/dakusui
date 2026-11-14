@@ -32,3 +32,6 @@ Sets can be committed to git and shared, so a cloned repository can ship a set
 that grants access; spec 0004 must settle how a user trusts one (Q17). Confined
 commands can read sets but not change them. Two sessions on one set can each save
 rules, so spec 0004 must keep those writes safe.
+
+Q17 is settled: v0 does not check trust. It loads the set and prints it at
+start (spec 0004 R9). (Added 2026-11-14.)

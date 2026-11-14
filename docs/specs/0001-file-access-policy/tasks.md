@@ -132,6 +132,16 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T23 Stress the torn-walk risk: run concurrent renames against opens and
   check that no denied file is ever readable. Done when the result is recorded
   in the plan, pass or fail.
+- [ ] T33 Make the walk safe against renames: read the kernel's rename
+  sequence count before and after the walk, walk again if it changed, and
+  after four tries deny with the reason "path changed". Add the reason to
+  the denial event and log. (R6, R7) Done when the object builds, the event
+  and log tests cover the reason, and T23's test, now A23, reads no secret.
+- [ ] T34 Deny renames above a deny rule. The compiler marks the path of each
+  deny rule and every ancestor of it; the rename hook denies a confined
+  rename whose old or new path is marked, with the reason "holds a denied
+  path". (R6, R7) Done when compiler tests cover the marks, the reference
+  evaluator gives the same verdicts, and A22 is in the acceptance harness.
 - [ ] T24 Fill in the spec's verification table, set its status to Implemented,
   and move the plan to Implemented.
 

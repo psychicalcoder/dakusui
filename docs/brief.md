@@ -34,7 +34,8 @@ user ── Dakusui (no capabilities) ── LLM server
   tools through `tool_calls`; Dakusui runs them and replies with `tool`-role
   messages. MCP tools join the same list. Arguments decode into typed values.
 - **Roles.** A role names a model, base URL, API key, and optionally a rule set.
-  `agent` and `judge` ship built in; users define more.
+  `agent` and `judge` ship built in; users define more in
+  `~/.config/dakusui/config.json`.
 - **Policy.** Ordered rules, last match wins. The default allows the project
   directory and denies `.env`. Users add allows and denies. The agent reads the
   policy through a tool; the judge sees it too.
@@ -44,15 +45,17 @@ user ── Dakusui (no capabilities) ── LLM server
 - **Enforcement.** A BPF LSM program checks every file access by confined
   processes. The helper flags each command before it runs, and children inherit
   the flag. The helper owns the policy map and applies updates.
-- **Auto mode.** A judge model reviews bash commands before they run. Its verdict
-  is advice. BPF remains the hard limit.
+- **Tools.** `bash` and `show_policy`, plus the tools of configured MCP
+  servers. Commands and servers both run confined.
+- **Auto mode.** The user approves each command before it runs. In auto mode a
+  judge model does instead. Its verdict is advice. BPF remains the hard limit.
 
 ## Specs
 
 | # | Spec | State |
 |---|------|-------|
-| 0001 | File access policy and enforcement | Draft |
-| 0002 | Agent loop and provider client | Not started |
-| 0003 | Tools and MCP | Not started |
-| 0004 | Roles and configuration | Not started |
-| 0005 | Auto mode (judge) | Not started |
+| 0001 | File access policy and enforcement | Approved; T33, T34 open |
+| 0002 | Agent loop and provider client | Approved |
+| 0003 | Tools and MCP | Approved |
+| 0004 | Roles and configuration | Approved |
+| 0005 | Auto mode (judge) | Approved |
