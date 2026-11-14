@@ -4,7 +4,7 @@ Plan: ./plan.md
 
 Write each test first or alongside its code.
 
-- [ ] T1 Parse the command line into `Options`. (R4, R7) Done when tests cover
+- [x] T1 Parse the command line into `Options`. (R4, R7) Done when tests cover
   each option, a missing value, and an unknown option.
 - [ ] T2 Parse the configuration and resolve roles. (R1, R2, R3, R4, R5, R12)
   Done when A1 through A4 and A12 pass.

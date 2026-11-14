@@ -18,6 +18,7 @@
                     (#:provider #:dakusui/provider)
                     (#:turn #:dakusui/loop)
                     (#:commands #:dakusui/commands)
+                    (#:options #:dakusui/options)
                     (#:cell #:coalton/cell)
                     (#:list #:coalton/list)
                     (#:string #:coalton/string))
