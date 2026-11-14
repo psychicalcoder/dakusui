@@ -1,6 +1,6 @@
 # Plan for 0005: Auto mode (judge)
 
-Status: Approved
+Status: Implemented
 Spec: ./spec.md
 Tasks: ./tasks.md
 

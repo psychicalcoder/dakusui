@@ -1,6 +1,6 @@
 # 0005: Auto mode (judge)
 
-Status: Approved
+Status: Implemented
 
 ## Summary
 
@@ -73,11 +73,16 @@ None.
 
 | Requirement | Verified by | State |
 |-------------|-------------|-------|
-| R1 | A1 | Not started |
-| R2 | A1, A2 | Not started |
-| R3 | A3 | Not started |
-| R4 | A4 | Not started |
-| R5 | A3 | Not started |
-| R6 | A5 | Not started |
-| R7 | A6 | Not started |
-| R8 | A7 | Not started |
+| R1 | A1 | Passes (unit, agent-check) |
+| R2 | A1, A2 | Passes (unit, agent-check) |
+| R3 | A3 | Passes (unit, agent-check) |
+| R4 | A4 | Passes (unit, agent-check) |
+| R5 | A3 | Passes (unit, agent-check) |
+| R6 | A5 | Passes (unit) |
+| R7 | A6 | Passes (unit, agent-check) |
+| R8 | A7 | Passes (unit, agent-check) |
+
+"Unit" is `make test`; "agent-check" is `make agent-check`, the agent under
+a stand-in helper, with the test provider playing the judge. agent-check
+answers `y` only; `n` and the end of input are unit cases. Checked
+2026-11-14.

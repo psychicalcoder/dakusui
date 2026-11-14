@@ -11,5 +11,5 @@ Write each test first or alongside its code.
 - [x] T3 Write `judge-gate` and the judge's prompt. (R3, R4, R5, R6, R8) Done
   when A3, A4, A5, and A7 pass.
 - [x] T4 Add `--auto` and `/auto`. (R7) Done when A6 passes.
-- [ ] T5 Add an allowed and a blocked command to `make agent-check`. Fill in
+- [x] T5 Add an allowed and a blocked command to `make agent-check`. Fill in
   the verification table.

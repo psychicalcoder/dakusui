@@ -13,6 +13,11 @@ helper and agent.
 HOME is a temp directory with a configuration file, so the user's own file
 plays no part. Spec 0004: a role and a rule set from the command line, the
 start-up listing, saving, and two agents saving to one set at once (A11).
+
+Spec 0005: the test provider also plays the judge. The configuration gives
+the judge role its own model name, so the server tells the judge's requests
+from the agent's. Outside auto mode a bash call asks on stdin, so the checks
+answer y.
 """
 
 import http.server
@@ -28,19 +33,24 @@ KEY = "sk-secret"
 SPAWN = threading.Lock()
 
 
+JUDGE_MODEL = "judge-model"
+
+
 class Provider(http.server.ThreadingHTTPServer):
     """A chat completions server on a loopback port. It gives the scripted
-    answers in order, then repeats the last, and keeps each request."""
+    answers in order, then repeats the last, and keeps each request. A
+    request for JUDGE_MODEL gets the judge's answers and is kept apart."""
 
     def __init__(self):
         super().__init__(("127.0.0.1", 0), Handler)
-        self.answers = []
-        self.requests = []
+        self.script()
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
-    def script(self, *answers):
+    def script(self, *answers, judge=None):
         self.answers = list(answers)
         self.requests = []
+        self.judge_answers = list(judge or [verdict(False, "no verdict scripted")])
+        self.judge_requests = []
 
     @property
     def url(self):
@@ -49,14 +59,17 @@ class Provider(http.server.ThreadingHTTPServer):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
-        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
         server = self.server
-        server.requests.append(
+        judging = body.get("model") == JUDGE_MODEL
+        requests = server.judge_requests if judging else server.requests
+        answers = server.judge_answers if judging else server.answers
+        requests.append(
             {"path": self.path, "auth": self.headers.get("Authorization"),
-             "body": json.loads(body)})
-        status, answer = server.answers[0]
-        if len(server.answers) > 1:
-            server.answers.pop(0)
+             "body": body})
+        status, answer = answers[0]
+        if len(answers) > 1:
+            answers.pop(0)
         data = json.dumps(answer).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -76,6 +89,11 @@ def reply(text=None, calls=()):
              "function": {"name": name, "arguments": json.dumps(args)}}
             for ident, name, args in calls]
     return 200, {"choices": [{"index": 0, "message": message}]}
+
+
+def verdict(allow, reason):
+    """The judge's reply: its JSON object, in prose, as a model may give it."""
+    return reply("Verdict: " + json.dumps({"allow": allow, "reason": reason}))
 
 
 def stand_in(sock):
@@ -143,7 +161,8 @@ def main():
         os.makedirs(os.path.join(home, ".config", "dakusui"))
         with open(os.path.join(home, ".config", "dakusui", "config.json"), "w") as f:
             json.dump({"roles": {"tester": {"model": "role-model", "base_url": provider.url,
-                                            "api_key_env": "OPENAI_API_KEY"}}}, f)
+                                            "api_key_env": "OPENAI_API_KEY"},
+                                 "judge": {"model": JUDGE_MODEL}}}, f)
         secret = os.path.join(base, "secret")
         with open(os.path.join(rules, "strict"), "w") as f:
             f.write("# from agent-check\n\ndeny read,write %s\n" % secret)
@@ -192,12 +211,53 @@ def main():
               code == 1 and "401" in output and "bad key [key]" in output, output)
 
         provider.script(reply(calls=[("c1", "bash", {"command": "echo one"})]), reply("done"))
-        code, output = agent_run(["-p", "run echo"])
+        code, output = agent_run(["-p", "run echo"], b"y\n")
         second = provider.requests[1]["body"]["messages"] if len(provider.requests) > 1 else []
-        check("A2 a bash call runs, and the next request carries its result",
-              code == 0 and "[bash]" in output and "done" in output
-              and second[-1] == {"role": "tool", "tool_call_id": "c1", "content": "one"},
+        check("A2, 0005 A1 a bash call asks, runs on y, and the next request carries its result",
+              code == 0 and "[bash]" in output and "Run? [y/n]" in output and "done" in output
+              and second[-1] == {"role": "tool", "tool_call_id": "c1", "content": "one"}
+              and not provider.judge_requests,
               output)
+
+        def tool_result(requests):
+            """The content of the last message of the second request."""
+            if len(requests) < 2:
+                return None
+            return requests[1]["body"]["messages"][-1].get("content")
+
+        provider.script(reply(calls=[("c1", "bash", {"command": "echo allowed-run"})]),
+                        reply("done"), judge=(verdict(True, "asked for"),))
+        code, output = agent_run(["--auto", "-p", "run the allowed echo"])
+        judged = provider.judge_requests[0]["body"] if provider.judge_requests else {}
+        asked = "".join(m.get("content") or "" for m in judged.get("messages", []))
+        check("0005 A3 in auto mode the judge allows a command, and it runs unasked",
+              code == 0 and "Run? [y/n]" not in output
+              and tool_result(provider.requests) == "allowed-run"
+              and len(provider.judge_requests) == 1
+              and provider.judge_requests[0]["auth"] == "Bearer " + KEY,
+              output)
+        check("0005 A4, A7 the judge sees the user's message and the command, and no tools",
+              "run the allowed echo" in asked and "echo allowed-run" in asked
+              and "tools" not in judged,
+              json.dumps(judged, indent=1))
+
+        marker = os.path.join(project, "blocked-ran")
+        provider.script(reply(calls=[("c1", "bash", {"command": "touch %s" % marker})]),
+                        reply("done"), judge=(verdict(False, "sends the key away"),))
+        code, output = agent_run(["--auto", "-p", "run the blocked touch"])
+        reason = "blocked by the judge: sends the key away"
+        check("0005 A3 in auto mode the judge blocks a command, and the model and the terminal see why",
+              code == 0 and not os.path.exists(marker) and reason in output
+              and tool_result(provider.requests) == reason
+              and len(provider.judge_requests) == 1,
+              output)
+
+        provider.script(reply("never"))
+        code, output = agent_run(["--auto"], b"/auto\n/auto off\n/auto\n")
+        check("0005 A6 --auto starts auto mode, and /auto off turns it off",
+              code == 0 and "Auto mode is on" in output
+              and output.index("Auto mode is on") < output.index("Auto mode is off")
+              and not provider.requests, output)
 
         provider.script(reply("hello"))
         code, output = agent_run([], b"/policy\n/deny read /nope\nhi\n")
