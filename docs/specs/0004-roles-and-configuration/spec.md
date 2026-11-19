@@ -47,7 +47,10 @@ MCP servers; the command line picks a role, a rule set, and the mode.
   file. Another running session sees the change when it next starts.
 - R12: The configuration MAY name MCP servers: for each, a name of lowercase
   letters, digits, `-`, or `_`, a command, and environment variables to add
-  to the server's environment (spec 0003 R9).
+  to the server's environment (spec 0003 R9). A variable named `LD_*`,
+  `ENV`, or `BASH_ENV` is an error: the launcher runs unconfined until the
+  helper flags it, and these would run code in that window (spec 0001 plan,
+  "The unflagged launcher").
 
 Example:
 
@@ -96,7 +99,8 @@ Example:
 - A11 (R11): Given two processes that each add 100 different rules to one
   set at once, then the file holds all 200, each on its own line.
 - A12 (R12): Given the example, then the MCP server list holds `docs` with
-  its command and one variable. A server named `Bad Name` is an error.
+  its command and one variable. A server named `Bad Name` is an error, and
+  so is a variable `LD_PRELOAD`.
 
 ## Non-goals
 
@@ -126,7 +130,7 @@ None.
 | R9 | A8 | Passes (unit, agent-check) |
 | R10 | A9, A10 | Passes (unit, agent-check) |
 | R11 | A11 | Passes (unit, agent-check) |
-| R12 | A12 | Passes (unit) |
+| R12 | A12 | Passes (unit), except the LD_* check (spec 0003 T7) |
 
 "Unit" is `make test`; "agent-check" is `make agent-check`, the agent under
 a stand-in helper. Checked 2026-11-14.
