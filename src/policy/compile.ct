@@ -31,10 +31,12 @@
 
   (derive Eq)
   (define-struct Entry
-    "One map entry: a pattern, and the decision for each kind."
+    "One map entry: a pattern, the decision for each kind, and whether a
+confined rename of the path is denied because it holds a denied one."
     (pattern Pattern)
     (on-read (Optional Decision))
-    (on-write (Optional Decision)))
+    (on-write (Optional Decision))
+    (held Boolean))
 
   (declare utf8-bytes (String -> List U8))
   (define (utf8-bytes text)
@@ -92,7 +94,8 @@
     (let chosen = (Some (Decision seq effect)))
     (Entry (.pattern old)
            (if (covers? listed Read) chosen (.on-read old))
-           (if (covers? listed Write) chosen (.on-write old))))
+           (if (covers? listed Write) chosen (.on-write old))
+           (.held old)))
 
   (declare add-rule (List Entry * UFix * Rule -> List Entry))
   (define (add-rule entries seq r)
@@ -105,7 +108,7 @@
                       entry))
                 entries)
            (<> entries
-               (make-list (merge-rule (Entry pat None None) seq effect listed)))))))
+               (make-list (merge-rule (Entry pat None None False) seq effect listed)))))))
 
   (declare add-rules (List Entry * UFix * List Rule -> List Entry))
   (define (add-rules entries seq rules)
@@ -113,15 +116,33 @@
       ((Nil) entries)
       ((Cons r rest) (add-rules (add-rule entries seq r) (+ seq 1) rest))))
 
+  (declare mark-held (List Entry * String -> List Entry))
+  (define (mark-held entries path)
+    "Mark PATH held, adding an entry with no decision if none names it."
+    (let pat = (PathPrefix path))
+    (if (list:any (fn (old) (== (.pattern old) pat)) entries)
+        (map (fn (old)
+               (if (== (.pattern old) pat)
+                   (Entry pat (.on-read old) (.on-write old) True)
+                   old))
+             entries)
+        (<> entries (make-list (Entry pat None None True)))))
+
+  (declare mark-all-held (List Entry * List Rule -> List Entry))
+  (define (mark-all-held entries rules)
+    "Mark each path held-paths gives for RULES. (R6)"
+    (fold mark-held entries (held-paths (Policy rules))))
+
   (declare compile-policy (Policy -> Result String (List Entry)))
   (define (compile-policy pol)
-    "One entry per pattern, in order of first appearance. The error names the
-pattern that the enforcer could never match."
+    "One entry per pattern, in order of first appearance, then one for each
+held path that no rule names. The error names the pattern that the enforcer
+could never match."
     (match pol
       ((Policy rules)
        (do
         (traverse check-rule rules)
-        (pure (add-rules Nil 1 rules))))))
+        (pure (mark-all-held (add-rules Nil 1 rules) rules))))))
 
   (declare u32-bytes (UFix -> List U8))
   (define (u32-bytes n)
@@ -161,10 +182,11 @@ pattern that the enforcer could never match."
 
   (declare entry-value-bytes (Entry -> List U8))
   (define (entry-value-bytes entry)
-    "struct rule_val: index 0 is read, index 1 is write."
+    "struct rule_val: seq and effect, index 0 read and 1 write, then held and
+a pad byte."
     (mconcat (make-list (u32-bytes (decision-seq (.on-read entry)))
                         (u32-bytes (decision-seq (.on-write entry)))
                         (make-list (decision-effect (.on-read entry))
                                    (decision-effect (.on-write entry))
-                                   0
+                                   (if (.held entry) 1 0)
                                    0)))))

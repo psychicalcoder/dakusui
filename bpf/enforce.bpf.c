@@ -7,7 +7,8 @@
  * keeps the match with the highest sequence number per access kind (last
  * match wins), and returns -EACCES unless every needed kind is allowed.
  * Anything that goes wrong while building the path denies (fail closed).
- * A rename that races the walk makes it walk again (R6, see walk_path).
+ * A rename that races the walk makes it walk again (R6, see walk_path). A
+ * rename of a path that holds a denied one is denied (R6, see path_rename).
  * Once the helper is gone, every hook denies every confined task (ADR 0008).
  */
 #include "vmlinux.h"
@@ -282,8 +283,11 @@ struct match_ctx {
 	__u32 status;
 	__u32 seq[2];
 	__u32 eff[2];
+	__u32 held; /* the mark of the last key looked up */
 };
 
+/* Merge the entry for s->key into c. Path prefixes are looked up from the
+ * root down, so after the walk c->held is the mark of the full path. */
 static __always_inline void lookup_merge(struct scratch *s,
 					 struct match_ctx *c)
 {
@@ -291,11 +295,13 @@ static __always_inline void lookup_merge(struct scratch *s,
 	void *inner = bpf_map_lookup_elem(&rules, &zero);
 	struct rule_val *v;
 
+	c->held = 0;
 	if (!inner)
 		return;
 	v = bpf_map_lookup_elem(inner, &s->key);
 	if (!v)
 		return;
+	c->held = v->held;
 	if (v->seq[0] > c->seq[0]) {
 		c->seq[0] = v->seq[0];
 		c->eff[0] = v->effect[0];
@@ -345,7 +351,7 @@ static __always_inline int deny(struct scratch *s, __u32 hook, __u32 need,
 	s->d.need = need;
 	s->d.status = status;
 	bpf_get_current_comm(s->d.comm, sizeof(s->d.comm));
-	if (status == ST_NOMATCH || status == ST_DENYRULE)
+	if (status == ST_NOMATCH || status == ST_DENYRULE || status == ST_HELD)
 		__builtin_memcpy(s->d.path, s->key.s, KEY_LEN);
 	else
 		s->d.path[0] = 0;
@@ -353,8 +359,10 @@ static __always_inline int deny(struct scratch *s, __u32 hook, __u32 need,
 	return -EACCES;
 }
 
-static __always_inline int decide(__u32 hook, __u32 need, __u64 start,
-				  __u64 mnt)
+/* A rename also needs a path that holds no denied one (R6): moving it would
+ * carry the denied files out from under their rule. */
+static __always_inline int decide(__u32 hook, __u32 need, int rename,
+				  __u64 start, __u64 mnt)
 {
 	struct scratch *s = get_scratch();
 	struct walk_ctx w = {};
@@ -403,6 +411,8 @@ static __always_inline int decide(__u32 hook, __u32 need, __u64 start,
 		if (!m.eff[1])
 			return deny(s, hook, need, ST_DENYRULE);
 	}
+	if (rename && m.held)
+		return deny(s, hook, need, ST_HELD);
 	return 0;
 }
 
@@ -435,7 +445,7 @@ int BPF_PROG(e_file_open, struct file *file)
 		need |= KIND_WRITE;
 	if ((mode & M_READ) || !(mode & M_WRITE))
 		need |= KIND_READ;
-	return decide(H_FILE_OPEN, need,
+	return decide(H_FILE_OPEN, need, 0,
 		      (__u64)BPF_CORE_READ(&file->f_path, dentry),
 		      mnt_of(&file->f_path));
 }
@@ -445,7 +455,7 @@ int BPF_PROG(e_file_truncate, struct file *file)
 {
 	if (!is_confined(bpf_get_current_task_btf()))
 		return 0;
-	return decide(H_FILE_TRUNC, KIND_WRITE,
+	return decide(H_FILE_TRUNC, KIND_WRITE, 0,
 		      (__u64)BPF_CORE_READ(&file->f_path, dentry),
 		      mnt_of(&file->f_path));
 }
@@ -455,7 +465,7 @@ int BPF_PROG(e_path_truncate, const struct path *path)
 {
 	if (!is_confined(bpf_get_current_task_btf()))
 		return 0;
-	return decide(H_PATH_TRUNC, KIND_WRITE,
+	return decide(H_PATH_TRUNC, KIND_WRITE, 0,
 		      (__u64)BPF_CORE_READ(path, dentry), mnt_of(path));
 }
 
@@ -468,7 +478,7 @@ int BPF_PROG(e_path_mknod, const struct path *dir, struct dentry *dentry,
 {
 	if (!is_confined(bpf_get_current_task_btf()))
 		return 0;
-	return decide(H_MKNOD, KIND_WRITE, launder(dentry), mnt_of(dir));
+	return decide(H_MKNOD, KIND_WRITE, 0, launder(dentry), mnt_of(dir));
 }
 
 SEC("lsm/path_mkdir")
@@ -477,7 +487,7 @@ int BPF_PROG(e_path_mkdir, const struct path *dir, struct dentry *dentry,
 {
 	if (!is_confined(bpf_get_current_task_btf()))
 		return 0;
-	return decide(H_MKDIR, KIND_WRITE, launder(dentry), mnt_of(dir));
+	return decide(H_MKDIR, KIND_WRITE, 0, launder(dentry), mnt_of(dir));
 }
 
 SEC("lsm/path_rmdir")
@@ -485,7 +495,7 @@ int BPF_PROG(e_path_rmdir, const struct path *dir, struct dentry *dentry)
 {
 	if (!is_confined(bpf_get_current_task_btf()))
 		return 0;
-	return decide(H_RMDIR, KIND_WRITE, launder(dentry), mnt_of(dir));
+	return decide(H_RMDIR, KIND_WRITE, 0, launder(dentry), mnt_of(dir));
 }
 
 SEC("lsm/path_unlink")
@@ -493,7 +503,7 @@ int BPF_PROG(e_path_unlink, const struct path *dir, struct dentry *dentry)
 {
 	if (!is_confined(bpf_get_current_task_btf()))
 		return 0;
-	return decide(H_UNLINK, KIND_WRITE, launder(dentry), mnt_of(dir));
+	return decide(H_UNLINK, KIND_WRITE, 0, launder(dentry), mnt_of(dir));
 }
 
 SEC("lsm/path_symlink")
@@ -502,9 +512,13 @@ int BPF_PROG(e_path_symlink, const struct path *dir, struct dentry *dentry,
 {
 	if (!is_confined(bpf_get_current_task_btf()))
 		return 0;
-	return decide(H_SYMLINK, KIND_WRITE, launder(dentry), mnt_of(dir));
+	return decide(H_SYMLINK, KIND_WRITE, 0, launder(dentry), mnt_of(dir));
 }
 
+/* Both paths need write, and neither may hold a denied path (R6, A22): not
+ * the old, so no denied file moves out from under its rule, and not the new,
+ * so no directory is renamed over one. With RENAME_EXCHANGE the two swap, and
+ * the same checks cover both. */
 SEC("lsm/path_rename")
 int BPF_PROG(e_path_rename, const struct path *old_dir,
 	     struct dentry *old_dentry, const struct path *new_dir,
@@ -514,11 +528,11 @@ int BPF_PROG(e_path_rename, const struct path *old_dir,
 
 	if (!is_confined(bpf_get_current_task_btf()))
 		return 0;
-	r = decide(H_RENAME_OLD, KIND_WRITE, launder(old_dentry),
+	r = decide(H_RENAME_OLD, KIND_WRITE, 1, launder(old_dentry),
 		   mnt_of(old_dir));
 	if (r)
 		return r;
-	return decide(H_RENAME_NEW, KIND_WRITE, launder(new_dentry),
+	return decide(H_RENAME_NEW, KIND_WRITE, 1, launder(new_dentry),
 		      mnt_of(new_dir));
 }
 

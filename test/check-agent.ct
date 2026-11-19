@@ -19,7 +19,7 @@
 ;;; agent's own code. make attach-check puts it next to a copy of the real
 ;;; helper, which starts it as it starts the real agent. It builds a temp tree,
 ;;; sends the session policy, and runs one check per acceptance case, A1
-;;; through A19, through the launcher, plus the spike's other cases. The
+;;; through A19 and A22, through the launcher, plus the spike's other cases. The
 ;;; random-policy test (T22) and the torn-walk test (T23) live in
 ;;; check-stress.ct, and the order of the run in check-main.ct.
 ;;;
@@ -114,6 +114,7 @@ through the symlink BASE/homelink (A17)."
       (write-text (at "outside/secret") "outside")
       (make-symlink (at "outside/secret") (at "p/link"))
       (write-text (at "anc/sub/secret") "ancestor")
+      (cl:ensure-directories-exist (at "other/"))
       (cl:ensure-directories-exist (at "data/s/"))
       (make-symlink (at "data/s") (at "s"))
       (cl:ensure-directories-exist (at "w/"))
@@ -407,7 +408,7 @@ descriptor go on, and a new open fails."
                     "A7 an open descriptor survives a deny, a new open does not"
                     (mconcat (map (fn (line) (<> line "; ")) lines))))))))))
 
-;;; A5, A9, and the spike's other cases for R5 and R6.
+;;; A5, A9, A22, and the spike's other cases for R5 and R6.
 
 (coalton-toplevel
   (declare check-links (Ctx * session:Session -> List Boolean))
@@ -428,23 +429,78 @@ descriptor go on, and a new open fails."
                 (Denied "Permission denied"))
          (check c "A9 hard link" "ln src/a.c hard" (Denied ""))))))
 
-  (declare note-ancestor-rename (Ctx * session:Session -> Unit))
-  (define (note-ancestor-rename c s)
-    "Not a pass or a fail: a question for the spec. A rule covers a path, so
-renaming a writable ancestor moves a denied directory to a path no rule
-covers. Report what happens."
+  (declare check-reason (Ctx * String * String * String -> Boolean))
+  (define (check-reason c label command reason)
+    "Run COMMAND in the project. It must fail with a permission error, and a
+new line of the denial log must give REASON."
+    (let before = (list:length (log-lines (.log-file c))))
+    (match (run-in c command)
+      ((Err why) (verdict False label why))
+      ((Ok o)
+       (let code = (launch:outcome-code o))
+       (let output = (launch:outcome-output o))
+       (let _ = (log-grew? (.log-file c) before))
+       (let new = (list:drop before (log-lines (.log-file c))))
+       (verdict (and (/= code 0)
+                     (or (string:substring? "Permission denied" output)
+                         (string:substring? "PermissionError" output))
+                     (list:any (fn (line) (string:substring? reason line)) new))
+                label
+                (mconcat (make-list "(exit " (show-i32 code) ") " output "; log: "
+                                    (mconcat (map (fn (line) (<> line "; ")) new))))))))
+
+  (declare rename-back (String * String -> Unit))
+  (define (rename-back from to)
+    "If a check moved TO to FROM, the agent, not confined, moves it back."
+    (lisp (-> Unit) (from to)
+      (cl:when (cl:probe-file from)
+        (cffi:foreign-funcall "rename" :string from :string to :int))
+      Unit))
+
+  (declare check-a22 (Ctx * session:Session -> List Boolean))
+  (define (check-a22 c s)
+    "deny read BASE/anc/sub, where BASE is writable through /tmp. Renaming
+BASE/anc or BASE/anc/sub, or another directory over BASE/anc, fails with the
+reason, so no denied file moves out from under its rule. Renaming BASE/other
+succeeds, and so does renaming BASE/anc once the rule is gone. The project
+holds the fixed deny on .dakusui, so it cannot be renamed either."
     (let anc = (in-base c "anc"))
-    (let _ = (with-rules c s "R6 note" (make-list (mconcat (make-list "deny read,write " anc "/sub")))
-      (fn (_)
-        (let ran = (run-in c
-                                       (mconcat (make-list "mv " anc " " anc "2 && cat " anc "2/sub/secret"))))
-        (say (<> "note R6 rename an ancestor of a denied directory, then read it: "
-                 (match ran
-                   ((Ok o) (mconcat (make-list "exit " (show-i32 (launch:outcome-code o)) ", "
-                                               (launch:outcome-output o))))
-                   ((Err why) why))))
-        Nil)))
-    Unit)
+    (let other = (in-base c "other"))
+    (let reason = "holds a denied path")
+    (let py-rename = (fn (from to)
+                       (mconcat (make-list "python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "
+                                           from " " to))))
+    (let held =
+      (with-rules c s "A22" (make-list (<> "deny read " (<> anc "/sub")))
+        (fn (_)
+          (let results =
+            (make-list
+             (check-reason c "A22 mv an ancestor of a denied directory"
+                           (mconcat (make-list "mv " anc " " anc "2")) reason)
+             (check-reason c "A22 mv the denied directory itself"
+                           (mconcat (make-list "mv " anc "/sub " (in-base c "sub2"))) reason)
+             (check-reason c "A22 rename another directory over the ancestor"
+                           (py-rename other anc) reason)
+             (check c "A22 renaming a directory that holds no denied path succeeds"
+                    (mconcat (make-list "mv " other " " other "2 && mv " other "2 " other
+                                        " && echo moved"))
+                    (Succeeds "moved"))
+             (check-reason c "A22 the project holds .dakusui, so it cannot be renamed"
+                           (mconcat (make-list "mv " (.project c) " " (.project c) "2")) reason)))
+          (rename-back (<> anc "2") anc)
+          (rename-back (in-base c "sub2") (<> anc "/sub"))
+          (rename-back (<> (.project c) "2") (.project c))
+          results)))
+    (let removed =
+      (match (session:replace-rules s Nil)
+        ((Err why) (verdict False "A22 after the rule is removed" why))
+        ((Ok _)
+         (let moved = (check c "A22 after the rule is removed, mv the ancestor succeeds"
+                             (mconcat (make-list "mv " anc " " anc "2 && echo moved"))
+                             (Succeeds "moved")))
+         (rename-back (<> anc "2") anc)
+         moved)))
+    (<> held (make-list removed)))
 
   (declare check-spike (Ctx -> List Boolean))
   (define (check-spike c)

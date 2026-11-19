@@ -28,6 +28,7 @@ enum {
 	ST_ALWAYS, /* hooks that deny every confined caller */
 	ST_GONE,   /* the helper is gone, so nothing is allowed (ADR 0008) */
 	ST_MOVED,  /* renames kept changing the path; fails closed too */
+	ST_HELD,   /* a rename of a path that holds a denied one (R6) */
 };
 
 enum {
@@ -54,11 +55,15 @@ struct rule_key {
 	char s[KEY_LEN];
 };
 
-/* Index 0 is read, index 1 is write. seq 0 means "no rule for this kind". */
+/* Index 0 is read, index 1 is write. seq 0 means "no rule for this kind".
+ * held is 1 on a path entry that a path deny rule names, or that is an
+ * ancestor of one: a confined task may not rename it (R6). It applies to the
+ * entry's exact path, not to the paths beneath it. */
 struct rule_val {
 	__u32 seq[2];
 	__u8 effect[2]; /* 1 allow, 0 deny */
-	__u8 pad[2];
+	__u8 held;
+	__u8 pad;
 };
 
 /* The helper's liveness (ADR 0008). The helper writes its pid; the enforcer

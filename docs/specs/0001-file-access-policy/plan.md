@@ -44,17 +44,23 @@ confined processes are denied everything (ADR 0008).
 An array-of-maps with one slot. Each inner map is a hash:
 
     key   { u32 tag; char s[256] }   tag 0 = path prefix, 1 = name; zero padded
-    value { u32 seq[2]; u8 effect[2]; u8 held }   index 0 = read, 1 = write; seq 0 = none
+    value { u32 seq[2]; u8 effect[2]; u8 held; u8 pad }   index 0 = read, 1 = write; seq 0 = none
 
 Keys compare as exact bytes, so no hash collision can change a verdict. To
 change the policy, the helper builds a new inner map and swaps it into the
 slot. The swap is atomic, so a command never sees half a policy. For rules with
 the same pattern and kind, the compiler keeps the last one.
 
-`held` marks a path that a deny rule names, and every ancestor of one. The
-compiler adds an entry for each, with `seq` 0 where no rule names the path
-itself. The rename hook looks up the old and the new path, and denies when
-either is held (R6, A22). A swap rebuilds the marks with the rest.
+`held` marks a path that a path deny rule names, of any kind, and every
+ancestor of one. The compiler adds an entry for each, with `seq` 0 where no
+rule names the path itself. A later allow does not unmark a path: the deny
+rule is still in the policy, and moving the path would still carry its files
+away. A name rule marks nothing, since it matches wherever the file goes, and
+marking for it would mark every directory. The mark covers its exact path,
+not the paths beneath it. The rename hook takes the mark of the full path from
+its last prefix lookup, for the old and the new path, and denies with "holds
+a denied path" when either is held and write is allowed (R6, A22). A swap
+rebuilds the marks with the rest, so removing a rule clears them.
 
 **3. Policy library** (Coalton, used by both programs)
 
@@ -178,9 +184,9 @@ only: logging is not enforcement.
   and, once pinning lands, the bpffs mount. It then grants them to a copy of
   the real helper in `build/check/`, which starts a check agent built from the
   agent's code. The check agent is the acceptance harness (T21): one check
-  per case, A1 through A19, through the launcher in a temp tree, plus the
-  spike's other cases, the random-policy test (T22), and the torn-walk test
-  (T23). It counts the denials of the two stress tests instead of logging
+  per case, A1 through A19 and A22, through the launcher in a temp tree, plus
+  the spike's other cases, the random-policy test (T22, which also probes
+  renames), and the torn-walk test (T23). It counts the denials of the two stress tests instead of logging
   them.
 
 ## Socket protocol
@@ -291,7 +297,10 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
   cannot rename a deny rule's path or its ancestors. An unconfined process
   still can, and the rule then no longer covers the files. The marks also
   stop a command from renaming the project directory or the home directory,
-  which the default denies sit beneath.
+  which the default denies sit beneath, or any directory above them. Renames inside the project are unaffected. Still open: a rule that
+  denies only read, under an allowed write, lets a command move a file out
+  from beneath it, as in `mv P/anc/sub/secret P/x`. R6 names the path and its
+  ancestors only.
 - **The unflagged launcher.** From its spawn until the helper flags it, the
   launcher runs unconfined. In that window it runs only `/bin/sh` up to its
   `read`, with an absolute path, and the command is still an argument. The

@@ -137,7 +137,7 @@ a task that can run in parallel with the one before it. The spike code in
   after four tries deny with the reason "path changed". Add the reason to
   the denial event and log. (R6, R7) Done when the object builds, the event
   and log tests cover the reason, and T23's test, now A23, reads no secret.
-- [ ] T34 Deny renames above a deny rule. The compiler marks the path of each
+- [x] T34 Deny renames above a deny rule. The compiler marks the path of each
   deny rule and every ancestor of it; the rename hook denies a confined
   rename whose old or new path is marked, with the reason "holds a denied
   path". (R6, R7) Done when compiler tests cover the marks, the reference

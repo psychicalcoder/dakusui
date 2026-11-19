@@ -9,13 +9,13 @@
   (declare run-all (Ctx * session:Session -> List Boolean))
   (define (run-all c s)
     (let a13 = (check-a13 c))
-    (let _ = (note-ancestor-rename c s))
     (let rest =
       (mconcat
        (make-list (check-defaults c)
                   (check-a3 c s)
                   (check-a4 c s)
                   (check-links c s)
+                  (check-a22 c s)
                   (check-a7 c s)
                   (check-a8 c)
                   (make-list (check-a10 c))

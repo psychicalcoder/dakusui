@@ -17,11 +17,21 @@
 
   (declare path-entry (String * Optional policy:Decision * Optional policy:Decision -> policy:Entry))
   (define (path-entry path on-read on-write)
-    (policy:Entry (policy::PathPrefix path) on-read on-write))
+    (policy:Entry (policy::PathPrefix path) on-read on-write False))
+
+  (declare held-entry (String * Optional policy:Decision * Optional policy:Decision -> policy:Entry))
+  (define (held-entry path on-read on-write)
+    "A path entry that a confined rename may not touch. (R6)"
+    (policy:Entry (policy::PathPrefix path) on-read on-write True))
+
+  (declare held-only (String -> policy:Entry))
+  (define (held-only path)
+    "An entry that no rule names: an ancestor of a deny rule's path."
+    (held-entry path None None))
 
   (declare name-entry (String * Optional policy:Decision * Optional policy:Decision -> policy:Entry))
   (define (name-entry name on-read on-write)
-    (policy:Entry (policy::FileName name) on-read on-write))
+    (policy:Entry (policy::FileName name) on-read on-write False))
 
   (declare letters (UFix -> String))
   (define (letters n)
@@ -68,38 +78,92 @@
        cl:t))))
 
 (define-test compile-keeps-one-entry-per-rule-on-new-patterns ()
-  (is (== (compiled (make-list "allow read /a" "deny write /b" "deny read,write name:.env"))
+  (is (== (compiled (make-list "allow read /a" "allow write /b" "allow read,write name:.env"))
           (make-list (path-entry "/a" (allow-at 1) None)
-                     (path-entry "/b" None (deny-at 2))
-                     (name-entry ".env" (deny-at 3) (deny-at 3))))))
+                     (path-entry "/b" None (allow-at 2))
+                     (name-entry ".env" (allow-at 3) (allow-at 3))))))
 
 ;; The done condition of T7.
 (define-test compile-merges-duplicates-kind-by-kind ()
   ;; A later rule on the same kind replaces the earlier one.
+  (is (== (compiled (make-list "allow read /a" "allow write /a" "allow read /a"))
+          (make-list (path-entry "/a" (allow-at 3) (allow-at 2)))))
   (is (== (compiled (make-list "allow read /a" "deny read /a"))
-          (make-list (path-entry "/a" (deny-at 2) None))))
+          (make-list (held-entry "/a" (deny-at 2) None) (held-only "/"))))
   ;; A rule on the other kind leaves the first untouched.
   (is (== (compiled (make-list "allow read /a" "deny write /a"))
-          (make-list (path-entry "/a" (allow-at 1) (deny-at 2)))))
+          (make-list (held-entry "/a" (allow-at 1) (deny-at 2)) (held-only "/"))))
   ;; A partial override keeps the other kind's older number.
   (is (== (compiled (make-list "allow read,write /a" "deny write /a"))
-          (make-list (path-entry "/a" (allow-at 1) (deny-at 2)))))
+          (make-list (held-entry "/a" (allow-at 1) (deny-at 2)) (held-only "/"))))
   ;; A later rule on both kinds replaces both.
   (is (== (compiled (make-list "allow read /a" "deny write /a" "allow read,write /a"))
-          (make-list (path-entry "/a" (allow-at 3) (allow-at 3)))))
+          (make-list (held-entry "/a" (allow-at 3) (allow-at 3)) (held-only "/"))))
   ;; A trailing slash names the same pattern.
-  (is (== (compiled (make-list "allow read /a/" "deny read /a"))
-          (make-list (path-entry "/a" (deny-at 2) None)))))
+  (is (== (compiled (make-list "allow read /a/" "allow write /a"))
+          (make-list (path-entry "/a" (allow-at 1) (allow-at 2))))))
 
 (define-test compile-numbers-rules-by-place-in-the-policy ()
   (is (== (compiled (make-list "allow read /a" "allow read /b" "deny read /a"))
-          (make-list (path-entry "/a" (deny-at 3) None)
-                     (path-entry "/b" (allow-at 2) None)))))
+          (make-list (held-entry "/a" (deny-at 3) None)
+                     (path-entry "/b" (allow-at 2) None)
+                     (held-only "/")))))
 
 (define-test compile-keeps-names-and-paths-apart ()
   (is (== (compiled (make-list "allow read /a" "deny read name:a"))
           (make-list (path-entry "/a" (allow-at 1) None)
                      (name-entry "a" (deny-at 2) None)))))
+
+;;; T34: the held marks. (R6)
+
+(define-test compile-marks-a-deny-path-and-its-ancestors ()
+  (is (== (compiled (make-list "allow read,write /p" "deny read /p/anc/sub"))
+          (make-list (held-entry "/p" (allow-at 1) (allow-at 1))
+                     (held-entry "/p/anc/sub" (deny-at 2) None)
+                     (held-only "/")
+                     (held-only "/p/anc")))))
+
+(define-test compile-marks-each-path-once ()
+  (is (== (compiled (make-list "deny read /a/b" "deny write /a/c" "deny read /a/b"))
+          (make-list (held-entry "/a/b" (deny-at 3) None)
+                     (held-entry "/a/c" None (deny-at 2))
+                     (held-only "/")
+                     (held-only "/a")))))
+
+(define-test compile-marks-the-root-for-a-deny-on-it ()
+  (is (== (compiled (make-list "deny write /"))
+          (make-list (held-entry "/" None (deny-at 1))))))
+
+(define-test compile-marks-nothing-for-allows-or-names ()
+  (is (== (compiled (make-list "allow read,write /a/b" "deny read,write name:.env"))
+          (make-list (path-entry "/a/b" (allow-at 1) (allow-at 1))
+                     (name-entry ".env" (deny-at 2) (deny-at 2))))))
+
+;; A later allow does not unmark: the deny rule is still in the policy.
+(define-test compile-keeps-the-mark-under-a-later-allow ()
+  (is (== (compiled (make-list "deny read /a" "allow read /a"))
+          (make-list (held-entry "/a" (allow-at 2) None) (held-only "/")))))
+
+;; The marks come from the rules in force, so removing the rule clears them.
+(define-test compile-marks-follow-the-rules-in-force ()
+  (is (== (compiled (make-list "allow read,write /p"))
+          (make-list (path-entry "/p" (allow-at 1) (allow-at 1))))))
+
+(define-test compile-marks-agree-with-the-evaluator ()
+  (let p = (policy-of (make-list "allow read /" "allow read,write /p" "deny read /p/anc/sub"
+                                 "deny write /q" "deny read,write name:.env")))
+  (let marked = (list:filter (fn (path) (policy:held? p path))
+                             (make-list "/" "/p" "/p/anc" "/p/anc/sub" "/p/anc/sub/x"
+                                        "/p/other" "/q" "/q/x" "/.env" "/p/.env")))
+  (is (== marked (make-list "/" "/p" "/p/anc" "/p/anc/sub" "/q")))
+  (is (== (unwrap (policy:compile-policy p))
+          (make-list (held-entry "/" (allow-at 1) None)
+                     (held-entry "/p" (allow-at 2) (allow-at 2))
+                     (held-entry "/p/anc/sub" (deny-at 3) None)
+                     (held-entry "/q" None (deny-at 4))
+                     (name-entry ".env" (deny-at 5) (deny-at 5))
+                     (held-only "/p/anc"))))
+  (is (== (policy:held-paths p) (make-list "/" "/p" "/p/anc" "/p/anc/sub" "/q"))))
 
 (define-test compile-empty-policy-has-no-entries ()
   (is (== (compiled Nil) Nil)))
@@ -127,7 +191,12 @@
   (is (== (policy:entry-value-bytes (path-entry "/a" None (allow-at 2)))
           (make-list 0 0 0 0  2 0 0 0  0 1  0 0)))
   (is (== (policy:entry-value-bytes (path-entry "/a" (deny-at 3) None))
-          (make-list 3 0 0 0  0 0 0 0  0 0  0 0))))
+          (make-list 3 0 0 0  0 0 0 0  0 0  0 0)))
+  ;; held is the byte after the effects. (R6)
+  (is (== (policy:entry-value-bytes (held-entry "/a" (deny-at 3) None))
+          (make-list 3 0 0 0  0 0 0 0  0 0  1 0)))
+  (is (== (policy:entry-value-bytes (held-only "/"))
+          (make-list 0 0 0 0  0 0 0 0  0 0  1 0))))
 
 (define-test compile-name-limit-is-63-bytes ()
   (is (name-accepted? (letters 63)))

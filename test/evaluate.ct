@@ -71,3 +71,56 @@
   (is (policy:allows? separate read-write "/w/f"))
   (let both = (policy-of (make-list "allow read,write /w")))
   (is (policy:allows? both read-write "/w/f")))
+
+;;; T34: renames above a deny rule. (R6, A22)
+
+(define-test evaluate-a22-renames-above-a-deny-rule ()
+  (let p = (policy-of (make-list "allow read /" "allow read,write /p" "deny read /p/anc/sub")))
+  ;; mv /p/anc /p/anc2, and mv /p/anc/sub /p/sub2
+  (is (not (policy:allows-rename? p "/p/anc" "/p/anc2")))
+  (is (not (policy:allows-rename? p "/p/anc/sub" "/p/sub2")))
+  ;; Renaming another directory over /p/anc.
+  (is (not (policy:allows-rename? p "/p/other" "/p/anc")))
+  (is (policy:allows-rename? p "/p/other" "/p/other2"))
+  ;; Beneath the denied path, nothing is held: write decides.
+  (is (policy:allows-rename? p "/p/anc/sub/f" "/p/anc/sub/g"))
+  (is (policy:allows-rename? p "/p/anc/f" "/p/anc/g"))
+  ;; The project itself holds the denied path.
+  (is (not (policy:allows-rename? p "/p" "/p2")))
+  ;; After the rule is removed, the rename succeeds.
+  (let q = (policy-of (make-list "allow read /" "allow read,write /p")))
+  (is (policy:allows-rename? q "/p/anc" "/p/anc2")))
+
+(define-test evaluate-rename-needs-write-on-both-paths ()
+  (let p = (policy-of (make-list "allow read /" "allow read,write /p" "allow read /r")))
+  (is (policy:allows-rename? p "/p/a" "/p/b"))
+  (is (not (policy:allows-rename? p "/p/a" "/r/b")))
+  (is (not (policy:allows-rename? p "/r/a" "/p/b"))))
+
+(define-test evaluate-held-follows-path-deny-rules-only ()
+  (let p = (policy-of (make-list "allow read,write /a/b" "deny read,write name:.env")))
+  (is (== Nil (policy:held-paths p)))
+  (is (not (policy:held? p "/a")))
+  ;; A later allow of the denied path keeps it held.
+  (let q = (policy-of (make-list "allow read,write /" "deny read /a/b" "allow read /a/b")))
+  (is (policy:held? q "/a/b"))
+  (is (policy:held? q "/a"))
+  (is (policy:held? q "/"))
+  (is (not (policy:held? q "/a/b/c")))
+  (is (not (policy:held? q "/a/bc")))
+  (is (not (policy:allows-rename? q "/a" "/z")))
+  (is (policy:allows-rename? q "/a/b/c" "/a/b/d")))
+
+;; The default policy holds the project, the home directory, and their
+;; ancestors, but no file of ordinary work.
+(define-test evaluate-default-policy-holds-project-and-home ()
+  (let p = (unwrap (policy:session-policy "/home/u/proj" "/home/u" Nil)))
+  (is (not (policy:allows-rename? p "/home/u/proj" "/home/u/proj2")))
+  (is (not (policy:allows-rename? p "/home/u/proj/.dakusui" "/home/u/proj/x")))
+  (is (policy:allows-rename? p "/home/u/proj/src" "/home/u/proj/src2"))
+  (is (policy:allows-rename? p "/home/u/proj/a.c" "/home/u/proj/b.c"))
+  (is (policy:allows-rename? p "/tmp/a" "/tmp/b"))
+  (is (policy:held? p "/home/u"))
+  (is (policy:held? p "/home/u/.ssh"))
+  (is (policy:held? p "/"))
+  (is (not (policy:held? p "/tmp"))))

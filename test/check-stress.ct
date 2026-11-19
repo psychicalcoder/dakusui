@@ -3,6 +3,7 @@
 ;;; T22: random policies. The kernel's verdicts must match the reference
 ;;; evaluator's. Each policy reads only system directories, so a path in the
 ;;; temp tree can match no rule, and then adds random rules over the tree.
+;;; A probe opens a file, or renames a file or a directory (T34).
 ;;;
 ;;; A23 (T23, fixed by T33): torn walks. The enforcer walks a path from the
 ;;; leaf up, reading each dentry's parent and then its name. A rename between
@@ -54,13 +55,25 @@ that is not a path prefix, or a name rule."
 
 (cl:defparameter *probe-modes* '("<" ">>" "<>")
   "Shell redirections for read, write, and read-write. >> creates nothing,
-since every probed file exists, and writes nothing.")
+since every probed file exists, and writes nothing. Mode 3 is a rename.")
+
+(cl:defun probe-path (root mode)
+  "A file for an open; a file or a directory for a rename (mode 3)."
+  (pick (cl:if (cl:= mode 3)
+               (cl:append (tree-dirs root) (tree-files root))
+               (tree-files root))))
 
 (cl:defun probe-script (paths modes)
+  "One verdict line per probe. A rename moves PATH to PATH.t and back. Both
+ask the same of the policy, so the second fails only if the first did, and
+the tree stays as it was. (R6, T34)"
   (cl:format cl:nil "~{~A~}"
              (cl:mapcar (cl:lambda (path mode)
-                          (cl:format cl:nil "( : ~A '~A' ) 2>/dev/null && echo 1 || echo 0; "
-                                     (cl:nth mode *probe-modes*) path))
+                          (cl:if (cl:= mode 3)
+                                 (cl:format cl:nil "mv -- '~A' '~:*~A.t' 2>/dev/null && mv -- '~:*~A.t' '~:*~A' && echo 1 || echo 0; "
+                                            path)
+                                 (cl:format cl:nil "( : ~A '~A' ) 2>/dev/null && echo 1 || echo 0; "
+                                            (cl:nth mode *probe-modes*) path)))
                         paths modes)))
 
 (cl:defun probe-bits (output)
@@ -124,17 +137,25 @@ holds still for 300 ms, or after ten seconds."
     (cond
       ((== mode 0) "read")
       ((== mode 1) "write")
-      (True "read-write")))
+      ((== mode 2) "read-write")
+      (True "rename")))
+
+  (declare evaluator-allows? (policy:Policy * String * UFix -> Boolean))
+  (define (evaluator-allows? pol path mode)
+    "The evaluator's verdict on one probe. A rename moves PATH to PATH.t."
+    (if (== mode 3)
+        (policy:allows-rename? pol path (<> path ".t"))
+        (policy:allows? pol (mode-kinds mode) path)))
 
   (declare random-case (Ctx * String * UFix -> Result String UFix))
   (define (random-case c root probes)
     "One random policy and PROBES random opens. The number that agree with
 the evaluator, or why the case could not run."
     (let texts = (lisp (-> (List String)) (root) (random-rules root)))
-    (let paths = (lisp (-> (List String)) (root probes)
-                   (cl:loop :repeat probes :collect (pick (tree-files root)))))
     (let modes = (lisp (-> (List UFix)) (probes)
-                   (cl:loop :repeat probes :collect (cl:random 3))))
+                   (cl:loop :repeat probes :collect (cl:random 4))))
+    (let paths = (lisp (-> (List String)) (root modes)
+                   (cl:loop :for mode :in modes :collect (probe-path root mode))))
     (do
      (rules <- (rules-of (<> system-reads texts)))
      (let pol = (policy:Policy rules))
@@ -144,7 +165,7 @@ the evaluator, or why the case could not run."
                                check-limit))
      (let out = (launch:outcome-output o))
      (let got = (lisp (-> (List Boolean)) (out) (probe-bits out)))
-     (let wanted = (map (fn (pm) (match pm ((Tuple p m) (policy:allows? pol (mode-kinds m) p))))
+     (let wanted = (map (fn (pm) (match pm ((Tuple p m) (evaluator-allows? pol p m))))
                         (list:zip paths modes)))
      (if (/= (list:length got) (list:length wanted))
          (Err (<> "the probe printed no verdict for each open: " out))

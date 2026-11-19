@@ -38,6 +38,8 @@
           (denials:denial-text (event-line-for "helper gone" "cat" "file_open" "read" ""))))
   (is (== (Some "denied read by cat (pid 42): path changed")
           (denials:denial-text (event-line-for "path changed" "cat" "file_open" "read" ""))))
+  (is (== (Some "denied write of /p/anc by mv (pid 42): holds a denied path")
+          (denials:denial-text (event-line-for "holds a denied path" "mv" "path_rename" "write" "/p/anc"))))
   (is (== None (denials:denial-text "{\"ok\":true}")))
   (is (== None (denials:denial-text "{\"event\":\"denial\",\"pid\":\"42\"}")))
   (is (== None (denials:denial-text "not json"))))

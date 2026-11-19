@@ -46,4 +46,52 @@
 its own, and no match denies. (R2, R5)"
     (match wanted
       ((Kinds first rest)
-       (list:all (fn (kind) (allows-kind? pol path kind)) (Cons first rest))))))
+       (list:all (fn (kind) (allows-kind? pol path kind)) (Cons first rest)))))
+
+  (declare path-and-ancestors (String -> List String))
+  (define (path-and-ancestors path)
+    "PATH, an absolute path in plain form, and each path above it, root first."
+    (lisp (-> (List String)) (path)
+      (cl:if (cl:string= path "/")
+             (cl:list "/")
+             (cl:cons "/"
+                      (cl:loop :for i := (cl:position #\/ path :start 1)
+                                 :then (cl:position #\/ path :start (cl:1+ i))
+                               :collect (cl:subseq path 0 (cl:or i (cl:length path)))
+                               :while i)))))
+
+  (declare held-paths (Policy -> List String))
+  (define (held-paths pol)
+    "The paths a confined process may not rename: each path that a path deny
+rule names, of any kind, and every ancestor of one, whatever rules come later.
+A later allow does not unmark a path, since moving it would still carry the
+deny rule's files away; an allow rule alone marks nothing. A name rule marks
+nothing either: it matches its name wherever the file goes, so no rename
+escapes it, and marking for it would mark every directory. (R6)"
+    (match pol
+      ((Policy rules)
+       (fold (fn (found r)
+               (match r
+                 ((Rule effect _ (PathPrefix path))
+                  (if (== effect Deny)
+                      (fold (fn (acc p) (if (list:member p acc) acc (<> acc (make-list p))))
+                            found
+                            (path-and-ancestors path))
+                      found))
+                 (_ found)))
+             Nil
+             rules))))
+
+  (declare held? (Policy * String -> Boolean))
+  (define (held? pol path)
+    "True if PATH is one of held-paths. (R6)"
+    (list:member path (held-paths pol)))
+
+  (declare allows-rename? (Policy * String * String -> Boolean))
+  (define (allows-rename? pol old new)
+    "True if POL lets a confined process rename OLD to NEW: both need write
+(R5), and neither may be held (R6). Renaming over NEW, or swapping the two,
+asks the same."
+    (let write = (Kinds Write Nil))
+    (and (allows? pol write old) (allows? pol write new)
+         (not (held? pol old)) (not (held? pol new)))))

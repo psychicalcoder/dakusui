@@ -20,6 +20,9 @@
    #:policy-text
    #:resolve-rule
    #:allows?
+   #:held-paths
+   #:held?
+   #:allows-rename?
    #:default-policy
    #:session-policy
    #:Decision
