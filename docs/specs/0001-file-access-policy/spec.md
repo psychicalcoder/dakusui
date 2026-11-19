@@ -1,6 +1,6 @@
 # 0001: File access policy and enforcement
 
-Status: Approved
+Status: Implemented
 
 ## Summary
 
@@ -218,18 +218,21 @@ Design choices made while writing this spec live in the ADRs:
 
 | Requirement | Verified by | State |
 |-------------|-------------|-------|
-| R1 | A1, A2 | Not started |
-| R2 | A3 | Not started |
-| R3 | A1, A11 | Not started |
-| R4 | A4, A7 | Not started |
-| R5 | A12, A24 | Not started |
-| R6 | A5, A9, A22, A23, A24 | Not started |
-| R7 | A13 | Not started |
-| R8 | A14 | Not started |
-| R9 | A6, A19 | Not started |
-| R10 | A15, A16 | Not started |
-| R11 | A8 | Not started |
-| R12 | A10 | Not started |
-| R13 | A17 | Not started |
-| R14 | A18 | Not started |
+| R1 | A1, A2 | Passes |
+| R2 | A3 | Passes |
+| R3 | A1, A11 | Passes |
+| R4 | A4, A7 | Passes |
+| R5 | A12, A24 | Passes |
+| R6 | A5, A9, A22, A23, A24 | Passes |
+| R7 | A13 | Passes |
+| R8 | A14 | Passes |
+| R9 | A6, A19 | Passes |
+| R10 | A15, A16 | Passes |
+| R11 | A8 | Passes |
+| R12 | A10 | Passes |
+| R13 | A17 | Passes |
+| R14 | A18 | Passes |
 | R15 | A20, A21 | Deferred |
+
+"Passes" means `make attach-check` passed under the kernel on 2026-11-20,
+and the unit cases (A3, A12, A15, A16, A18, A22, A24) pass in `make test`.

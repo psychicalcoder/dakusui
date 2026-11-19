@@ -145,7 +145,7 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T35 Make a rename need read and write at both its old and new path.
   (R5, R6) Done when the reference evaluator and T22's rename probes agree,
   and A24 is in the acceptance harness.
-- [ ] T24 Fill in the spec's verification table, set its status to Implemented,
+- [x] T24 Fill in the spec's verification table, set its status to Implemented,
   and move the plan to Implemented.
 
 ## Notes

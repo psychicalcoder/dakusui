@@ -1,6 +1,6 @@
 # Plan for 0001: File access policy and enforcement
 
-Status: Review
+Status: Implemented
 Spec: ./spec.md
 Tasks: ./tasks.md
 
