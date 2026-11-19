@@ -15,6 +15,7 @@
                     (#:chat #:dakusui/chat)
                     (#:terminal #:dakusui/terminal)
                     (#:tools #:dakusui/tools)
+                    (#:mcp #:dakusui/mcp)
                     (#:provider #:dakusui/provider)
                     (#:turn #:dakusui/loop)
                     (#:gate #:dakusui/gate)
