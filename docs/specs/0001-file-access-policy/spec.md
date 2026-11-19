@@ -186,9 +186,12 @@ Settled:
 - Q17 (2026-11-14): v0 does not check whether the user trusts a rule set. A
   cloned repository can ship one that grants access. Dakusui prints the set
   at start (spec 0004 R9).
-- Q20 (2026-11-14): the walk reads the kernel's rename sequence count before
-  and after, and walks again if it changed. After four tries it denies, with
-  the reason "path changed". See R6 and A23.
+- Q20 (2026-11-14, mechanism revised 2026-11-19): the walk reads each
+  dentry's rename count (`d_seq`) before it reads the dentry's parent and
+  name, and reads every count again after the walk. If one was odd or has
+  changed, it walks again. After four tries it denies, with the reason "path
+  changed". The global `rename_lock` cannot serve: its address is hidden from
+  a loader without CAP_SYSLOG. See R6 and A23.
 - Q21 (2026-11-14): R6 forbids it. See R6 and A22.
 
 ## Decisions

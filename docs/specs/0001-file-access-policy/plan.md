@@ -197,7 +197,7 @@ The helper also pushes
 `{"event":"denial","pid":1,"comm":"cat","hook":"file_open","kind":"read","reason":"denied by rule","path":"..."}`.
 `kind` is `read`, `write`, `read,write`, or `none` for a hook that denies every
 confined caller. `reason` tells a rule's denial from a missing match, a limit
-of the walk, or "helper gone". The agent logs each one (R7). Replies come in the order of the
+of the walk, "helper gone", or "path changed". The agent logs each one (R7). Replies come in the order of the
 requests, but an event can come before any reply, so the agent tells the two
 apart by the `event` field.
 
@@ -271,13 +271,22 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
 - **Torn walks.** Found by T23: the walk reads a dentry's parent, then its
   name, so a rename between the two reads joins names that were never one
   path. On 2026-11-09, of about 3.5 million opens during 1.09 million
-  renames, 11,402 read a denied file. The fix (T33): every rename in the
-  kernel holds `rename_lock` for writing, so the walk reads its sequence
-  count before and after. An odd count, or a changed one, means a rename may
-  have torn the walk; the hook walks again, and denies after four tries.
-  A machine that renames without pause can so deny a confined open that the
-  policy allows. Mount changes are not covered: a confined process cannot
-  make one (R12).
+  renames, 11,402 read a denied file. The fix (T33): the kernel bumps a
+  dentry's `d_seq` count before and after it changes the dentry's name or
+  parent. The walk reads each dentry's count before its parent and name,
+  and reads them all again after the walk. An odd count, or a changed one,
+  means a rename may have torn the walk; the hook walks again, and denies
+  with "path changed" after four tries. If no count changed, each dentry
+  kept its name and parent from its first read to its second, so the whole
+  path held at one moment between the last first read and the first second
+  read. On x86-64 loads are not reordered with loads, and each read is a
+  helper call, so the reads need no further barrier. We chose `d_seq` over
+  the global `rename_lock` that Q20 names: `rename_lock` has no BTF
+  variable, and `/proc/kallsyms` shows its address only to CAP_SYSLOG,
+  which the helper lacks. Only renames of the walked dentries cause a
+  retry, but a process that renames one without pause can so deny a
+  confined open that the policy allows. Mount changes are not covered: a
+  confined process cannot make one (R12).
 - **Moved ancestors.** Closed by T34 and the `held` marks: a confined process
   cannot rename a deny rule's path or its ancestors. An unconfined process
   still can, and the rule then no longer covers the files. The marks also

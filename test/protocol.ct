@@ -119,6 +119,8 @@
           (protocol:denial-event (record-bytes 7 10 0 8 "ln" ""))))
   (is (== (Some "{\"event\":\"denial\",\"pid\":9,\"comm\":\"cat\",\"hook\":\"file_open\",\"kind\":\"read\",\"reason\":\"helper gone\",\"path\":\"\"}")
           (protocol:denial-event (record-bytes 9 0 1 9 "cat" ""))))
+  (is (== (Some "{\"event\":\"denial\",\"pid\":9,\"comm\":\"cat\",\"hook\":\"file_open\",\"kind\":\"read\",\"reason\":\"path changed\",\"path\":\"\"}")
+          (protocol:denial-event (record-bytes 9 0 1 10 "cat" ""))))
   (is (== None (protocol:denial-event (make-list 1 2 3)))))
 
 (define-test serve-answers-every-line-and-survives-garbage ()

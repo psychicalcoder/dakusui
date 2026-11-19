@@ -7,6 +7,7 @@
  * keeps the match with the highest sequence number per access kind (last
  * match wins), and returns -EACCES unless every needed kind is allowed.
  * Anything that goes wrong while building the path denies (fail closed).
+ * A rename that races the walk makes it walk again (R6, see walk_path).
  * Once the helper is gone, every hook denies every confined task (ADR 0008).
  */
 #include "vmlinux.h"
@@ -22,6 +23,8 @@ char LICENSE[] SEC("license") = "GPL";
 #define M_READ 0x1  /* FMODE_READ */
 #define M_WRITE 0x2 /* FMODE_WRITE */
 #define PF_EXITING 0x00000004
+#define MAX_SEEN (2 * MAX_COMP) /* dentries a walk checks: MAX_COMP + 1 */
+#define MAX_TRIES 4             /* walks before "path changed" */
 
 extern struct task_struct *bpf_task_from_pid(s32 pid) __ksym;
 extern void bpf_task_release(struct task_struct *p) __ksym;
@@ -44,6 +47,8 @@ struct {
 
 struct scratch {
 	char comp[MAX_COMP][COMP_LEN]; /* path components, leaf first */
+	__u64 seen[MAX_SEEN];          /* each dentry the walk named, */
+	__u32 seq[MAX_SEEN];           /* and its d_seq before the reads */
 	struct rule_key key;
 	struct denial d;
 };
@@ -147,15 +152,24 @@ struct walk_ctx {
 	__u64 dentry;
 	__u64 mnt;
 	__u32 n;
+	__u32 nseen;
 	__u32 status;
 	int done;
 };
+
+/* The kernel bumps a dentry's d_seq before and after it changes the dentry's
+ * name or parent (__d_move), so the count is odd while a rename is under way. */
+static __always_inline __u32 dseq(const struct dentry *d)
+{
+	return BPF_CORE_READ(d, d_seq.seqcount.sequence);
+}
 
 static __noinline long walk_step(__u32 idx, void *data)
 {
 	struct walk_ctx *c = data;
 	struct dentry *dentry = (struct dentry *)c->dentry;
 	struct mount *mnt = (struct mount *)c->mnt;
+	__u32 seq = dseq(dentry); /* read before the parent and the name */
 	struct dentry *parent = BPF_CORE_READ(dentry, d_parent);
 	struct scratch *s;
 	const unsigned char *nm;
@@ -176,6 +190,19 @@ static __noinline long walk_step(__u32 idx, void *data)
 			return 0;
 		}
 	}
+	if (seq & 1) {
+		c->status = ST_MOVED;
+		return 1;
+	}
+	s = get_scratch();
+	if (!s) {
+		c->status = ST_ERR;
+		return 1;
+	}
+	/* At most MAX_COMP names and the root: nseen stays below MAX_SEEN. */
+	s->seen[c->nseen & (MAX_SEEN - 1)] = (__u64)dentry;
+	s->seq[c->nseen & (MAX_SEEN - 1)] = seq;
+	c->nseen++;
 	if (dentry == parent) {
 		c->done = 1;
 		return 1;
@@ -189,11 +216,6 @@ static __noinline long walk_step(__u32 idx, void *data)
 		c->status = ST_LONGNAME;
 		return 1;
 	}
-	s = get_scratch();
-	if (!s) {
-		c->status = ST_ERR;
-		return 1;
-	}
 	nm = BPF_CORE_READ(dentry, d_name.name);
 	if (bpf_probe_read_kernel_str(s->comp[c->n & (MAX_COMP - 1)], COMP_LEN,
 				      nm) < 0) {
@@ -203,6 +225,53 @@ static __noinline long walk_step(__u32 idx, void *data)
 	c->n++;
 	c->dentry = (__u64)parent;
 	return 0;
+}
+
+/* After the walk: has any dentry it named changed since its reads? */
+static __noinline long check_step(__u32 idx, void *data)
+{
+	struct walk_ctx *c = data;
+	struct scratch *s = get_scratch();
+	__u32 i = idx & (MAX_SEEN - 1);
+
+	if (!s) {
+		c->status = ST_ERR;
+		return 1;
+	}
+	if (dseq((struct dentry *)s->seen[i]) != s->seq[i]) {
+		c->status = ST_MOVED;
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Walk, then read each named dentry's d_seq again. If no count was odd or
+ * changed, each dentry kept its name and parent from its first read to its
+ * second. All first reads come before all second reads, so at one moment
+ * between them every link held at once: the path existed (R6). Otherwise walk
+ * again; after MAX_TRIES walks the status stays ST_MOVED, "path changed".
+ *
+ * Ordering: x86-64 does not reorder loads with other loads, and each read is
+ * a helper call, which the compiler cannot move loads across. That gives the
+ * smp_rmb() a seqcount reader needs. Mount changes are not checked: a
+ * confined task cannot make one (R12).
+ */
+static __always_inline void walk_path(struct walk_ctx *w, __u64 start,
+				      __u64 mnt)
+{
+	int i;
+
+	for (i = 0; i < MAX_TRIES; i++) {
+		__builtin_memset(w, 0, sizeof(*w));
+		w->dentry = start;
+		w->mnt = mnt;
+		bpf_loop(MAX_STEPS, walk_step, w, 0);
+		if (!w->status && w->done)
+			bpf_loop(w->nseen, check_step, w, 0);
+		if (w->status != ST_MOVED)
+			return;
+	}
 }
 
 /* ---- match: prefixes from the root down, then the last name ---- */
@@ -297,9 +366,7 @@ static __always_inline int decide(__u32 hook, __u32 need, __u64 start,
 		return deny(s, hook, need, ST_GONE);
 	if (!mnt)
 		return deny(s, hook, need, ST_ERR);
-	w.dentry = start;
-	w.mnt = mnt;
-	bpf_loop(MAX_STEPS, walk_step, &w, 0);
+	walk_path(&w, start, mnt);
 	if (w.status)
 		return deny(s, hook, need, w.status);
 	if (!w.done)

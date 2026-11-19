@@ -4,10 +4,11 @@
 ;;; evaluator's. Each policy reads only system directories, so a path in the
 ;;; temp tree can match no rule, and then adds random rules over the tree.
 ;;;
-;;; T23: torn walks. The enforcer walks a path from the leaf up, reading each
-;;; dentry's parent and then its name. A rename between the two reads could
-;;; join names that were never one path. Readers open the secret under both
-;;; its denied names while a rename moves it between them; no open may succeed.
+;;; A23 (T23, fixed by T33): torn walks. The enforcer walks a path from the
+;;; leaf up, reading each dentry's parent and then its name. A rename between
+;;; the two reads could join names that were never one path; the walk's d_seq
+;;; check must catch it. Readers open the secret under both its denied names
+;;; while a rename moves it between them; no open may succeed.
 
 (cl:defparameter *tree-names* '("dk0" "dk1"))
 (cl:defparameter *file-names* '("f0" "f1"))
@@ -216,7 +217,7 @@ print('torn', read, denied, missing)
 
   (declare check-torn (Ctx * session:Session -> Boolean))
   (define (check-torn c s)
-    "T23: BASE/t/a/s/f is the secret. The agent, not confined, renames
+    "A23: BASE/t/a/s/f is the secret. The agent, not confined, renames
 BASE/t/a/s to BASE/t/b/t and back as fast as it can. Both names are denied.
 A torn walk would see BASE/t/a/t/f or BASE/t/b/s/f, which no rule denies.
 Four confined readers try for five seconds; none may open the secret."
@@ -232,7 +233,7 @@ Four confined readers try for five seconds; none may open the secret."
     (let command = (mconcat (make-list "for i in 1 2 3 4; do python3 " script " " a "/f " b
                                        "/f 5 & done; wait")))
     (let results =
-      (with-rules c s "T23" (make-list (<> "deny read,write " a) (<> "deny read,write " b))
+      (with-rules c s "A23" (make-list (<> "deny read,write " a) (<> "deny read,write " b))
         (fn (_)
           (lisp (-> Unit) (a b) (start-renamer a b) Unit)
           (let ran = (run-in c command))
@@ -254,8 +255,8 @@ Four confined readers try for five seconds; none may open the secret."
            (match counts
              ((Cons read (Cons denied (Cons missing (Nil))))
               (verdict (and (== read 0) (> denied 0))
-                       "T23 concurrent renames never open a denied file"
+                       "A23 concurrent renames never open a denied file"
                        (mconcat (make-list (show-n renames) " renames; opens: " (show-n read) " read, "
                                            (show-n denied) " denied, " (show-n missing) " missing"))))
-             (_ (verdict False "T23 concurrent renames" (<> "the readers did not report: " output))))))))
+             (_ (verdict False "A23 concurrent renames" (<> "the readers did not report: " output))))))))
     (list:all id results)))

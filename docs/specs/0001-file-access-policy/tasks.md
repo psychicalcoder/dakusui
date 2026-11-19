@@ -132,7 +132,7 @@ a task that can run in parallel with the one before it. The spike code in
 - [x] T23 Stress the torn-walk risk: run concurrent renames against opens and
   check that no denied file is ever readable. Done when the result is recorded
   in the plan, pass or fail.
-- [ ] T33 Make the walk safe against renames: read the kernel's rename
+- [x] T33 Make the walk safe against renames: read the kernel's rename
   sequence count before and after the walk, walk again if it changed, and
   after four tries deny with the reason "path changed". Add the reason to
   the denial event and log. (R6, R7) Done when the object builds, the event
