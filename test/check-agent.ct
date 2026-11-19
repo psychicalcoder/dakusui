@@ -633,7 +633,9 @@ exist yet, names BASE/data/s/new, and denies it once it exists."
 
 (cl:defun live-with (token)
   "How many live processes, not zombies, have TOKEN in their command line."
-  (cl:loop :for dir :in (cl:directory "/proc/[0-9]*/")
+  ;; SBCL's directory has no [0-9] pattern, so take every entry and skip
+  ;; those that are not pids.
+  (cl:loop :for dir :in (cl:directory "/proc/*/" :resolve-symlinks cl:nil)
            :for pid := (cl:car (cl:last (cl:pathname-directory dir)))
            :for cmdline := (cl:ignore-errors
                             (cl:with-open-file (in (cl:format cl:nil "/proc/~A/cmdline" pid)
@@ -643,7 +645,7 @@ exist yet, names BASE/data/s/new, and denies it once it exists."
                                         (cl:subseq bytes 0 (cl:read-sequence bytes in))))))
            :for stat := (cl:ignore-errors (uiop:read-file-string (cl:format cl:nil "/proc/~A/stat" pid)))
            :for close := (cl:and stat (cl:position #\) stat :from-end cl:t))
-           :count (cl:and cmdline (cl:search token cmdline) close
+           :count (cl:and (cl:every #'cl:digit-char-p pid) cmdline (cl:search token cmdline) close
                           (cl:not (cl:member (cl:char stat (cl:+ 2 close)) '(#\Z #\X))))))
 
 (coalton-toplevel
@@ -685,7 +687,37 @@ exist yet, names BASE/data/s/new, and denies it once it exists."
                    (has a6 (mconcat (make-list "denied read of " (.project c) "/.env by cat (pid ")))
                    (has a6 "denied by rule"))
               "0003 A6 bash lists the denials of its command" a6)
-     (verdict (not (has quiet "denials")) "0003 A6 a missing file lists no denial" quiet))))
+     (verdict (not (has quiet "denials")) "0003 A6 a missing file lists no denial" quiet)))
+
+  (declare check-process (Ctx -> List Boolean))
+  (define (check-process c)
+    "Spec 0003 R10: a process from start-process, as an MCP server runs, is
+confined like a command. It reads each path it gets and says whether it could.
+Its stderr goes to /dev/null, so cat's complaint does not reach its stdout."
+    (let label = "0003 R10 a process from start-process runs confined")
+    (match (launch:start-process (.helper c) (.project c)
+                                 "while read -r path; do if cat \"$path\" >/dev/null; then echo read; else echo denied; fi; done"
+                                 Nil)
+      ((Err why) (make-list (verdict False label why)))
+      ((Ok p)
+       (let ask = (fn (path)
+                    (match (launch:send-line p path)
+                      ((Err why) why)
+                      ((Ok _)
+                       (match (launch:receive-line p 10)
+                         ((launch:Line line) line)
+                         ((launch:TimedOut) "no answer in 10 seconds")
+                         ((launch:Closed) "the process closed its stdout"))))))
+       (let before = (list:length (log-lines (.log-file c))))
+       (let secret = (ask ".env"))
+       (let logged = (log-grew? (.log-file c) before))
+       (let source = (ask "src/a.c"))
+       (launch:stop p)
+       (make-list
+        (verdict (and (== secret "denied") logged) label
+                 (mconcat (make-list ".env: " secret (if logged ", logged" ", not logged"))))
+        (verdict (== source "read") "0003 R10 the process reads what the policy allows"
+                 (<> "src/a.c: " source)))))))
 
 ;;; A6 and A19: the helper ends. These come last.
 

@@ -19,7 +19,7 @@ Write each test first or alongside its code.
 
 ## Phase 2: MCP
 
-- [ ] T5 Write `start-process`. (R10) Done when a process started through it
+- [x] T5 Write `start-process`. (R10) Done when a process started through it
   answers on its pipes and shows as confined in the check agent.
 - [ ] T6 Write the MCP client: start, list, call, limits, a dead server.
   (R9, R11, R12) Done when A8 and A10 pass against a scripted server.

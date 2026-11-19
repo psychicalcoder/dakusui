@@ -27,6 +27,7 @@
                   (check-a18 c s)
                   (check-spike c)
                   (check-tools c s)
+                  (check-process c)
                   (make-list (check-random c s)
                              (check-torn c s)))))
     (let victim = (start-a19 c))

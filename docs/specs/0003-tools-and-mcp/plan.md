@@ -39,7 +39,11 @@ argument error, not clamped. `show_policy` takes empty argument text too.
   until the deadline. A process that left the group with `setsid` lives on, still
   confined, and no longer holds up the call.
 - `start-process` is the same spawn with stdin and stdout on two pipes and
-  stderr to `/dev/null`, for MCP servers. It returns the pid and both ends.
+  stderr to `/dev/null`, for MCP servers. It adds the configuration's
+  variables to the scrubbed environment. It returns a handle on the pid and
+  both ends, which are close-on-exec. The handle writes a line, reads a line
+  with a deadline (a line, a timeout, or the end), and stops the process: it
+  kills the group, closes both pipes, and reaps.
 
 **3. Denials for a command** (`denials.ct`, helper `protocol.ct`, `serve.ct`)
 
