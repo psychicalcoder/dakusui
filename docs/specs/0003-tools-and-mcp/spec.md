@@ -83,17 +83,17 @@ None. Settled: Q1 (2026-11-14), an MCP server runs confined (R10).
 |-------------|-------------|-------|
 | R1 | A1 | Passes (unit, agent-check) |
 | R2 | A2 | Passes (unit) |
-| R3 | A3 | Passes (unit, unconfined); in attach-check, not run |
-| R4 | A4 | Passes (unit, unconfined); in attach-check, not run |
+| R3 | A3 | Passes (unit, attach-check) |
+| R4 | A4 | Passes (unit, attach-check) |
 | R5 | A5 | Passes (unit) |
-| R6 | A6 | Passes (unit, fake helper); in attach-check, not run |
+| R6 | A6 | Passes (unit, attach-check) |
 | R7 | A7 | Passes (unit) |
 | R8 | review: no file call in `tools.ct` or `mcp.ct` | Passes (review) |
 | R9 | A1, A8 | Passes (unit, agent-check) |
-| R10 | A9 | In attach-check, not run |
+| R10 | A9 | Passes (attach-check) |
 | R11 | A8 | Passes (unit, agent-check) |
-| R12 | A10 | Passes (unit); confined half in attach-check, not run |
+| R12 | A10 | Passes (unit, attach-check) |
 
 "Unit" is `make test`; "agent-check" is `make agent-check`, the agent under
-a stand-in helper. Cases marked "in attach-check" need `sudo` and the bpffs
-mount, which the development machine lacked. Checked 2026-11-19.
+a stand-in helper; "attach-check" is `make attach-check`, under the kernel.
+Checked 2026-11-20.

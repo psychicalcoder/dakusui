@@ -54,8 +54,8 @@ user ── Dakusui (no capabilities) ── LLM server
 
 | # | Spec | State |
 |---|------|-------|
-| 0001 | File access policy and enforcement | Approved; T33, T34 open |
-| 0002 | Agent loop and provider client | Approved |
+| 0001 | File access policy and enforcement | Approved; T34, T24 open |
+| 0002 | Agent loop and provider client | Implemented |
 | 0003 | Tools and MCP | Implemented |
 | 0004 | Roles and configuration | Implemented |
 | 0005 | Auto mode (judge) | Implemented |

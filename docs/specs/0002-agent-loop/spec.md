@@ -1,6 +1,6 @@
 # 0002: Agent loop and provider client
 
-Status: Approved
+Status: Implemented
 
 ## Summary
 
@@ -113,4 +113,4 @@ None.
 | R8 | A2 | Passes (unit) |
 | R9 | A8, A9 | Passes (unit) |
 | R10 | A10 | Passes (unit) |
-| R11 | A11 | Passes (`make agent-check`); in attach-check, not run |
+| R11 | A11 | Passes (`make agent-check`, `make attach-check`) |

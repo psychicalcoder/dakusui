@@ -1,6 +1,6 @@
 # Plan for 0002: Agent loop and provider client
 
-Status: Approved
+Status: Implemented
 Spec: ./spec.md
 Tasks: ./tasks.md
 
