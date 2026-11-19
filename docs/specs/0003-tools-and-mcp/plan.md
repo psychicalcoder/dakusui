@@ -1,6 +1,6 @@
 # Plan for 0003: Tools and MCP
 
-Status: Approved
+Status: Implemented
 Spec: ./spec.md
 Tasks: ./tasks.md
 
