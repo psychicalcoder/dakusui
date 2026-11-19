@@ -47,7 +47,8 @@ build/check/dakusui: build/dakusui
 	mkdir -p build/check
 	cp $< $@
 
-build/check/dakusui-agent: $(SOURCES) test/check-agent.ct test/check-stress.ct test/check-main.ct
+build/check/dakusui-agent: $(SOURCES) test/check-agent.ct test/check-stress.ct test/check-main.ct \
+		test/mcp-server.py
 	$(SBCL) --eval '(build-binary "dakusui/check-agent" "$@")'
 
 # Copies of the real helper and agent, for spec 0002 A11 under the kernel.

@@ -130,7 +130,7 @@ None.
 | R9 | A8 | Passes (unit, agent-check) |
 | R10 | A9, A10 | Passes (unit, agent-check) |
 | R11 | A11 | Passes (unit, agent-check) |
-| R12 | A12 | Passes (unit), except the LD_* check (spec 0003 T7) |
+| R12 | A12 | Passes (unit) |
 
 "Unit" is `make test`; "agent-check" is `make agent-check`, the agent under
 a stand-in helper. Checked 2026-11-14.

@@ -18,6 +18,11 @@ Spec 0005: the test provider also plays the judge. The configuration gives
 the judge role its own model name, so the server tells the judge's requests
 from the agent's. Outside auto mode a bash call asks on stdin, so the checks
 answer y.
+
+Spec 0003 T7: a second home names two MCP servers, one whose command does
+not exist and the test server test/mcp-server.py. The checks look for the
+warning, the server's tools in the model's request, a call's result, and
+that no server outlives the agent.
 """
 
 import http.server
@@ -34,6 +39,23 @@ SPAWN = threading.Lock()
 
 
 JUDGE_MODEL = "judge-model"
+MCP_SERVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp-server.py")
+
+
+def live_servers():
+    """The pids of live processes, not zombies, that run MCP_SERVER."""
+    pids = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                cmdline = f.read()
+            with open("/proc/%s/stat" % pid) as f:
+                state = f.read().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            continue
+        if MCP_SERVER.encode() in cmdline and state not in ("Z", "X"):
+            pids.append(pid)
+    return pids
 
 
 class Provider(http.server.ThreadingHTTPServer):
@@ -163,6 +185,13 @@ def main():
             json.dump({"roles": {"tester": {"model": "role-model", "base_url": provider.url,
                                             "api_key_env": "OPENAI_API_KEY"},
                                  "judge": {"model": JUDGE_MODEL}}}, f)
+        mcp_home = os.path.join(base, "mcp-home")
+        os.makedirs(os.path.join(mcp_home, ".config", "dakusui"))
+        with open(os.path.join(mcp_home, ".config", "dakusui", "config.json"), "w") as f:
+            json.dump({"roles": {"judge": {"model": JUDGE_MODEL}},
+                       "mcp": {"gone": {"command": "/nonexistent/dakusui-mcp-server"},
+                               "test": {"command": "exec python3 -I '%s'" % MCP_SERVER}}},
+                      f)
         secret = os.path.join(base, "secret")
         with open(os.path.join(rules, "strict"), "w") as f:
             f.write("# from agent-check\n\ndeny read,write %s\n" % secret)
@@ -179,8 +208,8 @@ def main():
                 failed.append(label)
                 print("  " + output.replace("\n", "\n  "))
 
-        def agent_run(args, stdin=b""):
-            code, output = run(agent, helper, args, env, project, stdin)
+        def agent_run(args, stdin=b"", home=home):
+            code, output = run(agent, helper, args, dict(env, HOME=home), project, stdin)
             log = os.path.join(state, "dakusui", "denials.log")
             logged = open(log).read() if os.path.exists(log) else ""
             # R10: the key reaches the provider, and nothing else.
@@ -308,6 +337,32 @@ def main():
               all(code == 0 for code, _ in results.values())
               and saved[-1] == "" and len(saved) == 201 and set(saved[:-1]) == wanted,
               "\n".join(out for _, out in results.values())[-2000:])
+
+        provider.script(reply(calls=[("c1", "test__echo", {"text": "hi"})]),
+                        reply("done"), judge=(verdict(True, "asked for"),))
+        code, output = agent_run(["--auto", "-p", "echo hi"], home=mcp_home)
+        sent = provider.requests[0]["body"] if provider.requests else {}
+        names = [t["function"]["name"] for t in sent.get("tools", [])]
+        check("0003 A1, A10 a server that fails is skipped with a warning, and the "
+              "tool list is the built-in tools, then the server's",
+              'the MCP server "gone" ended before it answered initialize; skipping it' in output
+              and names[:3] == ["bash", "show_policy", "test__echo"]
+              and "test__read" in names,
+              output + "\n" + json.dumps(names))
+        check("0003 A8 a call to test__echo returns hi",
+              code == 0 and tool_result(provider.requests) == "hi"
+              and len(provider.judge_requests) == 1, output)
+        left = live_servers()
+        check("0003 the agent stops its MCP servers when it exits", not left, " ".join(left))
+
+        provider.script(reply(calls=[("c1", "test__echo", {"text": "typed"})]), reply("done"))
+        code, output = agent_run(["-p", "echo typed"], b"y\n", home=mcp_home)
+        check("0003 A8, 0005 A1 a call to an MCP tool asks, and runs on y",
+              code == 0 and "Run? [y/n]" in output
+              and tool_result(provider.requests) == "typed", output)
+        code, output = agent_run([], b"hi\n", home=mcp_home)
+        left = live_servers()
+        check("0003 the agent stops its MCP servers at the end of input", not left, " ".join(left))
 
         code, output = agent_run(["-x"])
         check("R11 an unknown argument is refused", code == 1 and "usage" in output, output)

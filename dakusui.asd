@@ -64,8 +64,8 @@
 
 (defsystem "dakusui/check-agent"
   :description "The acceptance harness: a stand-in agent that runs A1 through
-A19, the random-policy test, the torn-walk test, and spec 0003 A3, A4, and A6
-under the real helper.
+A19, the random-policy test, the torn-walk test, and spec 0003 A3, A4, A6, A9,
+and A10 under the real helper.
 Run it with `make attach-check`."
   :depends-on ("coalton" "cffi" "dakusui/policy" "dakusui/agent")
   :defsystem-depends-on ("coalton-asdf")

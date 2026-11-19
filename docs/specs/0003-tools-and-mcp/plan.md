@@ -67,6 +67,13 @@ with its id, skipping notices, with `poll` against the 120 second limit. The
 result's `content` items of type `text` join into the result string;
 `isError` prefixes it with "error: ". A closed pipe marks the server dead.
 
+At start each request waits 30 seconds, so a server that hangs does not hold
+up the session for long. A tool whose full name does not match
+`^[A-Za-z0-9_-]{1,64}$`, as OpenAI-compatible servers require, is skipped
+with a warning. A server that lists more than 100 pages of tools fails to
+start. Main starts the servers in order after the start-up listing, and
+stops them all when it exits.
+
 The server's command comes from the configuration (spec 0004) and runs
 through `sh`, as `bash` commands do, with the same scrubbed environment plus
 the variables the configuration names for it.

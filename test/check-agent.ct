@@ -8,6 +8,7 @@
                     (#:denials #:dakusui/denials)
                     (#:chat #:dakusui/chat)
                     (#:tools #:dakusui/tools)
+                    (#:mcp #:dakusui/mcp)
                     (#:cell #:coalton/cell)
                     (#:string #:coalton/string)
                     (#:list #:coalton/list))
@@ -84,6 +85,13 @@ print('got', got)
 sys.exit(0 if got else 3)
 ")
 
+(cl:defmacro mcp-server-text ()
+  "The text of test/mcp-server.py, read when this file is compiled, so the
+built check agent needs no source tree."
+  (uiop:read-file-string (asdf:system-relative-pathname "dakusui" "test/mcp-server.py")))
+
+(cl:defparameter *mcp-server-py* (mcp-server-text))
+
 (cl:defun make-base ()
   "A temp tree for every check. The agent is not confined, so it builds it.
 BASE/p is the project, BASE/home the home directory, which the agent reaches
@@ -112,7 +120,8 @@ through the symlink BASE/homelink (A17)."
       (write-text (at "ro") "read only")
       (write-text (at "ptrace.py") *ptrace-py*)
       (write-text (at "mem.py") *mem-py*)
-      (write-text (at "getfd.py") *getfd-py*))
+      (write-text (at "getfd.py") *getfd-py*)
+      (write-text (at "mcp-server.py") *mcp-server-py*))
     base))
 
 (coalton-toplevel
@@ -718,6 +727,38 @@ Its stderr goes to /dev/null, so cat's complaint does not reach its stdout."
                  (mconcat (make-list ".env: " secret (if logged ", logged" ", not logged"))))
         (verdict (== source "read") "0003 R10 the process reads what the policy allows"
                  (<> "src/a.c: " source)))))))
+
+;;; Spec 0003 A9 and A10: an MCP server, confined.
+
+(coalton-toplevel
+  (declare check-mcp (Ctx -> List Boolean))
+  (define (check-mcp c)
+    "Spec 0003 A9 and the confined half of A10, through the test server's
+tools as the model calls them. Its read tool says how much it read, never
+what."
+    (let label = "0003 A9 a server tool that reads .env is denied, and the denial is logged")
+    (let command = (mconcat (make-list "exec python3 -I '" (in-base c "mcp-server.py") "'")))
+    (match (mcp:start (.helper c) (.project c) "test" command Nil)
+      ((Err why) (make-list (verdict False label why)))
+      ((Ok server)
+       (let tools = (mcp:server-tools server))
+       (let call = (fn (name arguments) (tools:call tools (chat:ToolCall "c" name arguments))))
+       (let before = (list:length (log-lines (.log-file c))))
+       (let secret = (call "test__read" "{\"path\":\".env\"}"))
+       (let logged = (log-grew? (.log-file c) before))
+       (let source = (call "test__read" "{\"path\":\"src/a.c\"}"))
+       (let pid = (mcp:server-pid server))
+       (lisp (-> Unit) (pid) (cffi:foreign-funcall "kill" :int (cl:- pid) :int 9 :int) Unit)
+       (let killed = (call "test__echo" "{\"text\":\"hi\"}"))
+       (mcp:stop server)
+       (make-list
+        (verdict (and (string:substring? "error: " secret)
+                      (string:substring? "Permission denied" secret) logged)
+                 label (<> secret (if logged ", logged" ", not logged")))
+        (verdict (string:substring? "read " source)
+                 "0003 R10 a server tool reads what the policy allows" (<> "src/a.c: " source))
+        (verdict (== killed "error: the MCP server \"test\" has ended")
+                 "0003 A10 once its server is killed, a call to its tool is an error" killed))))))
 
 ;;; A6 and A19: the helper ends. These come last.
 

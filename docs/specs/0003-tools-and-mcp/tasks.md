@@ -23,6 +23,6 @@ Write each test first or alongside its code.
   answers on its pipes and shows as confined in the check agent.
 - [x] T6 Write the MCP client: start, list, call, limits, a dead server.
   (R9, R11, R12) Done when A8 and A10 pass against a scripted server.
-- [ ] T7 Start the configured servers at session start and add their tools.
+- [x] T7 Start the configured servers at session start and add their tools.
   (R1, R9) Done when A1 passes, and A9 and A10 are in the check agent.
 - [ ] T8 Fill in the verification table.

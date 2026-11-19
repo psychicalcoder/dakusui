@@ -109,7 +109,17 @@
   (is (== "mcp.docs needs a command" (config-error "{\"mcp\": {\"docs\": {}}}")))
   (is (== "unknown key mcp.docs.args" (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"args\": []}}}")))
   (is (== "mcp.docs.env.T must be a string"
-          (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"T\": 1}}}}"))))
+          (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"T\": 1}}}}")))
+  ;; Loader variables would run code before the server is confined.
+  (is (== "mcp.docs.env.LD_PRELOAD is not allowed: a loader variable would run code before the server is confined"
+          (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"LD_PRELOAD\": \"/x.so\"}}}}")))
+  (is (string:substring? "mcp.docs.env.ENV is not allowed"
+                         (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"ENV\": \"/x\"}}}}")))
+  (is (string:substring? "mcp.docs.env.BASH_ENV is not allowed"
+                         (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"BASH_ENV\": \"/x\"}}}}")))
+  ;; Only those names: LD alone, and a name that merely holds ENV, pass.
+  (is (== "no error"
+          (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"LD\": \"1\", \"MY_ENV\": \"1\"}}}}"))))
 
 (define-test config-a-role-prints-without-its-key ()
   ;; Spec 0002 R10: no message can show the key.

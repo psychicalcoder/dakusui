@@ -261,10 +261,22 @@ take the agent's key: a key goes only to the server it was given for. (R3)"
                                  (cl:char= c #\-) (cl:char= c #\_)))
                         name))))
 
+  (declare loader-variable? (String -> Boolean))
+  (define (loader-variable? name)
+    "True for LD_*, ENV, and BASH_ENV, which would run code in the launcher
+before the helper flags it. (R12)"
+    (lisp (-> Boolean) (name)
+      (cl:or (cl:and (cl:>= (cl:length name) 3) (cl:string= "LD_" name :end2 3))
+             (cl:string= name "ENV")
+             (cl:string= name "BASH_ENV"))))
+
   (declare read-variable (String * Tuple String Json -> Result String (Tuple String String)))
   (define (read-variable at entry)
     (match entry
-      ((Tuple name json) (map (fn (value) (Tuple name value)) (as-string (inside at name) json)))))
+      ((Tuple name json)
+       (if (loader-variable? name)
+           (Err (<> (inside at name) " is not allowed: a loader variable would run code before the server is confined"))
+           (map (fn (value) (Tuple name value)) (as-string (inside at name) json))))))
 
   (declare read-server (Tuple String Json -> Result String McpServer))
   (define (read-server entry)

@@ -16,12 +16,12 @@
 
   (declare mcp-start (String * String -> Tuple (Result String mcp:Server) (List String)))
   (define (mcp-start name command)
-    "Start COMMAND as the server NAME in /, with a limit of 1 second, against
+    "Start COMMAND as the server NAME in /, with limits of 1 second, against
 a fake helper that agrees once. Return the server and the requests the
 helper got."
     (let fake = (fake-helper (ok-replies 1) False))
     (let c = (client:connect (.agent fake) ignore-event))
-    (let started = (mcp:start-limited c "/" name command Nil 1))
+    (let started = (mcp:start-limited c "/" name command Nil 1 1))
     (Tuple started (requests-of fake c)))
 
   (declare mcp-started (String -> mcp:Server))
@@ -46,15 +46,18 @@ helper got."
              (policies-of requests)))
      ;; Both pages, in order. The server lists tools only once initialized.
      (let specs = (tools:specs (mcp:server-tools server)))
-     (is (== (make-list "test__echo" "test__fail" "test__exit" "test__hang")
+     (is (== (make-list "test__echo" "test__fail" "test__exit" "test__hang" "test__read")
              (map chat:spec-name specs)))
-     (is (== (make-list "Echo the text." "Report an error." "End the server." "Never answer.")
+     (is (== (make-list "Echo the text." "Report an error." "End the server." "Never answer."
+                        "Read the file at the path.")
              (map chat:spec-description specs)))
      (is (== (make-list "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}"
                         "{\"type\":\"object\"}"
                         "{\"type\":\"object\",\"properties\":{}}"
-                        "{\"type\":\"object\"}")
+                        "{\"type\":\"object\"}"
+                        "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}")
              (map chat:spec-parameters specs)))
+     (is (== Nil (mcp:server-skipped server)))
      ;; Every MCP tool needs a go-ahead. (Spec 0005 R1)
      (is (list:all (fn (spec) (tools:gated? (mcp:server-tools server)
                                             (chat:ToolCall "c1" (chat:spec-name spec) "{}")))
@@ -117,6 +120,26 @@ input" (mcp-call server "test__fail" "")))
   (let fake = (fake-helper (make-list "{\"ok\":false,\"error\":\"no such process\"}") False))
   (let c = (client:connect (.agent fake) ignore-event))
   (is (== "the MCP server \"test\" did not start: the command did not run, since it could not be confined: the helper refused: no such process"
-          (mcp-error-of (mcp:start-limited c "/" "test" (mcp-script-command "") Nil 1))))
+          (mcp-error-of (mcp:start-limited c "/" "test" (mcp-script-command "") Nil 1 1))))
   (let _ = (requests-of fake c))
   Unit)
+
+(define-test mcp-a-tool-with-a-bad-name-is-skipped ()
+  (let server = (mcp-started "odd"))
+  (is (== (make-list "test__has space") (mcp:server-skipped server)))
+  (is (== (make-list "test__echo" "test__fail" "test__exit" "test__hang" "test__read")
+          (map chat:spec-name (tools:specs (mcp:server-tools server)))))
+  (mcp:stop server))
+
+(define-test mcp-tool-names-are-what-openai-takes ()
+  (is (mcp:tool-name? "test__echo"))
+  (is (mcp:tool-name? "a-B_9"))
+  (is (mcp:tool-name? (lisp (-> String) () (cl:make-string 64 :initial-element #\a))))
+  (is (not (mcp:tool-name? (lisp (-> String) () (cl:make-string 65 :initial-element #\a)))))
+  (is (not (mcp:tool-name? "")))
+  (is (not (mcp:tool-name? "a.b")))
+  (is (not (mcp:tool-name? (lisp (-> String) () (cl:string (cl:code-char 233)))))))
+
+(define-test mcp-a-server-that-lists-pages-forever-does-not-start ()
+  (is (== "the MCP server \"test\" listed more than 100 pages of tools"
+          (mcp-error-of (fst (mcp-start "test" (mcp-script-command "endless")))))))

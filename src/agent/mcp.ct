@@ -4,9 +4,11 @@
                     (#:client #:dakusui/client)
                     (#:launch #:dakusui/launch)
                     (#:tools #:dakusui/tools)
-                    (#:cell #:coalton/cell))
-  (:export #:Server #:server-name #:server-pid #:ended?
-           #:call-limit #:start #:start-limited #:server-tools #:call-tool #:stop))
+                    (#:cell #:coalton/cell)
+                    (#:list #:coalton/list))
+  (:export #:Server #:server-name #:server-pid #:ended? #:server-skipped
+           #:start-limit #:call-limit #:max-pages #:tool-name?
+           #:start #:start-limited #:server-tools #:call-tool #:stop))
 (in-package #:dakusui/mcp)
 
 ;;; Spec 0003 part 4: the MCP client. (R9, R11, R12)
@@ -16,6 +18,10 @@
 ;;; tools/list, page by page. A request reads lines until the answer with its
 ;;; id, skipping notices and unrelated lines, until its limit. A closed pipe
 ;;; marks the server ended, and every later call to it is an error result.
+;;;
+;;; Two guards keep a server from spoiling the tool list: a tool whose full
+;;; name OpenAI-compatible servers would refuse is skipped, and a server that
+;;; lists more than max-pages pages fails to start.
 ;;;
 ;;; The server starts through the launcher, so it runs confined. (R10)
 
@@ -99,10 +105,11 @@ message, nothing in time, or the end of the server."
 
   (define-struct Link
     "A running server: its name, its process, the limit on each request in
-seconds, the next request number, and whether it has ended."
+seconds (the start limit until it has started, then the call limit), the
+next request number, and whether it has ended."
     (server String)
     (process launch:Process)
-    (limit UFix)
+    (limit (cell:Cell UFix))
     (next-id (cell:Cell Integer))
     (ended (cell:Cell Boolean)))
 
@@ -113,14 +120,45 @@ seconds, the next request number, and whether it has ended."
     (schema String))
 
   (define-struct Server
-    "A started MCP server and the tools it listed."
+    "A started MCP server, the tools it listed, and the full names of those
+it listed that were skipped for a bad name."
     (link Link)
-    (listed (List Listed)))
+    (listed (List Listed))
+    (skipped (List String)))
+
+  (declare start-limit UFix)
+  (define start-limit
+    "Seconds each request at start waits, so a server that hangs does not
+hold up the session for long. (R12)"
+    30)
 
   (declare call-limit UFix)
   (define call-limit
     "Seconds a call waits for its answer. (R11)"
     120)
+
+  (declare max-pages UFix)
+  (define max-pages
+    "Pages of tools/list a server may send before its start fails."
+    100)
+
+  (declare server-skipped (Server -> List String))
+  (define (server-skipped s) (.skipped s))
+
+  (declare tool-name? (String -> Boolean))
+  (define (tool-name? name)
+    "True if NAME matches ^[A-Za-z0-9_-]{1,64}$, as OpenAI-compatible servers
+require of a tool name."
+    (lisp (-> Boolean) (name)
+      (cl:and (cl:<= 1 (cl:length name) 64)
+              (cl:every (cl:lambda (c)
+                          (cl:or (cl:char<= #\a c #\z) (cl:char<= #\A c #\Z)
+                                 (cl:char<= #\0 c #\9) (cl:char= c #\_) (cl:char= c #\-)))
+                        name))))
+
+  (declare full-name (String * String -> String))
+  (define (full-name server tool)
+    (mconcat (make-list server "__" tool)))
 
   (declare server-name (Server -> String))
   (define (server-name s) (.server (.link s)))
@@ -192,7 +230,7 @@ seconds, the next request number, and whether it has ended."
              (end link)
              Ended)
             ((Ok _)
-             (await link number (+ (now-ms) (* 1000 (into (.limit link))))))))))
+             (await link number (+ (now-ms) (* 1000 (into (cell:read (.limit link)))))))))))
 
   (declare failure (Link * String * Answer -> String))
   (define (failure link what answer)
@@ -201,7 +239,7 @@ seconds, the next request number, and whether it has ended."
       ((Answered _) "")
       ((Refused why) (mconcat (make-list (named link) " refused " what ": " why)))
       ((NoAnswer) (mconcat (make-list (named link) " did not answer " what " in "
-                                      (seconds (.limit link)))))
+                                      (seconds (cell:read (.limit link))))))
       ((Ended) (mconcat (make-list (named link) " ended before it answered " what)))))
 
   (declare initialize-params Json)
@@ -222,9 +260,10 @@ notice that cannot be sent shows at the next request."
        (Ok Unit))
       (other (Err (failure link "initialize" other)))))
 
-  (declare list-tools (Link * Optional String * List Listed -> Result String (List Listed)))
-  (define (list-tools link cursor found)
-    "FOUND, then the tools of each page from CURSOR on."
+  (declare list-tools (Link * Optional String * UFix * List Listed -> Result String (List Listed)))
+  (define (list-tools link cursor pages found)
+    "FOUND, then the tools of each page from CURSOR on, which is page PAGES.
+A server that sends more than max-pages pages fails to start."
     (let params = (match cursor
                     ((Some c) (lisp (-> Json) (c) (json-object "cursor" c)))
                     ((None) (lisp (-> Json) () (json-object)))))
@@ -242,34 +281,43 @@ notice that cannot be sent shows at the next request."
                               (cl:let ((c (simple c))) (coalton (Some (lisp (-> String) () c))))
                               (coalton None)))))
        (match next
-         ((Some c) (list-tools link (Some c) (<> found page)))
+         ((Some c)
+          (if (>= pages max-pages)
+              (Err (<> (named link) " listed more than 100 pages of tools"))
+              (list-tools link (Some c) (+ pages 1) (<> found page))))
          ((None) (Ok (<> found page)))))
       (other (Err (failure link "tools/list" other)))))
 
-  (declare start-limited (client:Client * String * String * String * List (Tuple String String) * UFix
-                          -> Result String Server))
-  (define (start-limited helper directory name command extra limit)
+  (declare start-limited (client:Client * String * String * String * List (Tuple String String)
+                          * UFix * UFix -> Result String Server))
+  (define (start-limited helper directory name command extra start-in call-in)
     "Start the server NAME: run COMMAND confined in DIRECTORY with the
-variables in EXTRA, then initialize it and list its tools, giving each
-request LIMIT seconds. An error names the server, and the process is
-stopped. (R9, R12)"
+variables in EXTRA, then initialize it and list its tools, giving each of
+these requests START-IN seconds, and each later call CALL-IN. A tool whose
+full name fails tool-name? is skipped. An error names the server, and the
+process is stopped. (R9, R12)"
     (match (launch:start-process helper directory command extra)
       ((Err why)
        (Err (mconcat (make-list "the MCP server " (chat:quoted name) " did not start: " why))))
       ((Ok process)
-       (let link = (Link name process limit (cell:new 1) (cell:new False)))
+       (let link = (Link name process (cell:new start-in) (cell:new 1) (cell:new False)))
+       (let good? = (fn (listed) (tool-name? (full-name name (.tool listed)))))
        (let started = (>>= (initialize link)
-                           (fn (_) (map (fn (listed) (Server link listed)) (list-tools link None Nil)))))
+                           (fn (_) (map (fn (listed)
+                                          (Server link (list:filter good? listed)
+                                                  (map (fn (l) (full-name name (.tool l)))
+                                                       (list:filter (fn (l) (not (good? l))) listed))))
+                                        (list-tools link None 1 Nil)))))
        (match started
          ((Err _) (end link))
-         ((Ok _) Unit))
+         ((Ok _) (cell:write! (.limit link) call-in) Unit))
        started)))
 
   (declare start (client:Client * String * String * String * List (Tuple String String)
                   -> Result String Server))
   (define (start helper directory name command extra)
-    "start-limited with the limit of R11."
-    (start-limited helper directory name command extra call-limit))
+    "start-limited with the start limit, and the call limit of R11."
+    (start-limited helper directory name command extra start-limit call-limit))
 
   (declare call-tool (Server * String * String -> String))
   (define (call-tool server tool arguments)
@@ -284,7 +332,7 @@ the result, or an error result. (R11, R12)"
          ((Answered result) (lisp (-> String) (result) (call-text result)))
          ((Refused why) (mconcat (make-list "error: " (named link) " returned an error: " why)))
          ((NoAnswer) (mconcat (make-list "error: " (named link) " did not answer in "
-                                         (seconds (.limit link)))))
+                                         (seconds (cell:read (.limit link))))))
          ((Ended) (mconcat (make-list "error: " (named link) " has ended")))))))
 
   (declare server-tools (Server -> tools:Tools))
@@ -292,7 +340,7 @@ the result, or an error result. (R11, R12)"
     "The server's tools as SERVER__TOOL, with its descriptions and schemas.
 Each needs a go-ahead. (R9, spec 0005 R1)"
     (map (fn (listed)
-           (tools:Tool (chat:ToolSpec (mconcat (make-list (server-name server) "__" (.tool listed)))
+           (tools:Tool (chat:ToolSpec (full-name (server-name server) (.tool listed))
                                       (.description listed)
                                       (.schema listed))
                        True

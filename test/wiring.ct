@@ -172,3 +172,54 @@ deny read /p/x
   (is (== Nil (requests sc)))
   (unrig r)
   Unit)
+
+;;; Spec 0003 T7: the configured MCP servers, started as main starts them.
+;;; (R1, R9, R12) The fake helper agrees to every flag, so the servers run
+;;; unconfined; make attach-check runs one confined (A9, A10).
+
+(coalton-toplevel
+  (declare mcp-configured (List (Tuple String String) -> List config:McpServer))
+  (define (mcp-configured named)
+    "The MCP servers of a configuration that names each server and its command."
+    (let entries = (map (fn ((Tuple name command))
+                          (mconcat (make-list (chat:quoted name) ": {\"command\": " (chat:quoted command) "}")))
+                        named))
+    (let text = (mconcat (make-list "{\"mcp\": {"
+                                    (lisp (-> String) (entries) (cl:format cl:nil "~{~A~^, ~}" entries))
+                                    "}}")))
+    (config:config-servers (unwrap (config:parse-config text (env-of Nil)))))
+
+  (declare mcp-wired (Rig * List (Tuple String String) -> Tuple (List String) (List String)))
+  (define (mcp-wired r named)
+    "Start the servers NAMED as main does. Return the names of the tool list
+and the warnings, after stopping the servers."
+    (let (Tuple lines warn) = (capture))
+    (let servers = (agent:start-servers (.client r) (rig-project r) (mcp-configured named) warn))
+    (let names = (map chat:spec-name (tools:specs (agent:tool-list (.sessions r) (.dlog r) servers))))
+    (let _ = (map mcp:stop servers))
+    (Tuple names (captured lines))))
+
+(define-test wiring-0003-a1-builtin-tools-then-each-servers ()
+  (let r = (make-rig Nil))
+  (is (== (Tuple (make-list "bash" "show_policy" "test__echo" "test__fail" "test__exit"
+                            "test__hang" "test__read")
+                 Nil)
+          (mcp-wired r (make-list (Tuple "test" (mcp-script-command ""))))))
+  (unrig r)
+  Unit)
+
+(define-test wiring-0003-a10-a-server-that-fails-is-skipped-with-a-warning ()
+  (let r = (make-rig Nil))
+  (is (== (Tuple (make-list "bash" "show_policy" "test__echo" "test__fail" "test__exit"
+                            "test__hang" "test__read")
+                 (make-list "dakusui: the MCP server \"gone\" ended before it answered initialize; skipping it"))
+          (mcp-wired r (make-list (Tuple "gone" "/nonexistent/dakusui-mcp-server")
+                                  (Tuple "test" (mcp-script-command ""))))))
+  ;; A tool with a bad name is skipped, the rest kept.
+  (match (mcp-wired r (make-list (Tuple "test" (mcp-script-command "odd"))))
+    ((Tuple names warnings)
+     (is (== 7 (list:length names)))
+     (is (== (make-list "dakusui: skipping the MCP tool \"test__has space\": a tool name must match ^[A-Za-z0-9_-]{1,64}$")
+             warnings))))
+  (unrig r)
+  Unit)

@@ -5,8 +5,8 @@
 # 1. build/attach-check: T8 through T14, T28, T30, and T31 for itself.
 # 2. The real helper with the check agent, the acceptance harness (T21):
 #    A1 through A18, the first half of A19, the random-policy test (T22), and
-#    the torn-walk test (T23), and spec 0003 A3, A4, and A6 through the bash
-#    tool. The helper gets an API key and BASH_ENV, which
+#    the torn-walk test (T23), spec 0003 A3, A4, and A6 through the bash
+#    tool, and spec 0003 A9 and A10 through the test MCP server. The helper gets an API key and BASH_ENV, which
 #    no command may see. A6 kills the helper, so its exit code says nothing:
 #    the agent's last line does.
 # 3. The real helper again: its start must end A19's victim (T30), and its
