@@ -89,9 +89,9 @@ escapes it, and marking for it would mark every directory. (R6)"
 
   (declare allows-rename? (Policy * String * String -> Boolean))
   (define (allows-rename? pol old new)
-    "True if POL lets a confined process rename OLD to NEW: both need write
-(R5), and neither may be held (R6). Renaming over NEW, or swapping the two,
-asks the same."
-    (let write = (Kinds Write Nil))
-    (and (allows? pol write old) (allows? pol write new)
+    "True if POL lets a confined process rename OLD to NEW: both need read and
+write (R5), and neither may be held (R6). Renaming over NEW, or swapping the
+two, asks the same."
+    (let both = (Kinds Read (make-list Write)))
+    (and (allows? pol both old) (allows? pol both new)
          (not (held? pol old)) (not (held? pol new)))))

@@ -59,7 +59,10 @@ away. A name rule marks nothing, since it matches wherever the file goes, and
 marking for it would mark every directory. The mark covers its exact path,
 not the paths beneath it. The rename hook takes the mark of the full path from
 its last prefix lookup, for the old and the new path, and denies with "holds
-a denied path" when either is held and write is allowed (R6, A22). A swap
+a denied path" when either is held and write is allowed (R6, A22). The hook
+also needs read at both paths, from the same walk, so a read-denied file
+cannot move out or be replaced; a rule's deny or no match is the reason given
+before the mark, and the event's kind is `read,write` (R5, A24). A swap
 rebuilds the marks with the rest, so removing a rule clears them.
 
 **3. Policy library** (Coalton, used by both programs)
@@ -243,7 +246,7 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
 - R4: policy swap; open descriptors are untouched because there is no read or
   write hook.
 - R5, R6: hook list; `path_link` always denies; the walk's sequence check;
-  the `held` marks at `path_rename`.
+  the `held` marks and read and write at both paths at `path_rename`.
 - R7: `denials` ring buffer and the pushed event.
 - R8: `show_policy` tool.
 - R9: helper exits on any startup failure; the agent refuses to run commands if
@@ -297,10 +300,10 @@ exec keeps ignored signals. If the flag fails, the agent closes the pipe on fd
   cannot rename a deny rule's path or its ancestors. An unconfined process
   still can, and the rule then no longer covers the files. The marks also
   stop a command from renaming the project directory or the home directory,
-  which the default denies sit beneath, or any directory above them. Renames inside the project are unaffected. Still open: a rule that
-  denies only read, under an allowed write, lets a command move a file out
-  from beneath it, as in `mv P/anc/sub/secret P/x`. R6 names the path and its
-  ancestors only.
+  which the default denies sit beneath, or any directory above them. Renames inside the project are unaffected. A rule that
+  denies only read, under an allowed write, no longer lets a command move a
+  file out from beneath it, as in `mv P/anc/sub/secret P/x`: T35 makes a
+  rename need read at both paths (R5).
 - **The unflagged launcher.** From its spawn until the helper flags it, the
   launcher runs unconfined. In that window it runs only `/bin/sh` up to its
   `read`, with an absolute path, and the command is still an argument. The

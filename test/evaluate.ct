@@ -82,8 +82,8 @@
   ;; Renaming another directory over /p/anc.
   (is (not (policy:allows-rename? p "/p/other" "/p/anc")))
   (is (policy:allows-rename? p "/p/other" "/p/other2"))
-  ;; Beneath the denied path, nothing is held: write decides.
-  (is (policy:allows-rename? p "/p/anc/sub/f" "/p/anc/sub/g"))
+  ;; Beneath the denied path, nothing is held, but read is denied (A24).
+  (is (not (policy:allows-rename? p "/p/anc/sub/f" "/p/anc/sub/g")))
   (is (policy:allows-rename? p "/p/anc/f" "/p/anc/g"))
   ;; The project itself holds the denied path.
   (is (not (policy:allows-rename? p "/p" "/p2")))
@@ -96,6 +96,20 @@
   (is (policy:allows-rename? p "/p/a" "/p/b"))
   (is (not (policy:allows-rename? p "/p/a" "/r/b")))
   (is (not (policy:allows-rename? p "/r/a" "/p/b"))))
+
+;;; T35: a rename needs read at both ends too. (R5, R6, A24)
+
+(define-test evaluate-a24-rename-needs-read-on-both-paths ()
+  (let p = (policy-of (make-list "allow read /" "allow read,write /p" "deny read /p/anc/sub")))
+  ;; mv /p/anc/sub/secret /p/x: no mark beneath the denied path, but no read.
+  (is (not (policy:allows-rename? p "/p/anc/sub/secret" "/p/x")))
+  ;; mv /p/y over /p/anc/sub/secret.
+  (is (not (policy:allows-rename? p "/p/y" "/p/anc/sub/secret")))
+  (is (policy:allows-rename? p "/p/y" "/p/z"))
+  ;; Write alone is not enough at either end.
+  (let q = (policy-of (make-list "allow write /w" "allow read,write /p")))
+  (is (not (policy:allows-rename? q "/w/a" "/p/b")))
+  (is (not (policy:allows-rename? q "/p/a" "/w/b"))))
 
 (define-test evaluate-held-follows-path-deny-rules-only ()
   (let p = (policy-of (make-list "allow read,write /a/b" "deny read,write name:.env")))
@@ -120,6 +134,9 @@
   (is (policy:allows-rename? p "/home/u/proj/src" "/home/u/proj/src2"))
   (is (policy:allows-rename? p "/home/u/proj/a.c" "/home/u/proj/b.c"))
   (is (policy:allows-rename? p "/tmp/a" "/tmp/b"))
+  ;; Out of /tmp into the project: both read- and write-allowed.
+  (is (policy:allows-rename? p "/tmp/a" "/home/u/proj/a"))
+  (is (not (policy:allows-rename? p "/home/u/proj/.env" "/home/u/proj/env")))
   (is (policy:held? p "/home/u"))
   (is (policy:held? p "/home/u/.ssh"))
   (is (policy:held? p "/"))

@@ -142,7 +142,7 @@ a task that can run in parallel with the one before it. The spike code in
   rename whose old or new path is marked, with the reason "holds a denied
   path". (R6, R7) Done when compiler tests cover the marks, the reference
   evaluator gives the same verdicts, and A22 is in the acceptance harness.
-- [ ] T35 Make a rename need read and write at both its old and new path.
+- [x] T35 Make a rename need read and write at both its old and new path.
   (R5, R6) Done when the reference evaluator and T22's rename probes agree,
   and A24 is in the acceptance harness.
 - [ ] T24 Fill in the spec's verification table, set its status to Implemented,

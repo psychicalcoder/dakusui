@@ -515,25 +515,27 @@ int BPF_PROG(e_path_symlink, const struct path *dir, struct dentry *dentry,
 	return decide(H_SYMLINK, KIND_WRITE, 0, launder(dentry), mnt_of(dir));
 }
 
-/* Both paths need write, and neither may hold a denied path (R6, A22): not
- * the old, so no denied file moves out from under its rule, and not the new,
- * so no directory is renamed over one. With RENAME_EXCHANGE the two swap, and
- * the same checks cover both. */
+/* Both paths need read and write (R5, A24), and neither may hold a denied
+ * path (R6, A22): not the old, so no denied file moves out from under its
+ * rule, and not the new, so no directory is renamed over one. Read at the old
+ * path keeps a read-denied file from moving out of its rule's reach; read at
+ * the new path keeps a file from replacing a read-denied one. One walk per
+ * path decides both kinds. With RENAME_EXCHANGE the two swap, and the same
+ * checks cover both. */
 SEC("lsm/path_rename")
 int BPF_PROG(e_path_rename, const struct path *old_dir,
 	     struct dentry *old_dentry, const struct path *new_dir,
 	     struct dentry *new_dentry, unsigned int flags)
 {
+	__u32 both = KIND_READ | KIND_WRITE;
 	int r;
 
 	if (!is_confined(bpf_get_current_task_btf()))
 		return 0;
-	r = decide(H_RENAME_OLD, KIND_WRITE, 1, launder(old_dentry),
-		   mnt_of(old_dir));
+	r = decide(H_RENAME_OLD, both, 1, launder(old_dentry), mnt_of(old_dir));
 	if (r)
 		return r;
-	return decide(H_RENAME_NEW, KIND_WRITE, 1, launder(new_dentry),
-		      mnt_of(new_dir));
+	return decide(H_RENAME_NEW, both, 1, launder(new_dentry), mnt_of(new_dir));
 }
 
 /* Deny, and log it (R7), for hooks that refuse every confined caller. */

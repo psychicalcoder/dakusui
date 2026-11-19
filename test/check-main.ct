@@ -16,6 +16,7 @@
                   (check-a4 c s)
                   (check-links c s)
                   (check-a22 c s)
+                  (check-a24 c s)
                   (check-a7 c s)
                   (check-a8 c)
                   (make-list (check-a10 c))

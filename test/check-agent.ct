@@ -19,7 +19,7 @@
 ;;; agent's own code. make attach-check puts it next to a copy of the real
 ;;; helper, which starts it as it starts the real agent. It builds a temp tree,
 ;;; sends the session policy, and runs one check per acceptance case, A1
-;;; through A19 and A22, through the launcher, plus the spike's other cases. The
+;;; through A19, A22, and A24, through the launcher, plus the spike's other cases. The
 ;;; random-policy test (T22) and the torn-walk test (T23) live in
 ;;; check-stress.ct, and the order of the run in check-main.ct.
 ;;;
@@ -114,6 +114,7 @@ through the symlink BASE/homelink (A17)."
       (write-text (at "outside/secret") "outside")
       (make-symlink (at "outside/secret") (at "p/link"))
       (write-text (at "anc/sub/secret") "ancestor")
+      (write-text (at "y") "y")
       (cl:ensure-directories-exist (at "other/"))
       (cl:ensure-directories-exist (at "data/s/"))
       (make-symlink (at "data/s") (at "s"))
@@ -408,7 +409,7 @@ descriptor go on, and a new open fails."
                     "A7 an open descriptor survives a deny, a new open does not"
                     (mconcat (map (fn (line) (<> line "; ")) lines))))))))))
 
-;;; A5, A9, A22, and the spike's other cases for R5 and R6.
+;;; A5, A9, A22, A24, and the spike's other cases for R5 and R6.
 
 (coalton-toplevel
   (declare check-links (Ctx * session:Session -> List Boolean))
@@ -433,6 +434,12 @@ descriptor go on, and a new open fails."
   (define (check-reason c label command reason)
     "Run COMMAND in the project. It must fail with a permission error, and a
 new line of the denial log must give REASON."
+    (check-log-line c label command (make-list reason)))
+
+  (declare check-log-line (Ctx * String * String * List String -> Boolean))
+  (define (check-log-line c label command parts)
+    "Run COMMAND in the project. It must fail with a permission error, and one
+new line of the denial log must hold every text in PARTS."
     (let before = (list:length (log-lines (.log-file c))))
     (match (run-in c command)
       ((Err why) (verdict False label why))
@@ -444,7 +451,9 @@ new line of the denial log must give REASON."
        (verdict (and (/= code 0)
                      (or (string:substring? "Permission denied" output)
                          (string:substring? "PermissionError" output))
-                     (list:any (fn (line) (string:substring? reason line)) new))
+                     (list:any (fn (line)
+                                 (list:all (fn (part) (string:substring? part line)) parts))
+                               new))
                 label
                 (mconcat (make-list "(exit " (show-i32 code) ") " output "; log: "
                                     (mconcat (map (fn (line) (<> line "; ")) new))))))))
@@ -460,8 +469,9 @@ new line of the denial log must give REASON."
   (declare check-a22 (Ctx * session:Session -> List Boolean))
   (define (check-a22 c s)
     "deny read BASE/anc/sub, where BASE is writable through /tmp. Renaming
-BASE/anc or BASE/anc/sub, or another directory over BASE/anc, fails with the
-reason, so no denied file moves out from under its rule. Renaming BASE/other
+BASE/anc or BASE/anc/sub, or another directory over BASE/anc, fails, so no
+denied file moves out from under its rule. The reason is the mark, but for
+BASE/anc/sub, whose read the rule denies. Renaming BASE/other
 succeeds, and so does renaming BASE/anc once the rule is gone. The project
 holds the fixed deny on .dakusui, so it cannot be renamed either."
     (let anc = (in-base c "anc"))
@@ -477,8 +487,11 @@ holds the fixed deny on .dakusui, so it cannot be renamed either."
             (make-list
              (check-reason c "A22 mv an ancestor of a denied directory"
                            (mconcat (make-list "mv " anc " " anc "2")) reason)
+             ;; Read is denied there too (A24), and a rule's deny is the
+             ;; reason given before the mark.
              (check-reason c "A22 mv the denied directory itself"
-                           (mconcat (make-list "mv " anc "/sub " (in-base c "sub2"))) reason)
+                           (mconcat (make-list "mv " anc "/sub " (in-base c "sub2")))
+                           "denied by rule")
              (check-reason c "A22 rename another directory over the ancestor"
                            (py-rename other anc) reason)
              (check c "A22 renaming a directory that holds no denied path succeeds"
@@ -501,6 +514,33 @@ holds the fixed deny on .dakusui, so it cannot be renamed either."
          (rename-back (<> anc "2") anc)
          moved)))
     (<> held (make-list removed)))
+
+  (declare check-a24 (Ctx * session:Session -> List Boolean))
+  (define (check-a24 c s)
+    "deny read BASE/anc/sub, where BASE is writable through /tmp. A rename
+needs read and write at both ends (R5), so moving BASE/anc/sub/secret out, or
+BASE/y over it, fails and logs the rule's deny for both kinds. Moving BASE/y
+to BASE/z succeeds."
+    (let secret = (in-base c "anc/sub/secret"))
+    (let y = (in-base c "y"))
+    (let z = (in-base c "z"))
+    (let logged = (fn (path) (make-list (<> "denied read,write of " path) "denied by rule")))
+    (with-rules c s "A24" (make-list (<> "deny read " (in-base c "anc/sub")))
+      (fn (_)
+        (let results =
+          (make-list
+           (check-log-line c "A24 mv a read-denied file out"
+                           (mconcat (make-list "mv " secret " " (in-base c "x")))
+                           (logged secret))
+           (check-log-line c "A24 mv a file over a read-denied file"
+                           (mconcat (make-list "mv " y " " secret))
+                           (logged secret))
+           (check c "A24 mv a file that no rule denies succeeds"
+                  (mconcat (make-list "mv " y " " z " && mv " z " " y " && echo moved"))
+                  (Succeeds "moved"))))
+        (rename-back (in-base c "x") secret)
+        (rename-back z y)
+        results)))
 
   (declare check-spike (Ctx -> List Boolean))
   (define (check-spike c)
