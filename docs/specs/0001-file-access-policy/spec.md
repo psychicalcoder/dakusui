@@ -35,7 +35,8 @@ enforces the policy, and the user can change it while commands run.
   A descriptor that is already open keeps working.
 - R5: Rules MUST distinguish two access kinds, read and write. Executing a file
   and listing a directory count as read. Creating, deleting, renaming, and
-  truncating count as write.
+  truncating count as write. A rename also counts as read at both its old and
+  new path, so a read-denied file cannot be moved out of its rule's reach.
 - R6: A confined process MUST NOT create hard links. Symlinks, renames, and
   io_uring MUST NOT bypass a rule. A rename that races a check MUST NOT make
   the check allow a path that never existed. A confined process MUST NOT
@@ -140,6 +141,10 @@ enforces the policy, and the user can change it while commands run.
   directory over `/p/anc`, then each fails with a permission error, and the
   log gives the reason. Renaming `/p/other` succeeds. After the rule is
   removed, `mv /p/anc /p/anc2` succeeds.
+- A24 (R5, R6): Given `deny read /p/anc/sub` in a writable `/p`, when a
+  command runs `mv /p/anc/sub/secret /p/x`, or moves `/p/y` over
+  `/p/anc/sub/secret`, then each fails with a permission error. `mv /p/y /p/z`
+  succeeds.
 - A23 (R6): Given denied `t/a/s` and `t/b/t`, renames of one to the other and
   back, and four confined readers that open the secret under both names for
   five seconds, then no open succeeds.
@@ -217,8 +222,8 @@ Design choices made while writing this spec live in the ADRs:
 | R2 | A3 | Not started |
 | R3 | A1, A11 | Not started |
 | R4 | A4, A7 | Not started |
-| R5 | A12 | Not started |
-| R6 | A5, A9, A22, A23 | Not started |
+| R5 | A12, A24 | Not started |
+| R6 | A5, A9, A22, A23, A24 | Not started |
 | R7 | A13 | Not started |
 | R8 | A14 | Not started |
 | R9 | A6, A19 | Not started |
