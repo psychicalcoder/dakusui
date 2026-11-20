@@ -10,6 +10,9 @@ the agent runs. An optional judge model approves commands in auto mode. Dakusui
 is written in Coalton and talks to any OpenAI-compatible chat completions
 server.
 
+> [!WARNING]
+> This project is an AI (mainly Claude Opus 5.5) developed slop, developed with an unsophisticated language.
+
 ## Architecture
 
 ```
