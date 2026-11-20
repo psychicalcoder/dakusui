@@ -1,0 +1,111 @@
+(defpackage #:dakusui/loop
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:chat #:dakusui/chat)
+                    (#:provider #:dakusui/provider)
+                    (#:tools #:dakusui/tools)
+                    (#:terminal #:dakusui/terminal)
+                    (#:list #:coalton/list)
+                    (#:string #:coalton/string))
+  (:export #:Conversation #:Gate #:system-prompt #:new-conversation
+           #:max-calls #:run-turn #:short-form))
+(in-package #:dakusui/loop)
+
+;;; One turn of the conversation. (Spec 0002 R1, R3, R5, R6, R7, R8)
+;;;
+;;; The turn is handed its provider, tools, gate, and terminal, so tests
+;;; script all four. Every call of a reply runs before the next request, so the
+;;; conversation never holds a tool call without its result.
+
+(coalton-toplevel
+  (define-type-alias Conversation (List chat:Message)
+    "The messages so far, the system prompt first.")
+
+  (define-type-alias Gate (chat:ToolCall * Conversation -> Result String Unit)
+    "Says whether a call may run, given the conversation that led to it. Err
+holds the reason it may not. (Spec 0005 R1)")
+
+  (declare system-prompt (String -> String))
+  (define (system-prompt project)
+    "The first message, for the project directory PROJECT. (R7)"
+    (mconcat
+     (make-list
+      "You are Dakusui, a coding agent in a terminal. The project directory is " project ".
+Run commands with the bash tool. Each starts in the project directory, with sh.
+The kernel confines every command to a file access policy. A denied access fails with \"Permission denied\", and the bash result lists each denial and the reason.
+Call show_policy to see the policy in force. Only the user can change it.")))
+
+  (declare new-conversation (String -> Conversation))
+  (define (new-conversation project)
+    (make-list (chat:System (system-prompt project))))
+
+  (declare max-calls UFix)
+  (define max-calls
+    "The most model calls in one turn. (R5)"
+    50)
+
+  (declare short-form (String -> String))
+  (define (short-form text)
+    "The first line of TEXT, cut at 100 characters, and how many lines follow."
+    (lisp (-> String) (text)
+      (cl:let* ((lines (cl:loop :with start := 0
+                                :for end := (cl:position #\Newline text :start start)
+                                :collect (cl:subseq text start (cl:or end (cl:length text)))
+                                :while end
+                                :do (cl:setf start (cl:1+ end))))
+                (lines (cl:if (cl:and (cl:rest lines) (cl:string= (cl:car (cl:last lines)) ""))
+                              (cl:butlast lines)
+                              lines))
+                (first (cl:first lines))
+                (more (cl:1- (cl:length lines))))
+        (cl:format cl:nil "~A~:[~;...~]~[~:;~:* (~D more lines)~]"
+                   (cl:subseq first 0 (cl:min 100 (cl:length first)))
+                   (cl:> (cl:length first) 100)
+                   more))))
+
+  (declare run-calls (tools:Tools * Gate * terminal:Terminal * Conversation * List chat:ToolCall
+                      -> List chat:Message))
+  (define (run-calls tools gate say conversation calls)
+    "Run CALLS in order. Show each before it runs, and its result after. A
+call to a gated tool runs only if GATE says yes; else the reason is its
+result. (R3, R8; spec 0005 R1)"
+    (match calls
+      ((Nil) Nil)
+      ((Cons c rest)
+       (say (mconcat (make-list "[" (chat:call-name c) "] " (chat:call-arguments c))))
+       (let allowed = (if (tools:gated? tools c) (gate c conversation) (Ok Unit)))
+       (let result = (match allowed
+                       ((Ok _) (tools:call tools c))
+                       ((Err reason) reason)))
+       (say (<> "  = " (short-form result)))
+       (Cons (chat:ToolResult (chat:call-id c) result) (run-calls tools gate say conversation rest)))))
+
+  (declare turn-loop (provider:Provider * tools:Tools * Gate * terminal:Terminal * Conversation * UFix
+                      -> Tuple Conversation (Result String Unit)))
+  (define (turn-loop ask tools gate say conversation made)
+    (if (>= made max-calls)
+        (progn
+          (say "dakusui: the turn stopped after 50 model calls")
+          (Tuple conversation (Err "the turn stopped after 50 model calls")))
+        (match (ask conversation (tools:specs tools))
+          ((Err why)
+           (say (<> "dakusui: " why))
+           (Tuple conversation (Err why)))
+          ((Ok reply)
+           (let text = (chat:reply-text reply))
+           (let calls = (chat:reply-calls reply))
+           (match text
+             ((Some words) (if (== words "") Unit (say words)))
+             ((None) Unit))
+           (let asked = (<> conversation (make-list (chat:Assistant text calls))))
+           (let next = (<> asked (run-calls tools gate say asked calls)))
+           (if (list:null? calls)
+               (Tuple next (Ok Unit))
+               (turn-loop ask tools gate say next (+ made 1)))))))
+
+  (declare run-turn (provider:Provider * tools:Tools * Gate * terminal:Terminal * Conversation * String
+                     -> Tuple Conversation (Result String Unit)))
+  (define (run-turn ask tools gate say conversation text)
+    "Send TEXT, then run the tools the model asks for, as GATE allows, until a
+reply asks for none. Stop after 50 model calls. On a provider error, print it and return the
+conversation as gathered. (R1, R3, R5, R6)"
+    (turn-loop ask tools gate say (<> conversation (make-list (chat:User text))) 0)))

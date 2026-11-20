@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Shared by the enforcer (BPF) and its test driver. Spike 2 for spec 0001. */
+/* Shared by the enforcer (BPF) and its userspace. Spec 0001. */
 #ifndef ENFORCE_H
 #define ENFORCE_H
 
@@ -14,7 +14,8 @@
 
 enum { KIND_READ = 1, KIND_WRITE = 2 };
 
-/* Why a request was denied. Everything but the last two fails closed. */
+/* Why a request was denied. ST_DEEP through ST_ERR, and ST_MOVED, fail closed
+ * on a walk that went wrong. Never renumber: the helper names each value. */
 enum {
 	ST_OK,
 	ST_DEEP,
@@ -25,6 +26,9 @@ enum {
 	ST_NOMATCH,
 	ST_DENYRULE,
 	ST_ALWAYS, /* hooks that deny every confined caller */
+	ST_GONE,   /* the helper is gone, so nothing is allowed (ADR 0008) */
+	ST_MOVED,  /* renames kept changing the path; fails closed too */
+	ST_HELD,   /* a rename of a path that holds a denied one (R6) */
 };
 
 enum {
@@ -51,11 +55,23 @@ struct rule_key {
 	char s[KEY_LEN];
 };
 
-/* Index 0 is read, index 1 is write. seq 0 means "no rule for this kind". */
+/* Index 0 is read, index 1 is write. seq 0 means "no rule for this kind".
+ * held is 1 on a path entry that a path deny rule names, or that is an
+ * ancestor of one: a confined task may not rename it (R6). It applies to the
+ * entry's exact path, not to the paths beneath it. */
 struct rule_val {
 	__u32 seq[2];
 	__u8 effect[2]; /* 1 allow, 0 deny */
-	__u8 pad[2];
+	__u8 held;
+	__u8 pad;
+};
+
+/* The helper's liveness (ADR 0008). The helper writes its pid; the enforcer
+ * records its start time the first time the helper opens a file. */
+struct helper_info {
+	__s32 pid;
+	__u32 pad;
+	__u64 start; /* task_struct start_time, in ns; 0 until recorded */
 };
 
 struct denial {

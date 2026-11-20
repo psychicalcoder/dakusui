@@ -1,0 +1,134 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0002 T5: the commands and the prompt loop. (R1, R9) Lines come from a
+;;; list, the terminal is captured, and the provider is scripted, so a test
+;;; can see that no command reaches the model.
+
+(coalton-toplevel
+  (declare typed (List String -> (Void -> Optional String)))
+  (define (typed input)
+    "A line reader that gives the lines of INPUT, then the end of input."
+    (let left = (cell:new input))
+    (fn ()
+      (match (cell:read left)
+        ((Cons line rest)
+         (cell:write! left rest)
+         (Some line))
+        ((Nil) None))))
+
+  (declare rig-set (Rig -> String))
+  (define (rig-set r)
+    "The file of the set `default` in the rig's project."
+    (<> (rig-project r) "/.dakusui/rules/default"))
+
+  (declare typed-session-to (Rig * String * List String * Script -> List String))
+  (define (typed-session-to r set-file input sc)
+    "Run the prompt loop on INPUT, saving rule changes to SET-FILE. Return the
+terminal's lines."
+    (let (Tuple lines say) = (capture))
+    (commands:prompt-loop (scripted sc) (rig-tools r) (unwrap (gate:new-mode False yes-gate (Err "no judge")))
+                          (.sessions r) set-file say (typed input)
+                          (turn:new-conversation (rig-project r)))
+    (captured lines))
+
+  (declare typed-session (Rig * List String * Script -> List String))
+  (define (typed-session r input sc)
+    "Run the prompt loop on INPUT, with the rig's own set. Return the
+terminal's lines."
+    (typed-session-to r (rig-set r) input sc))
+
+  (declare printed? (String * List String -> Boolean))
+  (define (printed? part lines)
+    (list:any (fn (line) (has? line part)) lines)))
+
+(define-test parse-command-reads-each-command ()
+  (is (== (Ok commands:ShowPolicy) (commands:parse-command "/policy")))
+  (is (== (Ok (commands:AddRule (rule-of "deny read /p/x"))) (commands:parse-command "/deny read /p/x")))
+  (is (== (Ok (commands:AddRule (rule-of "allow read,write /my\\ dir")))
+          (commands:parse-command "/allow read,write /my\\ dir")))
+  (is (== (Ok (commands:RemoveRule 2)) (commands:parse-command "/remove 2")))
+  (is (== (Ok commands:Clear) (commands:parse-command "/clear")))
+  (is (== (Ok commands:Help) (commands:parse-command "/help")))
+  (is (== (Ok commands:Quit) (commands:parse-command "/quit ")))
+  (is (== (Ok (commands:Auto None)) (commands:parse-command "/auto")))
+  (is (== (Ok (commands:Auto (Some True))) (commands:parse-command "/auto on")))
+  (is (== (Ok (commands:Auto (Some False))) (commands:parse-command "/auto  off ")))
+  (is (== (Err "/auto takes on, off, or nothing") (commands:parse-command "/auto yes")))
+  (is (== (Err "/remove takes a rule number, as /policy shows it") (commands:parse-command "/remove x")))
+  (is (== (Err "/remove takes a rule number, as /policy shows it") (commands:parse-command "/remove 0")))
+  (is (== (Err "/policy takes nothing after it") (commands:parse-command "/policy now")))
+  (is (== (Err "unknown command /nosuch; /help lists the commands") (commands:parse-command "/nosuch"))))
+
+(define-test commands-a8-rules-change-through-commands-and-never-reach-the-model ()
+  (let r = (make-rig Nil))
+  (let sc = (make-script (make-list (Ok (text-reply "never")))))
+  (let lines = (typed-session r (make-list "/deny read /p/x" "/policy" "/remove 1" "/policy"
+                                          "/allow read x" "/nosuch" "/help")
+                             sc))
+  (is (== Nil (requests sc)))
+  (is (== (Some "added rule 1: deny read /p/x") (list:index 0 lines)))
+  (let first-listing = (with-default "" (list:index 1 lines)))
+  (is (has? first-listing "The session's rule set; later rules win:
+  1 deny read /p/x
+The fixed last rule:"))
+  (is (has? first-listing "The default rules:
+  allow read /
+"))
+  (is (== (Some "removed rule 1") (list:index 2 lines)))
+  (is (has? (with-default "" (list:index 3 lines)) "The session's rule set; later rules win:
+  (none)"))
+  (is (== (Some "dakusui: relative path \"x\": a path must be absolute")
+          (list:index 4 lines)))
+  (is (== (Some "dakusui: unknown command /nosuch; /help lists the commands") (list:index 5 lines)))
+  (is (== (Some commands:help-text) (list:index 6 lines)))
+  ;; The helper got the start, the add, and the remove.
+  (is (== 3 (op-count "policy" (unrig r)))))
+
+(cl:defun listed-rules (listing)
+  "The rule lines of a /policy listing, without their indent and numbers."
+  (cl:with-input-from-string (in listing)
+    (cl:loop :for line := (cl:read-line in cl:nil)
+             :while line
+             :when (cl:and (cl:> (cl:length line) 2) (cl:string= "  " line :end2 2)
+                           (cl:string/= "  (none)" line))
+               :collect (cl:let* ((text (cl:subseq line 2))
+                                  (space (cl:position #\Space text)))
+                          (simple-string
+                           (cl:if (cl:every #'cl:digit-char-p (cl:subseq text 0 space))
+                                  (cl:subseq text (cl:1+ space))
+                                  text))))))
+
+;;; Spec 0003 A7: show_policy returns the rules /policy lists.
+(define-test tools-a7-show-policy-has-the-rules-that-policy-lists ()
+  (let r = (make-rig Nil))
+  (let sc = (make-script (make-list (Ok (text-reply "never")))))
+  (let lines = (typed-session r (make-list "/deny read /p/x" "/policy") sc))
+  (let listing = (with-default "" (list:index 1 lines)))
+  (let shown = (tool-call r "show_policy" "{}"))
+  (is (has? shown "deny read /p/x"))
+  (is (== (list:filter (fn (line) (/= line "")) (string:split #\Newline shown))
+          (lisp (-> (List String)) (listing) (listed-rules listing))))
+  (unrig r)
+  Unit)
+
+(define-test commands-a9-clear-forgets-the-conversation ()
+  (let r = (make-rig Nil))
+  (let sc = (make-script (make-list (Ok (text-reply "ok")))))
+  (let lines = (typed-session r (make-list "one" "two" "/clear" "three") sc))
+  (let system = (chat:System (turn:system-prompt (rig-project r))))
+  (is (== 3 (list:length (requests sc))))
+  (is (== (Some (make-list system (chat:User "one") (chat:Assistant (Some "ok") Nil) (chat:User "two")))
+          (list:index 1 (requests sc))))
+  (is (== (Some (make-list system (chat:User "three"))) (list:index 2 (requests sc))))
+  (is (printed? "The conversation is cleared." lines))
+  (unrig r)
+  Unit)
+
+(define-test commands-a6-the-prompt-returns-after-a-provider-error ()
+  (let r = (make-rig Nil))
+  (let sc = (make-script (make-list (Err "the provider answered 401: bad key"))))
+  (let lines = (typed-session r (make-list "hi" "/help" "/quit" "never") sc))
+  (is (== (make-list "dakusui: the provider answered 401: bad key" commands:help-text) lines))
+  (is (== 1 (list:length (requests sc))))
+  (unrig r)
+  Unit)

@@ -1,0 +1,80 @@
+(in-package #:dakusui/policy)
+
+;;; The default policy. (R3)
+;;;
+;;; The directories come from the system, not from rule text, so they hold
+;;; literal paths: no escapes, and any character a path may hold.
+
+(coalton-toplevel
+  (declare directory-pattern (String * String -> Result String Pattern))
+  (define (directory-pattern label path)
+    (result:map-err (fn (message) (mconcat (make-list label ": " message)))
+                    (parse-path path path)))
+
+  (declare default-policy (String * String -> Result String Policy))
+  (define (default-policy project home)
+    "The rules of R3 for the directories PROJECT and HOME. A directory that is
+not an absolute path is an error, since the rules would then protect the wrong
+place."
+    (let read-write = (Kinds Read (make-list Write)))
+    (let write-only = (Kinds Write Nil))
+    (let base = (trim-slash home))
+    (let secret-rule =
+      (fn (sub)
+        (map (fn (pat) (Rule Deny read-write pat))
+             (directory-pattern "home directory" (string:concat base sub)))))
+    (do
+     (project-pattern <- (directory-pattern "project directory" project))
+     (directory-pattern "home directory" home)
+     (secrets <- (traverse secret-rule
+                           (make-list "/.ssh" "/.aws" "/.gnupg" "/.config/dakusui")))
+     (pure
+      (Policy
+       (mconcat
+        (make-list
+         (make-list
+          (Rule Allow (Kinds Read Nil) (PathPrefix "/"))
+          (Rule Allow read-write project-pattern)
+          (Rule Allow write-only (PathPrefix "/tmp"))
+          (Rule Allow write-only (PathPrefix "/dev/null"))
+          (Rule Allow write-only (PathPrefix "/dev/tty")))
+         secrets
+         (make-list (Rule Deny read-write (FileName ".env")))))))))
+
+  (declare session-policy (String * String * List Rule -> Result String Policy))
+  (define (session-policy project home set-rules)
+    "The default policy, then SET-RULES, then a deny that no set can override, so
+a confined command cannot change the stored rule sets. (R14, R11)"
+    (do
+     (default <- (default-policy project home))
+     (rule-sets <- (directory-pattern
+                    "project directory"
+                    (string:concat (trim-slash project) "/.dakusui")))
+     (pure
+      (match default
+        ((Policy rules)
+         (Policy
+          (mconcat
+           (make-list rules
+                      set-rules
+                      (make-list (Rule Deny (Kinds Write Nil) rule-sets)))))))))))
+
+;;; Symlinks. (R13)
+;;;
+;;; The enforcer matches real paths. The caller resolves a path, since that
+;;; needs the file system, and this library checks that the result is still a
+;;; path a rule can name.
+
+(coalton-toplevel
+  (declare resolve-rule ((String -> String) * Rule -> Result String Rule))
+  (define (resolve-rule resolve r)
+    "The rule R with its path passed through RESOLVE. A name rule has no path."
+    (match r
+      ((Rule effect kinds (PathPrefix path))
+       (let real = (resolve path))
+       (map (fn (pat) (Rule effect kinds pat))
+            (result:map-err (fn (message)
+                              (mconcat (make-list "cannot resolve " (quoted path)
+                                                  ": " message)))
+                            (parse-path real real))))
+      (_ (Ok r)))))

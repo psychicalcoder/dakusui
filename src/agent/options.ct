@@ -1,0 +1,48 @@
+(defpackage #:dakusui/options
+  (:use #:coalton #:coalton-prelude)
+  (:export #:Options #:parse-options #:usage))
+(in-package #:dakusui/options)
+
+;;; The command line. (Spec 0004 R4, R7; spec 0005 R7; spec 0002 R11)
+
+(coalton-toplevel
+  (derive Eq)
+  (define-struct Options
+    "What the command line asks for: the role, the rule set if given, auto
+mode, and the text of one turn if given."
+    (role String)
+    (rules (Optional String))
+    (auto Boolean)
+    (prompt (Optional String)))
+
+  (declare usage String)
+  (define usage "usage: dakusui [--role NAME] [--rules NAME] [--auto] [-p TEXT]")
+
+  (declare needs (String * String -> Result String Options))
+  (define (needs option what)
+    (Err (<> option (<> " needs " (<> what (<> "; " usage))))))
+
+  (declare read-options (Options * List String -> Result String Options))
+  (define (read-options o args)
+    "Add ARGS to O, one option at a time."
+    (match args
+      ((Nil) (Ok o))
+      ((Cons "--role" (Cons name more))
+       (read-options (Options name (.rules o) (.auto o) (.prompt o)) more))
+      ((Cons "--rules" (Cons name more))
+       (read-options (Options (.role o) (Some name) (.auto o) (.prompt o)) more))
+      ((Cons "--auto" more)
+       (read-options (Options (.role o) (.rules o) True (.prompt o)) more))
+      ((Cons "-p" (Cons text more))
+       (read-options (Options (.role o) (.rules o) (.auto o) (Some text)) more))
+      ((Cons "--role" (Nil)) (needs "--role" "a NAME"))
+      ((Cons "--rules" (Nil)) (needs "--rules" "a NAME"))
+      ((Cons "-p" (Nil)) (needs "-p" "a TEXT"))
+      ((Cons other _) (Err (<> "unknown option " (<> other (<> "; " usage)))))))
+
+  (declare parse-options (List String -> Result String Options))
+  (define (parse-options args)
+    "Read the command line. The role is `agent` unless --role names one (spec
+0004 R4); --rules names the set (R7); --auto starts auto mode (spec 0005 R7);
+-p runs one turn (spec 0002 R11). An option given twice keeps the last value."
+    (read-options (Options "agent" None False None) args)))

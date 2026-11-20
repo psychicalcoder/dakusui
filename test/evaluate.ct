@@ -1,0 +1,143 @@
+(in-package #:dakusui/test)
+
+;;; T5: the reference evaluator. (R2, R5)
+
+(coalton-toplevel
+  (declare policy-of (List String -> policy:Policy))
+  (define (policy-of lines)
+    (policy:Policy (map (fn (line) (unwrap (policy:parse-rule line))) lines))))
+
+(define-test evaluate-a3-last-match-wins ()
+  (let p = (policy-of (make-list "allow read /p/a/x" "deny read /p/a")))
+  (is (not (policy:allows? p read-only "/p/a/x"))))
+
+(define-test evaluate-later-allow-beats-an-earlier-deny ()
+  (let p = (policy-of (make-list "deny read /p/a" "allow read /p/a/x")))
+  (is (policy:allows? p read-only "/p/a/x"))
+  (is (not (policy:allows? p read-only "/p/a/y"))))
+
+(define-test evaluate-no-match-denies ()
+  (is (not (policy:allows? (policy:Policy Nil) read-only "/a")))
+  (let p = (policy-of (make-list "allow read /a")))
+  (is (not (policy:allows? p read-only "/b"))))
+
+(define-test evaluate-path-covers-itself-and-beneath ()
+  (let p = (policy-of (make-list "allow read /p/a")))
+  (is (policy:allows? p read-only "/p/a"))
+  (is (policy:allows? p read-only "/p/a/b/c"))
+  (is (not (policy:allows? p read-only "/p")))
+  ;; A prefix stops at a component boundary.
+  (is (not (policy:allows? p read-only "/p/ab"))))
+
+(define-test evaluate-root-covers-everything ()
+  (let p = (policy-of (make-list "allow read /")))
+  (is (policy:allows? p read-only "/"))
+  (is (policy:allows? p read-only "/a/b")))
+
+(define-test evaluate-name-tests-the-last-component-only ()
+  (let p = (policy-of (make-list "allow read /" "deny read name:.env")))
+  (is (not (policy:allows? p read-only "/.env")))
+  (is (not (policy:allows? p read-only "/a/b/.env")))
+  (is (policy:allows? p read-only "/.env/x"))
+  (is (policy:allows? p read-only "/a/.envrc"))
+  (is (policy:allows? p read-only "/")))
+
+(define-test evaluate-order-decides-between-name-and-path ()
+  (let p = (policy-of (make-list "deny read name:.env" "allow read /a")))
+  (is (policy:allows? p read-only "/a/.env")))
+
+(define-test evaluate-kinds-are-decided-apart ()
+  (let p = (policy-of (make-list "allow read,write /a" "deny write /a/b")))
+  (is (policy:allows? p read-only "/a/b"))
+  (is (not (policy:allows? p write-only "/a/b")))
+  (is (policy:allows? p write-only "/a/c"))
+  ;; A rule for one kind says nothing about the other.
+  (let q = (policy-of (make-list "allow read /a")))
+  (is (not (policy:allows? q write-only "/a"))))
+
+(define-test evaluate-a12 ()
+  (let p = (policy-of (make-list "allow read /" "allow write /w")))
+  (is (policy:allows? p write-only "/w/f"))
+  (is (policy:allows? p read-only "/etc/hostname"))
+  (is (not (policy:allows? p read-write "/etc/hostname"))))
+
+;; O_RDWR needs both kinds.
+(define-test evaluate-read-write-needs-both-kinds ()
+  (let read-missing = (policy-of (make-list "allow write /w")))
+  (is (policy:allows? read-missing write-only "/w/f"))
+  (is (not (policy:allows? read-missing read-write "/w/f")))
+  ;; Different rules may allow each kind.
+  (let separate = (policy-of (make-list "allow read /" "allow write /w")))
+  (is (policy:allows? separate read-write "/w/f"))
+  (let both = (policy-of (make-list "allow read,write /w")))
+  (is (policy:allows? both read-write "/w/f")))
+
+;;; T34: renames above a deny rule. (R6, A22)
+
+(define-test evaluate-a22-renames-above-a-deny-rule ()
+  (let p = (policy-of (make-list "allow read /" "allow read,write /p" "deny read /p/anc/sub")))
+  ;; mv /p/anc /p/anc2, and mv /p/anc/sub /p/sub2
+  (is (not (policy:allows-rename? p "/p/anc" "/p/anc2")))
+  (is (not (policy:allows-rename? p "/p/anc/sub" "/p/sub2")))
+  ;; Renaming another directory over /p/anc.
+  (is (not (policy:allows-rename? p "/p/other" "/p/anc")))
+  (is (policy:allows-rename? p "/p/other" "/p/other2"))
+  ;; Beneath the denied path, nothing is held, but read is denied (A24).
+  (is (not (policy:allows-rename? p "/p/anc/sub/f" "/p/anc/sub/g")))
+  (is (policy:allows-rename? p "/p/anc/f" "/p/anc/g"))
+  ;; The project itself holds the denied path.
+  (is (not (policy:allows-rename? p "/p" "/p2")))
+  ;; After the rule is removed, the rename succeeds.
+  (let q = (policy-of (make-list "allow read /" "allow read,write /p")))
+  (is (policy:allows-rename? q "/p/anc" "/p/anc2")))
+
+(define-test evaluate-rename-needs-write-on-both-paths ()
+  (let p = (policy-of (make-list "allow read /" "allow read,write /p" "allow read /r")))
+  (is (policy:allows-rename? p "/p/a" "/p/b"))
+  (is (not (policy:allows-rename? p "/p/a" "/r/b")))
+  (is (not (policy:allows-rename? p "/r/a" "/p/b"))))
+
+;;; T35: a rename needs read at both ends too. (R5, R6, A24)
+
+(define-test evaluate-a24-rename-needs-read-on-both-paths ()
+  (let p = (policy-of (make-list "allow read /" "allow read,write /p" "deny read /p/anc/sub")))
+  ;; mv /p/anc/sub/secret /p/x: no mark beneath the denied path, but no read.
+  (is (not (policy:allows-rename? p "/p/anc/sub/secret" "/p/x")))
+  ;; mv /p/y over /p/anc/sub/secret.
+  (is (not (policy:allows-rename? p "/p/y" "/p/anc/sub/secret")))
+  (is (policy:allows-rename? p "/p/y" "/p/z"))
+  ;; Write alone is not enough at either end.
+  (let q = (policy-of (make-list "allow write /w" "allow read,write /p")))
+  (is (not (policy:allows-rename? q "/w/a" "/p/b")))
+  (is (not (policy:allows-rename? q "/p/a" "/w/b"))))
+
+(define-test evaluate-held-follows-path-deny-rules-only ()
+  (let p = (policy-of (make-list "allow read,write /a/b" "deny read,write name:.env")))
+  (is (== Nil (policy:held-paths p)))
+  (is (not (policy:held? p "/a")))
+  ;; A later allow of the denied path keeps it held.
+  (let q = (policy-of (make-list "allow read,write /" "deny read /a/b" "allow read /a/b")))
+  (is (policy:held? q "/a/b"))
+  (is (policy:held? q "/a"))
+  (is (policy:held? q "/"))
+  (is (not (policy:held? q "/a/b/c")))
+  (is (not (policy:held? q "/a/bc")))
+  (is (not (policy:allows-rename? q "/a" "/z")))
+  (is (policy:allows-rename? q "/a/b/c" "/a/b/d")))
+
+;; The default policy holds the project, the home directory, and their
+;; ancestors, but no file of ordinary work.
+(define-test evaluate-default-policy-holds-project-and-home ()
+  (let p = (unwrap (policy:session-policy "/home/u/proj" "/home/u" Nil)))
+  (is (not (policy:allows-rename? p "/home/u/proj" "/home/u/proj2")))
+  (is (not (policy:allows-rename? p "/home/u/proj/.dakusui" "/home/u/proj/x")))
+  (is (policy:allows-rename? p "/home/u/proj/src" "/home/u/proj/src2"))
+  (is (policy:allows-rename? p "/home/u/proj/a.c" "/home/u/proj/b.c"))
+  (is (policy:allows-rename? p "/tmp/a" "/tmp/b"))
+  ;; Out of /tmp into the project: both read- and write-allowed.
+  (is (policy:allows-rename? p "/tmp/a" "/home/u/proj/a"))
+  (is (not (policy:allows-rename? p "/home/u/proj/.env" "/home/u/proj/env")))
+  (is (policy:held? p "/home/u"))
+  (is (policy:held? p "/home/u/.ssh"))
+  (is (policy:held? p "/"))
+  (is (not (policy:held? p "/tmp"))))

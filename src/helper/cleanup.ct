@@ -1,0 +1,161 @@
+(defpackage #:dakusui/cleanup
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:libbpf #:dakusui/libbpf)
+                    (#:pins #:dakusui/pins)
+                    (#:list #:coalton/list))
+  (:export #:max-passes #:session-live? #:clear-session
+           #:clear-stale-sessions #:clear-own-session))
+(in-package #:dakusui/cleanup)
+
+;;; Clear sessions whose helper is gone. (R9, ADR 0008, plan part 4)
+;;;
+;;; A session's hooks deny its confined tasks everything once its helper is
+;;; gone, and they stay attached while the session is pinned. So no session
+;;; is unpinned while a task it confines lives: kill each one, found through
+;;; the session's own confined map, and repeat until a pass finds none, since
+;;; a dying process can still fork. Only then unpin.
+
+(cl:defun digits-p (name)
+  (cl:and (cl:plusp (cl:length name)) (cl:every #'cl:digit-char-p name)))
+
+(cl:defun names-in (path)
+  (cl:let ((names (pins::directory-names path)))
+    (cl:if (cl:listp names) names cl:nil)))
+
+(cl:defun task-state (path)
+  "The state letter in the stat file at PATH, or NIL if it cannot be read."
+  (cl:let* ((text (cl:ignore-errors (uiop:read-file-string path)))
+            (close (cl:and text (cl:position #\) text :from-end cl:t))))
+    (cl:when close
+      (cl:find-if-not (cl:lambda (c) (cl:char= c #\Space)) text :start (cl:1+ close)))))
+
+(cl:defun task-flagged (map-fd pidfd)
+  "T if the task behind PIDFD is in the confined map, NIL if not, and :unknown
+if the lookup fails any other way."
+  (cffi:with-foreign-objects ((key :int) (value :uint32))
+    (cl:setf (cffi:mem-ref key :int) pidfd)
+    (cl:let ((status (cffi:foreign-funcall "bpf_map_lookup_elem"
+                                           :int map-fd :pointer key :pointer value :int)))
+      (cl:cond ((cl:zerop status) cl:t)
+               ((cl:= status (cl:- sb-posix:enoent)) cl:nil)
+               (cl:t :unknown)))))
+
+(cl:defun kill-pass (map-fd)
+  "Walk every thread in /proc once. Send SIGKILL, through a pidfd, to each one
+the map flags that is not a zombie. Return (values signalled unknown): the
+threads signalled, and those whose flag could not be read."
+  (cl:let ((signalled 0) (unknown 0))
+    (cl:dolist (tgid (names-in "/proc"))
+      (cl:when (digits-p tgid)
+        (cl:dolist (tid (names-in (cl:format cl:nil "/proc/~A/task" tgid)))
+          (cl:when (digits-p tid)
+            ;; pidfd_open (434) with PIDFD_THREAD (O_EXCL): this thread itself.
+            ;; A pidfd names the task, so a reused tid cannot be hit.
+            (cl:let ((pidfd (cffi:foreign-funcall "syscall" :long 434
+                                                  :int (cl:parse-integer tid)
+                                                  :uint #o200 :int)))
+              (cl:when (cl:>= pidfd 0)
+                (cl:unwind-protect
+                     (cl:let ((flagged (task-flagged map-fd pidfd)))
+                       (cl:cond
+                         ((cl:eq flagged :unknown) (cl:incf unknown))
+                         (flagged
+                          ;; A zombie cannot act, and killing it does nothing.
+                          ;; Read after the pidfd, so a tid reused since then
+                          ;; can only make us signal a dead task.
+                          (cl:unless (cl:member (task-state (cl:format cl:nil "/proc/~A/task/~A/stat" tgid tid))
+                                                '(#\Z #\X))
+                            ;; pidfd_send_signal (424), SIGKILL (9).
+                            (cl:when (cl:zerop (cffi:foreign-funcall "syscall" :long 424 :int pidfd
+                                                                     :int 9 :pointer (cffi:null-pointer)
+                                                                     :uint 0 :int))
+                              (cl:incf signalled))))))
+                  (cffi:foreign-funcall "close" :int pidfd :int))))))))
+    (cl:values signalled unknown)))
+
+(cl:defun warn-text (text)
+  (cl:format cl:*error-output* "dakusui: warning: ~A~%" text)
+  (cl:finish-output cl:*error-output*))
+
+(coalton-toplevel
+  (declare max-passes UFix)
+  (define max-passes 100)
+
+  (declare warn (String -> Unit))
+  (define (warn text)
+    (lisp (-> Unit) (text) (warn-text text) Unit))
+
+  (declare kill-confined (I32 -> Boolean))
+  (define (kill-confined map-fd)
+    "Kill the tasks MAP-FD flags, pass after pass, until a pass finds none.
+Wait a little after a pass that signalled, so the dying can exit. Return
+False if max-passes do not get there."
+    (lisp (-> Boolean) (map-fd max-passes)
+      (cl:loop :repeat max-passes
+               :do (cl:multiple-value-bind (signalled unknown) (kill-pass map-fd)
+                     (cl:when (cl:and (cl:zerop signalled) (cl:zerop unknown))
+                       (cl:return cl:t))
+                     (cl:sleep 0.01))
+               :finally (cl:return cl:nil))))
+
+  (declare clear-session (String -> Result String Unit))
+  (define (clear-session dir)
+    "End every task the session in DIR confines, then unpin it. A session with
+no confined map never confined anything, or another helper has cleared it,
+so unpin it at once. If max-passes leave tasks alive, keep the pins: the
+tasks stay denied everything. (R9)"
+    (let map-pin = (pins:pin-path dir pins:confined-pin))
+    (match (libbpf:obj-get-if-pinned map-pin)
+      ((Err why) (Err why))
+      ((Ok (None)) (pins:remove-session dir))
+      ((Ok (Some fd))
+       (let cleared = (kill-confined fd))
+       (let _ = (libbpf:close-fd fd))
+       (if cleared
+           (pins:remove-session dir)
+           (Err (lisp (-> String) (dir max-passes)
+                  (cl:format cl:nil "~A still confines live tasks after ~D passes; ~
+                                     keeping its pins, so they stay denied everything"
+                             dir max-passes)))))))
+
+  (declare session-live? (I32 * String -> Boolean))
+  (define (session-live? pid start)
+    "True while process PID started at START and is not a zombie: the
+session's helper still runs, and clears its own session when it ends."
+    (let path = (lisp (-> String) (pid) (cl:format cl:nil "/proc/~D/stat" pid)))
+    (match (pins:proc-stat-fields path)
+      ((Err _) False)
+      ((Ok fields)
+       (and (== (list:index 19 fields) (Some start))
+            (not (list:member (with-default "" (list:index 0 fields)) (make-list "Z" "X")))))))
+
+  (declare clear-stale-sessions (String -> Unit))
+  (define (clear-stale-sessions root)
+    "Clear each session in ROOT whose helper is gone. A name that is not a
+session's is left alone. A session that cannot be cleared only warns: the
+helper starts anyway, and a later start tries again. (R9)"
+    (match (pins:session-entries root)
+      ((Err why) (warn why))
+      ((Ok names)
+       (let stale = (list:filter (fn (name)
+                                   (match (pins:parse-session-name name)
+                                     ((Some (Tuple pid start)) (not (session-live? pid start)))
+                                     ((None) False)))
+                                 names))
+       (let _ = (map (fn (name)
+                       (match (clear-session (pins:pin-path root name))
+                         ((Ok _) Unit)
+                         ((Err why) (warn why))))
+                     stale))
+       Unit)))
+
+  (declare clear-own-session (Void -> Unit))
+  (define (clear-own-session)
+    "At a normal exit, clear this helper's own session, so only a crash leaves
+pins behind. (R9)"
+    (match (pins:own-session-dir)
+      ((Err why) (warn why))
+      ((Ok dir)
+       (match (clear-session dir)
+         ((Ok _) Unit)
+         ((Err why) (warn why)))))))

@@ -1,0 +1,118 @@
+(in-package #:dakusui/test)
+
+;;; T18: log each denial with the process, path, and access kind. (R7) The
+;;; client reads events on its own thread, so a denial is logged even while
+;;; no request is pending. make attach-check runs A13 under the real helper.
+
+(coalton-toplevel
+  (declare event-line (String * String * String * String -> String))
+  (define (event-line comm hook kind path)
+    (event-line-for "denied by rule" comm hook kind path))
+
+  (declare event-line-for (String * String * String * String * String -> String))
+  (define (event-line-for reason comm hook kind path)
+    (mconcat (make-list "{\"event\":\"denial\",\"pid\":42,\"comm\":" (quoted-json comm)
+                        ",\"hook\":\"" hook "\",\"kind\":\"" kind
+                        "\",\"reason\":\"" reason "\",\"path\":" (quoted-json path) "}")))
+
+  (declare quoted-json (String -> String))
+  (define (quoted-json text)
+    (lisp (-> String) (text) (com.inuoe.jzon:stringify text)))
+
+  (declare file-lines (String -> List String))
+  (define (file-lines path)
+    (lisp (-> (List String)) (path)
+      (cl:with-open-file (in path :if-does-not-exist cl:nil)
+        (cl:if in
+               (cl:loop :for line := (cl:read-line in cl:nil) :while line :collect line)
+               cl:nil)))))
+
+(define-test denial-text-names-process-path-and-kind ()
+  (is (== (Some "denied read of /p/.env by cat (pid 42): denied by rule")
+          (denials:denial-text (event-line "cat" "file_open" "read" "/p/.env"))))
+  (is (== (Some "denied read,write of /p/x by sh (pid 42): denied by rule")
+          (denials:denial-text (event-line "sh" "file_open" "read,write" "/p/x"))))
+  (is (== (Some "denied path_link by ln (pid 42): denied by rule")
+          (denials:denial-text (event-line "ln" "path_link" "none" ""))))
+  (is (== (Some "denied read by cat (pid 42): helper gone")
+          (denials:denial-text (event-line-for "helper gone" "cat" "file_open" "read" ""))))
+  (is (== (Some "denied read by cat (pid 42): path changed")
+          (denials:denial-text (event-line-for "path changed" "cat" "file_open" "read" ""))))
+  (is (== (Some "denied write of /p/anc by mv (pid 42): holds a denied path")
+          (denials:denial-text (event-line-for "holds a denied path" "mv" "path_rename" "write" "/p/anc"))))
+  (is (== None (denials:denial-text "{\"ok\":true}")))
+  (is (== None (denials:denial-text "{\"event\":\"denial\",\"pid\":\"42\"}")))
+  (is (== None (denials:denial-text "not json"))))
+
+;; A command names itself and its files, so it must not forge a log line.
+(define-test denial-text-keeps-one-line ()
+  (is (== (Some "denied read of /p/a\\x0Ab by x\\x0Adakusui: denied (pid 42): denied by rule")
+          (denials:denial-text (event-line "x
+dakusui: denied" "file_open" "read" "/p/a
+b")))))
+
+(define-test open-log-appends-a-timestamped-line ()
+  (let base = (temp-tree Nil Nil Nil))
+  (let path = (<> base "/state/dakusui/denials.log"))
+  (let record = (denials:on-event (denials:open-log path)))
+  (record (event-line "cat" "file_open" "read" "/p/.env"))
+  (record "{\"event\":\"other\"}")
+  (record (event-line "cat" "file_open" "write" "/etc/hostname"))
+  (let lines = (file-lines path))
+  (is (== 2 (list:length lines)))
+  (is (string:substring? "Z denied read of /p/.env by cat (pid 42)" (with-default "" (list:index 0 lines))))
+  (is (string:substring? "Z denied write of /etc/hostname" (with-default "" (list:index 1 lines))))
+  (remove-tree base))
+
+(define-test client-reads-events-with-no-request-pending ()
+  (let event = (event-line "cat" "file_open" "read" "/p/.env"))
+  (let fake = (fake-helper (make-list event event) False))
+  (let events = (cell:new Nil))
+  (let c = (client:connect (.agent fake) (fn (line) (cell:push! events line) Unit)))
+  (is (wait-until (fn () (== 2 (list:length (cell:read events))))))
+  (requests-of fake c)
+  Unit)
+
+(define-test client-survives-a-failing-handler ()
+  (let event = (event-line "cat" "file_open" "read" "/p/.env"))
+  (let fake = (fake-helper (make-list event "{\"ok\":true}") False))
+  (let c = (client:connect (.agent fake)
+                           (fn (_) (lisp (-> Unit) () (cl:error "handler failed")))))
+  (is (== (Ok Unit) (client:send-flag c 5)))
+  (requests-of fake c)
+  Unit)
+
+(define-test client-fails-every-request-once-the-helper-is-gone ()
+  (let fake = (fake-helper Nil True))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (is (== (Err "the helper closed the socket") (client:send-flag c 5)))
+  (is (== (Err "the helper closed the socket") (client:send-flag c 6)))
+  (requests-of fake c)
+  Unit)
+
+;;; Spec 0003 T3: between a mark and a take, the log keeps each denial's
+;;; text, for the bash result. (Spec 0003 R6)
+
+(define-test the-log-keeps-denials-only-since-the-mark ()
+  (let base = (temp-tree Nil Nil Nil))
+  (let dlog = (denials:open-log (<> base "/denials.log")))
+  (let record = (denials:on-event dlog))
+  (record (event-line "cat" "file_open" "read" "/before"))
+  (is (== Nil (denials:marked dlog)))
+  (denials:mark dlog)
+  (record (event-line "cat" "file_open" "read" "/a"))
+  (record "{\"event\":\"other\"}")
+  (record (event-line "sh" "file_open" "write" "/b"))
+  (is (== (make-list "denied read of /a by cat (pid 42): denied by rule"
+                     "denied write of /b by sh (pid 42): denied by rule")
+          (denials:marked dlog)))
+  ;; Taking them stops the keeping.
+  (record (event-line "cat" "file_open" "read" "/after"))
+  (is (== Nil (denials:marked dlog)))
+  (remove-tree base))
+
+(define-test client-sends-sync-and-waits-for-its-reply ()
+  (let fake = (fake-helper (make-list "{\"ok\":true}") False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (is (== (Ok Unit) (client:send-sync c)))
+  (is (== (make-list (Ok protocol:SyncRequest)) (policies-of (requests-of fake c)))))

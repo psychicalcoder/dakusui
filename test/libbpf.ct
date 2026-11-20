@@ -1,0 +1,102 @@
+(in-package #:dakusui/test)
+
+;;; T8: the libbpf bindings, on the paths that need no capabilities. The paths
+;;; that do need them run in `make attach-check`.
+
+(coalton-toplevel
+  (declare no-such-map libbpf:BpfMap)
+  (define no-such-map (libbpf::BpfMap -1 4 4 1))
+
+  (declare failure-message (Result String :a -> String))
+  (define (failure-message outcome)
+    (match outcome
+      ((Ok _) "")
+      ((Err message) message))))
+
+(define-test open-object-rejects-bytes-that-are-not-elf ()
+  (is (== "bpf_object__open_mem: BPF object format invalid"
+          (failure-message
+           (libbpf:open-object
+            (lisp (-> libbpf:Octets) ()
+              (cl:make-array 16 :element-type '(cl:unsigned-byte 8)
+                                :initial-element 7)))))))
+
+;;; T9: the helper opens the enforcer from its own image. (R11)
+
+(define-test open-enforcer-finds-every-program ()
+  (is (== 13
+          (match (enforcer:open-enforcer)
+            ((Ok obj) (list:length (libbpf:program-names obj)))
+            ((Err _) 0)))))
+
+;;; T10: start refuses before it loads anything when bpf is not active. (R9)
+
+(define-test start-refuses-without-the-bpf-lsm ()
+  (is (== (Err "bpf is not an active LSM, so nothing can be enforced. Active: capability,landlock,yama. Add bpf to the lsm= boot parameter.")
+          (map (const Unit) (enforcer:start (<> "capability,landlock,yama" (into #\Newline)))))))
+
+(define-test start-does-not-take-bpf-as-a-substring ()
+  (is (== False
+          (match (enforcer:start "capability,bpfx,nobpf")
+            ((Ok _) True)
+            ((Err _) False)))))
+
+(define-test read-lsm-list-reports-what-the-kernel-lists ()
+  (is (== True
+          (match (enforcer:read-lsm-list)
+            ((Ok text) (string:substring? "capability" text))
+            ((Err _) False)))))
+
+(define-test map-update-rejects-a-wrong-key-size ()
+  (is (== "bpf_map_update_elem: wrong key size"
+          (failure-message
+           (libbpf:map-update no-such-map (make-list 0 0 0) (make-list 0 0 0 0))))))
+
+(define-test map-update-rejects-a-wrong-value-size ()
+  (is (== "bpf_map_update_elem: wrong value size"
+          (failure-message
+           (libbpf:map-update no-such-map (make-list 0 0 0 0) (make-list 0))))))
+
+(define-test map-update-reports-the-kernel-error ()
+  (is (== "bpf_map_update_elem: Bad file descriptor"
+          (failure-message
+           (libbpf:map-update no-such-map (make-list 0 0 0 0) (make-list 0 0 0 0))))))
+
+(define-test ring-buffer-new-reports-a-bad-map ()
+  (is (== "ring_buffer__new: File descriptor in bad state"
+          (failure-message
+           (libbpf:ring-buffer-new no-such-map (fn (_) Unit))))))
+
+;;; T11: a policy must fit the rule map. (R4)
+
+(define-test check-capacity-names-both-numbers ()
+  (is (== (Err "the policy has 1025 patterns, but the rule map holds 1024")
+          (enforcer:check-capacity 1025 1024)))
+  (is (== (Ok Unit) (enforcer:check-capacity 1024 1024))))
+
+;;; T12: a pidfd names a live process. (R1)
+
+(define-test pidfd-open-opens-our-own-process ()
+  (is (== True
+          (match (libbpf:pidfd-open (lisp (-> I32) () (sb-unix:unix-getpid)))
+            ((Ok fd) (libbpf:close-fd fd) True)
+            ((Err _) False)))))
+
+(define-test pidfd-open-names-a-bad-pid ()
+  (is (== (Err "pidfd_open 0: Invalid argument")
+          (libbpf:pidfd-open 0)))
+  (is (== (Err "pidfd_open 2147483647: No such process")
+          (libbpf:pidfd-open 2147483647))))
+
+;;; T28: struct helper_info, as the helper writes it and reads it back. (R9)
+
+(define-test helper-bytes-match-struct-helper-info ()
+  (is (== (make-list #x39 #x30 0 0  0 0 0 0  8 7 6 5 4 3 2 1)
+          (enforcer:helper-bytes 12345 #x0102030405060708)))
+  (is (== #x0102030405060708
+          (enforcer:helper-start (enforcer:helper-bytes 12345 #x0102030405060708))))
+  (is (== 0 (enforcer:helper-start (make-list 1 2 3)))))
+
+(define-test map-lookup-rejects-a-wrong-key-size ()
+  (is (== "bpf_map_lookup_elem: wrong key size"
+          (failure-message (libbpf:map-lookup no-such-map (make-list 1 2))))))

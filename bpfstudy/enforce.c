@@ -32,7 +32,7 @@ static const char *hook_name[H_COUNT] = {
 static const char *why_name[] = {
 	"ok",	     "too many components", "name too long",  "path too long",
 	"walk step limit", "internal error", "no matching rule",
-	"denied by rule", "always denied",
+	"denied by rule", "always denied", "helper gone",
 };
 
 struct rule {
@@ -338,6 +338,17 @@ int main(void)
 				bpf_program__name(p), strerror(errno));
 			return 1;
 		}
+	}
+	/* Register as the live helper (ADR 0008), or every confined open is
+	 * denied: write our pid, then open a file so the hook records our start. */
+	{
+		struct helper_info h = { .pid = getpid() };
+		int zero = 0;
+
+		if (bpf_map_update_elem(bpf_map__fd(bpf_object__find_map_by_name(obj, "helper")),
+					&zero, &h, BPF_ANY))
+			return 1;
+		close(open("/", O_RDONLY));
 	}
 	outer_fd = bpf_map__fd(bpf_object__find_map_by_name(obj, "rules"));
 	confined_fd = bpf_map__fd(bpf_object__find_map_by_name(obj, "confined"));

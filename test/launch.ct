@@ -1,0 +1,277 @@
+(in-package #:dakusui/test)
+
+;;; T17: the launcher. (R1, R11) These run against a fake helper, so nothing
+;;; is confined. They show the order of the steps and what a command inherits.
+;;; make attach-check runs A1 and A2 under the real helper.
+
+(coalton-toplevel
+  (declare set-variable (String * String -> Unit))
+  (define (set-variable name value)
+    (lisp (-> Unit) (name value)
+      (cffi:foreign-funcall "setenv" :string name :string value :int 1 :int)
+      Unit))
+
+  (declare unset-variable (String -> Unit))
+  (define (unset-variable name)
+    (lisp (-> Unit) (name)
+      (cffi:foreign-funcall "unsetenv" :string name :int)
+      Unit))
+
+  (declare exists? (String -> Boolean))
+  (define (exists? path)
+    (lisp (-> Boolean) (path) (cl:and (cl:probe-file path) cl:t)))
+
+  (declare run-with (List String * String * String -> Tuple (Result String launch:Outcome)
+                                                             (List String)))
+  (define (run-with replies directory command)
+    "Run COMMAND against a fake helper that sends REPLIES, then closes when
+there are none. Return the outcome and the requests the helper got."
+    (let fake = (fake-helper replies (list:null? replies)))
+    (let c = (client:connect (.agent fake) ignore-event))
+    (let outcome = (launch:run-command c directory command 1))
+    (Tuple outcome (requests-of fake c)))
+
+  (declare outcome-or (Result String launch:Outcome -> Tuple I32 String))
+  (define (outcome-or result)
+    (match result
+      ((Ok o) (Tuple (launch:outcome-code o) (launch:outcome-output o)))
+      ((Err why) (Tuple -1 why)))))
+
+(define-test scrub-environment-keeps-only-the-allowlist ()
+  (is (== (make-list "PATH=/bin" "HOME=/h" "LC_ALL=C" "LANG=C.UTF-8" "TERM=xterm")
+          (launch:scrub-environment
+           (make-list "PATH=/bin" "OPENAI_API_KEY=sk-1" "HOME=/h" "LD_PRELOAD=/x.so"
+                      "LC_ALL=C" "BASH_ENV=/x" "ENV=/x" "LANG=C.UTF-8" "MY_TOKEN=t"
+                      "TERM=xterm" "PATHX=/y" "LC" "noequals")))))
+
+(define-test run-command-flags-the-launcher-before-it-runs ()
+  (match (run-with (ok-replies 1) "/" "echo hi; exit 3")
+    ((Tuple (Ok o) requests)
+     (is (== 3 (launch:outcome-code o)))
+     (is (== "hi
+" (launch:outcome-output o)))
+     (is (== (make-list (Ok (protocol:FlagRequest (launch:outcome-pid o))))
+             (policies-of requests))))
+    ((Tuple (Err why) _) (is (== "" why)))))
+
+(define-test run-command-runs-nothing-when-the-flag-fails ()
+  (let base = (temp-tree Nil Nil Nil))
+  (let marker = (<> base "/ran"))
+  (match (run-with (make-list "{\"ok\":false,\"error\":\"no such process\"}") "/"
+                   (<> "touch " marker))
+    ((Tuple result _)
+     (is (== (Err "the command did not run, since it could not be confined: the helper refused: no such process")
+             (map (fn (_) Unit) result)))))
+  (match (run-with Nil "/" (<> "touch " marker))
+    ((Tuple result _)
+     (is (== (Err "the command did not run, since it could not be confined: the helper closed the socket")
+             (map (fn (_) Unit) result)))))
+  (is (not (exists? marker)))
+  (remove-tree base))
+
+(define-test run-command-starts-in-the-directory ()
+  (let base = (temp-tree Nil Nil Nil))
+  (is (== (Tuple 0 (<> base "
+")) (outcome-or (fst (run-with (ok-replies 1) base "pwd")))))
+  (remove-tree base))
+
+(define-test run-command-passes-a-clean-process ()
+  (set-variable "DAKUSUI_TEST_API_KEY" "sk-secret")
+  (set-variable "BASH_ENV" "/nonexistent")
+  (let report = (snd (outcome-or (fst (run-with (ok-replies 1) "/"
+                                                 "grep -E '^Sig(Ign|Blk):' /proc/self/status; ls /proc/self/fd; env")))))
+  (unset-variable "DAKUSUI_TEST_API_KEY")
+  (unset-variable "BASH_ENV")
+  (is (has? report (<> "SigIgn:" (<> tab "0000000000000000"))))
+  (is (has? report (<> "SigBlk:" (<> tab "0000000000000000"))))
+  ;; ls sees 0, 1, 2, and its own directory on 3: not the gate or the socket.
+  (is (== (make-list "0" "1" "2" "3")
+          (list:filter (fn (line) (lisp (-> Boolean) (line)
+                                    (cl:and (cl:plusp (cl:length line))
+                                            (cl:every #'cl:digit-char-p line))))
+                       (string:split #\Newline report))))
+  (is (has? report "PATH="))
+  (is (not (has? report "sk-secret")))
+  (is (not (has? report "BASH_ENV"))))
+
+;;; T20: no command runs once the helper is gone. (R9, A6)
+
+(define-test run-command-refuses-once-the-helper-is-gone ()
+  (let base = (temp-tree Nil Nil Nil))
+  (let marker = (<> base "/ran"))
+  (let fake = (fake-helper Nil True))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (is (wait-until (fn () (client:closed? c))))
+  (is (== (Err "refused: the helper is gone, so no command can be confined")
+          (map (fn (_) Unit) (launch:run-command c "/" (<> "touch " marker) 10))))
+  (is (not (exists? marker)))
+  ;; It refused without asking the helper.
+  (is (== Nil (requests-of fake c)))
+  (remove-tree base))
+
+;;; Spec 0003 T2: the launcher leads its own process group, and a command
+;;; that outlives its limit ends with the whole group. (Spec 0003 R4)
+;;; make attach-check runs A4 confined.
+
+(cl:defun live-with (token)
+  "How many live processes, not zombies, have TOKEN in their command line."
+  ;; SBCL's directory has no [0-9] pattern, so take every entry and skip
+  ;; those that are not pids.
+  (cl:loop :for dir :in (cl:directory "/proc/*/" :resolve-symlinks cl:nil)
+           :for pid := (cl:car (cl:last (cl:pathname-directory dir)))
+           :for cmdline := (cl:ignore-errors
+                            (cl:with-open-file (in (cl:format cl:nil "/proc/~A/cmdline" pid)
+                                                   :element-type '(cl:unsigned-byte 8))
+                              (cl:let ((bytes (cl:make-array 4096 :element-type '(cl:unsigned-byte 8))))
+                                (cl:map 'cl:string #'cl:code-char
+                                        (cl:subseq bytes 0 (cl:read-sequence bytes in))))))
+           :for stat := (cl:ignore-errors (uiop:read-file-string (cl:format cl:nil "/proc/~A/stat" pid)))
+           :for close := (cl:and stat (cl:position #\) stat :from-end cl:t))
+           :count (cl:and (cl:every #'cl:digit-char-p pid) cmdline (cl:search token cmdline) close
+                          (cl:not (cl:member (cl:char stat (cl:+ 2 close)) '(#\Z #\X))))))
+
+(coalton-toplevel
+  (declare live-with-token (String -> UFix))
+  (define (live-with-token token)
+    (lisp (-> UFix) (token) (live-with token)))
+
+  (declare now-ms (Void -> Integer))
+  (define (now-ms)
+    (lisp (-> Integer) ()
+      (cl:floor (cl:* 1000 (cl:get-internal-real-time)) cl:internal-time-units-per-second))))
+
+(define-test run-command-starts-a-process-group ()
+  (match (fst (run-with (ok-replies 1) "/" "cut -d' ' -f5 /proc/$$/stat"))
+    ((Ok o)
+     (let pid = (launch:outcome-pid o))
+     (is (== (lisp (-> String) (pid) (cl:format cl:nil "~D~%" pid))
+             (launch:outcome-output o))))
+    ((Err why) (is (== "" why)))))
+
+(define-test tools-a4-the-launcher-ends-the-group-at-its-limit ()
+  (let start = (now-ms))
+  (let ran = (fst (run-with (ok-replies 1) "/" "sleep 99.0417 & sleep 99.0417")))
+  (let took = (- (now-ms) start))
+  (match ran
+    ((Ok o)
+     (is (launch:outcome-timed-out? o))
+     (is (== 137 (launch:outcome-code o))))
+    ((Err why) (is (== "" why))))
+  (is (< took 3000))
+  (is (wait-until (fn () (== 0 (live-with-token "99.0417"))))))
+
+(define-test run-command-within-its-limit-did-not-time-out ()
+  (match (fst (run-with (ok-replies 1) "/" "echo hi"))
+    ((Ok o) (is (not (launch:outcome-timed-out? o))))
+    ((Err why) (is (== "" why)))))
+
+;;; Spec 0003 T5: start-process, for MCP servers. (Spec 0003 R10) These run
+;;; against a fake helper, so nothing is confined; make attach-check runs a
+;;; process confined.
+
+(coalton-toplevel
+  (declare start-with (List String * String * List (Tuple String String)
+                       -> Tuple (Result String launch:Process) (List String)))
+  (define (start-with replies command extra)
+    "Start COMMAND in / against a fake helper that sends REPLIES. Return the
+process and the requests the helper got."
+    (let fake = (fake-helper replies (list:null? replies)))
+    (let c = (client:connect (.agent fake) ignore-event))
+    (let started = (launch:start-process c "/" command extra))
+    (Tuple started (requests-of fake c)))
+
+  (declare close-on-exec? (I32 -> Boolean))
+  (define (close-on-exec? fd)
+    ;; F_GETFD (1), FD_CLOEXEC (1).
+    (lisp (-> Boolean) (fd)
+      (cl:= 1 (cl:logand 1 (cffi:foreign-funcall "fcntl" :int fd :int 1 :int)))))
+
+  (declare process-fds-close-on-exec? (launch:Process -> Boolean))
+  (define (process-fds-close-on-exec? p)
+    (let input = (lisp (-> I32) (p) (dakusui/launch::proc-input p)))
+    (let output = (lisp (-> I32) (p) (dakusui/launch::proc-output p)))
+    (and (close-on-exec? input) (close-on-exec? output))))
+
+(define-test start-process-answers-on-its-pipes ()
+  (match (start-with (ok-replies 1)
+                     "echo noise >&2; while read -r line; do echo \"got $line\"; done" Nil)
+    ((Tuple (Ok p) requests)
+     (is (== (make-list (Ok (protocol:FlagRequest (launch:process-pid p))))
+             (policies-of requests)))
+     (is (== (Ok Unit) (launch:send-line p "hi")))
+     (is (== (launch:Line "got hi") (launch:receive-line p 5)))
+     (is (== (Ok Unit) (launch:send-line p "a")))
+     (is (== (Ok Unit) (launch:send-line p "b")))
+     (is (== (launch:Line "got a") (launch:receive-line p 5)))
+     (is (== (launch:Line "got b") (launch:receive-line p 5)))
+     (is (process-fds-close-on-exec? p))
+     (let start = (now-ms))
+     (is (== launch:TimedOut (launch:receive-line p 1)))
+     (is (>= (- (now-ms) start) 900))
+     (launch:stop p)
+     (is (== launch:Closed (launch:receive-line p 1)))
+     ;; A second stop does nothing.
+     (launch:stop p)
+     (is (== (Err "the process is stopped") (launch:send-line p "late"))))
+    ((Tuple (Err why) _) (is (== "" why)))))
+
+(define-test start-process-says-when-the-process-closes-its-end ()
+  (match (fst (start-with (ok-replies 1) "read -r line; printf '%s\\nhalf' \"$line\"" Nil))
+    ((Ok p)
+     (is (== (Ok Unit) (launch:send-line p "once")))
+     (is (== (launch:Line "once") (launch:receive-line p 5)))
+     (launch:stop p)
+     (is (== launch:Closed (launch:receive-line p 5))))
+    ((Err why) (is (== "" why)))))
+
+(define-test start-process-passes-a-clean-process ()
+  (set-variable "DAKUSUI_TEST_API_KEY" "sk-secret")
+  (match (fst (start-with (ok-replies 1)
+                          (<> "echo \"${DAKUSUI_TEST_API_KEY-unset} $DAKUSUI_TEST_EXTRA $HOME\"; "
+                              (<> "echo $(cut -d' ' -f5 /proc/$$/stat) $(ls /proc/self/fd); "
+                                  "grep -E '^Sig(Ign|Blk):' /proc/self/status | tr '\\t' ' '; sleep 60"))
+                          (make-list (Tuple "DAKUSUI_TEST_EXTRA" "x") (Tuple "HOME" "/h"))))
+    ((Ok p)
+     (unset-variable "DAKUSUI_TEST_API_KEY")
+     (is (== (launch:Line "unset x /h") (launch:receive-line p 5)))
+     ;; It leads its group; ls sees 0, 1, 2, and its own directory on 3.
+     (let pid = (launch:process-pid p))
+     (is (== (launch:Line (lisp (-> String) (pid) (cl:format cl:nil "~D 0 1 2 3" pid)))
+             (launch:receive-line p 5)))
+     (is (== (launch:Line "SigBlk: 0000000000000000") (launch:receive-line p 5)))
+     (let ignored = (launch:receive-line p 5))
+     (launch:stop p)
+     (is (== (launch:Line "SigIgn: 0000000000000000") ignored)))
+    ((Err why)
+     (unset-variable "DAKUSUI_TEST_API_KEY")
+     (is (== "" why)))))
+
+(define-test start-process-stop-ends-the-group ()
+  (match (fst (start-with (ok-replies 1) "sleep 97.0417 & sleep 97.0417" Nil))
+    ((Ok p)
+     (is (wait-until (fn () (>= (live-with-token "97.0417") 2))))
+     (launch:stop p)
+     (is (wait-until (fn () (== 0 (live-with-token "97.0417"))))))
+    ((Err why) (is (== "" why)))))
+
+(define-test start-process-runs-nothing-when-the-flag-fails ()
+  (let base = (temp-tree Nil Nil Nil))
+  (let marker = (<> base "/ran"))
+  (is (== (Err "the command did not run, since it could not be confined: the helper refused: no such process")
+          (map (fn (_) Unit)
+               (fst (start-with (make-list "{\"ok\":false,\"error\":\"no such process\"}")
+                                (<> "touch " marker) Nil)))))
+  (is (not (exists? marker)))
+  (remove-tree base))
+
+(define-test start-process-refuses-once-the-helper-is-gone ()
+  (let base = (temp-tree Nil Nil Nil))
+  (let marker = (<> base "/ran"))
+  (let fake = (fake-helper Nil True))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (is (wait-until (fn () (client:closed? c))))
+  (is (== (Err "refused: the helper is gone, so no command can be confined")
+          (map (fn (_) Unit) (launch:start-process c "/" (<> "touch " marker) Nil))))
+  (is (not (exists? marker)))
+  (is (== Nil (requests-of fake c)))
+  (remove-tree base))

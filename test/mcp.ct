@@ -1,0 +1,145 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0003 T6: the MCP client against the scripted server in
+;;; test/mcp-server.py. (R9, R11, R12) The server starts through
+;;; start-process under a fake helper, so it runs unconfined. make
+;;; attach-check runs a server confined (A9, A10).
+
+(coalton-toplevel
+  (declare mcp-script-command (String -> String))
+  (define (mcp-script-command mode)
+    "The command that runs the scripted server in MODE."
+    (lisp (-> String) (mode)
+      (cl:format cl:nil "exec python3 -I '~A' ~A"
+                 (cl:namestring (asdf:system-relative-pathname "dakusui" "test/mcp-server.py"))
+                 mode)))
+
+  (declare mcp-start (String * String -> Tuple (Result String mcp:Server) (List String)))
+  (define (mcp-start name command)
+    "Start COMMAND as the server NAME in /, with limits of 1 second, against
+a fake helper that agrees once. Return the server and the requests the
+helper got."
+    (let fake = (fake-helper (ok-replies 1) False))
+    (let c = (client:connect (.agent fake) ignore-event))
+    (let started = (mcp:start-limited c "/" name command Nil 1 1))
+    (Tuple started (requests-of fake c)))
+
+  (declare mcp-started (String -> mcp:Server))
+  (define (mcp-started mode)
+    (unwrap (fst (mcp-start "test" (mcp-script-command mode)))))
+
+  (declare mcp-call (mcp:Server * String * String -> String))
+  (define (mcp-call server name arguments)
+    (tools:call (mcp:server-tools server) (chat:ToolCall "c1" name arguments)))
+
+  (declare mcp-error-of (Result String mcp:Server -> String))
+  (define (mcp-error-of started)
+    (match started
+      ((Ok server) (mcp:stop server) "started")
+      ((Err why) why))))
+
+(define-test mcp-lists-the-tools-as-server-tool ()
+  (match (mcp-start "test" (mcp-script-command ""))
+    ((Tuple (Ok server) requests)
+     ;; The helper flagged the server before it ran. (R10)
+     (is (== (make-list (Ok (protocol:FlagRequest (mcp:server-pid server))))
+             (policies-of requests)))
+     ;; Both pages, in order. The server lists tools only once initialized.
+     (let specs = (tools:specs (mcp:server-tools server)))
+     (is (== (make-list "test__echo" "test__fail" "test__exit" "test__hang" "test__read")
+             (map chat:spec-name specs)))
+     (is (== (make-list "Echo the text." "Report an error." "End the server." "Never answer."
+                        "Read the file at the path.")
+             (map chat:spec-description specs)))
+     (is (== (make-list "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}"
+                        "{\"type\":\"object\"}"
+                        "{\"type\":\"object\",\"properties\":{}}"
+                        "{\"type\":\"object\"}"
+                        "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}")
+             (map chat:spec-parameters specs)))
+     (is (== Nil (mcp:server-skipped server)))
+     ;; Every MCP tool needs a go-ahead. (Spec 0005 R1)
+     (is (list:all (fn (spec) (tools:gated? (mcp:server-tools server)
+                                            (chat:ToolCall "c1" (chat:spec-name spec) "{}")))
+                   specs))
+     (mcp:stop server))
+    ((Tuple (Err why) _)
+     (is (== "" why))
+     Unit)))
+
+(define-test mcp-a8-echo-gives-the-text-and-an-error-is-an-error ()
+  (let server = (mcp-started ""))
+  ;; The server sends a notice, a line that is not JSON, and another id's
+  ;; answer first.
+  (is (== "hi" (mcp-call server "test__echo" "{\"text\":\"hi\"}")))
+  (is (== "error: bad
+input" (mcp-call server "test__fail" "")))
+  (is (== "error: the MCP server \"test\" returned an error: unknown tool: nosuch"
+          (mcp:call-tool server "nosuch" "{}")))
+  (is (== "error: the arguments must be a JSON object" (mcp-call server "test__echo" "[1]")))
+  (is (== "hi again" (mcp-call server "test__echo" "{\"text\":\"hi again\"}")))
+  (mcp:stop server))
+
+(define-test mcp-a-call-with-no-answer-times-out ()
+  (let server = (mcp-started ""))
+  (let start = (now-ms))
+  (is (== "error: the MCP server \"test\" did not answer in 1 second"
+          (mcp-call server "test__hang" "{}")))
+  (let took = (- (now-ms) start))
+  (is (>= took 900))
+  (is (< took 3000))
+  ;; The server lives on.
+  (is (not (mcp:ended? server)))
+  (is (== "hi" (mcp-call server "test__echo" "{\"text\":\"hi\"}")))
+  (mcp:stop server))
+
+(define-test mcp-a10-a-server-that-ends-gives-errors ()
+  (let server = (mcp-started ""))
+  (is (== "error: the MCP server \"test\" has ended" (mcp-call server "test__exit" "{}")))
+  (is (mcp:ended? server))
+  (is (== "error: the MCP server \"test\" has ended"
+          (mcp-call server "test__echo" "{\"text\":\"hi\"}"))))
+
+(define-test mcp-a10-a-killed-server-gives-errors ()
+  (let server = (mcp-started ""))
+  (let pid = (mcp:server-pid server))
+  (lisp (-> Unit) (pid) (cffi:foreign-funcall "kill" :int (cl:- pid) :int 9 :int) Unit)
+  (is (== "error: the MCP server \"test\" has ended"
+          (mcp-call server "test__echo" "{\"text\":\"hi\"}")))
+  (is (mcp:ended? server))
+  (is (== "error: the MCP server \"test\" has ended"
+          (mcp-call server "test__echo" "{\"text\":\"hi\"}"))))
+
+(define-test mcp-a10-a-server-that-cannot-start-is-an-error-naming-it ()
+  (is (== "the MCP server \"gone\" ended before it answered initialize"
+          (mcp-error-of (fst (mcp-start "gone" "/nonexistent/dakusui-mcp-server")))))
+  (is (== "the MCP server \"test\" did not answer initialize in 1 second"
+          (mcp-error-of (fst (mcp-start "test" (mcp-script-command "hang"))))))
+  (is (== "the MCP server \"test\" refused initialize: not today"
+          (mcp-error-of (fst (mcp-start "test" (mcp-script-command "refuse"))))))
+  (let fake = (fake-helper (make-list "{\"ok\":false,\"error\":\"no such process\"}") False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (is (== "the MCP server \"test\" did not start: the command did not run, since it could not be confined: the helper refused: no such process"
+          (mcp-error-of (mcp:start-limited c "/" "test" (mcp-script-command "") Nil 1 1))))
+  (let _ = (requests-of fake c))
+  Unit)
+
+(define-test mcp-a-tool-with-a-bad-name-is-skipped ()
+  (let server = (mcp-started "odd"))
+  (is (== (make-list "test__has space") (mcp:server-skipped server)))
+  (is (== (make-list "test__echo" "test__fail" "test__exit" "test__hang" "test__read")
+          (map chat:spec-name (tools:specs (mcp:server-tools server)))))
+  (mcp:stop server))
+
+(define-test mcp-tool-names-are-what-openai-takes ()
+  (is (mcp:tool-name? "test__echo"))
+  (is (mcp:tool-name? "a-B_9"))
+  (is (mcp:tool-name? (lisp (-> String) () (cl:make-string 64 :initial-element #\a))))
+  (is (not (mcp:tool-name? (lisp (-> String) () (cl:make-string 65 :initial-element #\a)))))
+  (is (not (mcp:tool-name? "")))
+  (is (not (mcp:tool-name? "a.b")))
+  (is (not (mcp:tool-name? (lisp (-> String) () (cl:string (cl:code-char 233)))))))
+
+(define-test mcp-a-server-that-lists-pages-forever-does-not-start ()
+  (is (== "the MCP server \"test\" listed more than 100 pages of tools"
+          (mcp-error-of (fst (mcp-start "test" (mcp-script-command "endless")))))))

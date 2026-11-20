@@ -30,7 +30,17 @@ run code, such as an SBCL image saved with runtime options.
 
 ## Consequences
 
+The child keeps its bounding set, since dropping it needs CAP_SETPCAP.
+`no_new_privs` does the same job: no exec in the child or its descendants
+gains a capability. Exec also resets the dumpable flag, so the agent clears it
+itself. (Added 2026-11-07, T13.)
+
 `setcap` must run again after every build. File capabilities do not work on a
 `nosuid` mount. The helper lives and dies with the Dakusui session, so the
 policy does too. The spike showed the two capabilities are enough to load and
 attach every program without `sudo` (`bpfstudy/`).
+
+The helper no longer takes enforcement with it: ADR 0008 pins the enforcer, so
+confined processes stay confined, and are denied everything, after the helper
+ends. `setcap` stays the only `sudo` for running Dakusui; install also adds a
+bpffs mount. (Added 2026-11-08, ADR 0008.)

@@ -1,0 +1,67 @@
+(in-package #:dakusui/test)
+
+;;; T13: the agent's process starts with nothing it should not have. (R11)
+;;; Without capabilities to drop, this shows the steps and the descriptors.
+;;; make attach-check shows the capabilities going.
+
+(coalton-toplevel
+  (declare status-script String)
+  (define status-script
+    "Run as the agent: report its status and descriptors over the socket."
+    (<> "grep -E '^(CapInh|CapPrm|CapEff|CapAmb|NoNewPrivs):' /proc/self/status >&3; "
+        "exec 1>&3; exec ls -l /proc/self/fd"))
+
+  (declare read-socket (I32 -> String))
+  (define (read-socket fd)
+    "Read the socket FD to its end, then close it."
+    (lisp (-> String) (fd)
+      (cl:with-open-stream (in (sb-sys:make-fd-stream fd :input cl:t
+                                                         :external-format :utf-8
+                                                         :auto-close cl:t))
+        (cl:with-output-to-string (out)
+          (cl:loop :for line := (cl:read-line in cl:nil)
+                   :while line
+                   :do (cl:write-line line out))))))
+
+  (declare spawn-report (Void -> String))
+  (define (spawn-report)
+    (match (spawn:start-agent "/bin/sh" (make-list "-c" status-script))
+      ((Ok agent)
+       (let report = (read-socket (spawn:agent-socket agent)))
+       (spawn:wait-agent agent)
+       report)
+      ((Err why) why)))
+
+  (declare has? (String * String -> Boolean))
+  (define (has? text part)
+    (string:substring? part text))
+
+  (declare tab String)
+  (define tab (into #\Tab))
+
+  (declare lines-with (String * String -> UFix))
+  (define (lines-with text part)
+    (list:length (list:filter (fn (line) (has? line part))
+                              (string:split #\Newline text)))))
+
+(define-test start-agent-sets-no-new-privs-and-clears-capabilities ()
+  (let report = (spawn-report))
+  (is (has? report (<> "NoNewPrivs:" (<> tab "1"))))
+  (is (has? report (<> "CapEff:" (<> tab "0000000000000000"))))
+  (is (has? report (<> "CapPrm:" (<> tab "0000000000000000"))))
+  (is (has? report (<> "CapInh:" (<> tab "0000000000000000"))))
+  (is (has? report (<> "CapAmb:" (<> tab "0000000000000000")))))
+
+(define-test start-agent-passes-only-the-socket-on-fd-3 ()
+  (let report = (spawn-report))
+  (is (has? report " 3 -> socket:"))
+  ;; From fd 4 up, only the directory that ls itself opens to list them.
+  (is (has? report " 4 -> /proc/"))
+  (is (== 0 (lines-with report " 5 -> ")))
+  (is (not (has? report "bpf"))))
+
+(define-test start-agent-ends-the-child-when-exec-fails ()
+  (is (== 127
+          (match (spawn:start-agent "/no/such/agent" Nil)
+            ((Ok agent) (spawn:wait-agent agent))
+            ((Err _) 0)))))

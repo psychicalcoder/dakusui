@@ -1,0 +1,60 @@
+(defpackage #:dakusui/helper
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:libbpf #:dakusui/libbpf)
+                    (#:enforcer #:dakusui/enforcer)
+                    (#:pins #:dakusui/pins)
+                    (#:cleanup #:dakusui/cleanup)
+                    (#:spawn #:dakusui/spawn)
+                    (#:serve #:dakusui/serve))
+  (:export #:main))
+(in-package #:dakusui/helper)
+
+(coalton-toplevel
+  (declare complain (String -> Unit))
+  (define (complain text)
+    (lisp (-> Unit) (text)
+      (cl:format cl:*error-output* "dakusui: ~A~%" text)
+      (cl:finish-output cl:*error-output*)
+      Unit))
+
+  (declare run-agent (libbpf:BpfObject * spawn:Agent -> UFix))
+  (define (run-agent obj agent)
+    "Serve the agent until it closes its end, then wait for it, and clear our
+session. If serving cannot start, close our end, so the agent sees the helper
+gone. (R9)"
+    (let served = (serve:serve-agent obj (spawn:agent-socket agent)))
+    (let _ = (libbpf:close-fd (spawn:agent-socket agent)))
+    (let code = (spawn:wait-agent agent))
+    (cleanup:clear-own-session)
+    (match served
+      ((Err why)
+       (complain why)
+       1)
+      ((Ok _) (lisp (-> UFix) (code) code))))
+
+  (declare arguments (Void -> List String))
+  (define (arguments)
+    "Our arguments, which go to the agent unread: the helper takes no option
+of its own. (R11, spec 0002 R11)"
+    (lisp (-> (List String)) ()
+      (cl:mapcar (cl:lambda (a) (cl:coerce a '(cl:simple-array cl:character (cl:*))))
+                 (cl:rest sb-ext:*posix-argv*))))
+
+  (declare main (Void -> UFix))
+  (define (main)
+    "Start enforcement and then the agent, or exit non-zero before anything
+runs. (R9, R11) Exit with the agent's code. Every exit but a crash clears our
+session."
+    (match (do
+            (lsm-list <- (enforcer:read-lsm-list))
+            (enforcer:check-lsm lsm-list)
+            (pins:check-system-pins)
+            (let _ = (cleanup:clear-stale-sessions (pins:pin-root (pins:real-uid))))
+            (obj <- (enforcer:start lsm-list))
+            (agent <- (spawn:start-agent (spawn:agent-path) (arguments)))
+            (pure (Tuple obj agent)))
+      ((Err why)
+       (complain why)
+       (cleanup:clear-own-session)
+       1)
+      ((Ok (Tuple obj agent)) (run-agent obj agent)))))

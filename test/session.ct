@@ -1,0 +1,264 @@
+(in-package #:dakusui/test)
+
+;;; T16: the agent's protocol client and its ordered policy. (R4, R13, R14)
+;;; A fake helper is the far end of a socketpair: its replies are written
+;;; before the client asks, and its requests are read after the client closes.
+
+(cl:defun fake-helper-fds (replies shut)
+  "A socketpair with REPLIES waiting for the agent end. With SHUT, the agent
+end then reads end of file. Return the agent end and the helper end."
+  (cffi:with-foreign-object (fds :int 2)
+    (cffi:foreign-funcall "socketpair" :int 1 :int 1 :int 0 :pointer fds :int)
+    (cl:let ((agent (cffi:mem-aref fds :int 0))
+             (helper (cffi:mem-aref fds :int 1))
+             (octets (sb-ext:string-to-octets (cl:format cl:nil "~{~A~%~}" replies)
+                                              :external-format :utf-8)))
+      (cffi:with-pointer-to-vector-data (p octets)
+        (cffi:foreign-funcall "write" :int helper :pointer p :size (cl:length octets) :long))
+      (cl:when shut
+        (cffi:foreign-funcall "shutdown" :int helper :int 1 :int))
+      (cl:list agent helper))))
+
+(cl:defun make-temp-tree (directories files links)
+  "A fresh directory holding DIRECTORIES, empty FILES, and LINKS, each a list
+of a link and its target. Every name is relative to the new directory."
+  (cl:let ((base (cffi:with-foreign-string (template "/tmp/dakusui-test-XXXXXX")
+                   (cffi:foreign-string-to-lisp
+                    (cffi:foreign-funcall "mkdtemp" :pointer template :pointer)))))
+    (cl:flet ((at (name) (cl:format cl:nil "~A/~A" base name)))
+      (cl:dolist (d directories)
+        (cl:ensure-directories-exist (cl:format cl:nil "~A/" (at d))))
+      (cl:dolist (f files)
+        (cl:with-open-file (out (at f) :direction :output)))
+      (cl:dolist (l links)
+        (cffi:foreign-funcall "symlink" :string (at (cl:second l)) :string (at (cl:first l)) :int)))
+    base))
+
+(cl:defun remove-temp-tree (base)
+  "rm -rf does not follow symlinks."
+  (uiop:run-program (cl:list "rm" "-rf" "--" base)))
+
+(coalton-toplevel
+  (define-struct Fake
+    (agent I32)
+    (helper I32))
+
+  (declare fake-helper (List String * Boolean -> Fake))
+  (define (fake-helper replies shut)
+    (let fds = (lisp (-> (List I32)) (replies shut) (fake-helper-fds replies shut)))
+    (Fake (with-default -1 (list:index 0 fds)) (with-default -1 (list:index 1 fds))))
+
+  (declare wait-until ((Void -> Boolean) -> Boolean))
+  (define (wait-until done?)
+    "Poll DONE? for up to two seconds."
+    (lisp (-> Boolean) (done?)
+      (cl:loop :repeat 200
+               :when (call-coalton-function done?) :return cl:t
+               :do (cl:sleep 0.01)
+               :finally (cl:return (call-coalton-function done?)))))
+
+  (declare ok-replies (UFix -> List String))
+  (define (ok-replies n)
+    (list:repeat n "{\"ok\":true}"))
+
+  (declare ignore-event (String -> Unit))
+  (define (ignore-event _) Unit)
+
+  (declare requests-of (Fake * client:Client -> List String))
+  (define (requests-of fake c)
+    "Close the client, then return each line the fake helper got."
+    (client:disconnect c)
+    (list:filter (fn (line) (/= line ""))
+                 (string:split #\Newline (read-socket (.helper fake)))))
+
+  (declare policies-of (List String -> List (Result String protocol:Request)))
+  (define (policies-of lines)
+    (map protocol:decode-request lines))
+
+  (declare sent (policy:Policy -> Result String protocol:Request))
+  (define (sent pol)
+    (Ok (protocol:PolicyRequest pol)))
+
+  (declare rule-of (String -> policy:Rule))
+  (define (rule-of line)
+    (unwrap (policy:parse-rule line)))
+
+  (declare temp-tree (List String * List String * List (Tuple String String) -> String))
+  (define (temp-tree directories files links)
+    "Make the tree, and return its base with symlinks resolved."
+    (let pairs = (map (fn ((Tuple link target)) (make-list link target)) links))
+    (session:resolve-path
+     (lisp (-> String) (directories files pairs) (make-temp-tree directories files pairs))))
+
+  (declare remove-tree (String -> Unit))
+  (define (remove-tree base)
+    (lisp (-> Unit) (base) (remove-temp-tree base) Unit))
+
+  (declare started (client:Client * String * String -> session:Session))
+  (define (started c project home)
+    (unwrap (session:start c project home Nil))))
+
+;;; The request text.
+
+(define-test policy-line-decodes-to-the-same-policy ()
+  (let pol = (policy:Policy
+              (<> (match (standard-default) ((policy:Policy rules) rules))
+                  (make-list (rule-of "allow read,write /my\\ dir")
+                             (rule-of "deny write name:a\\*b")))))
+  (is (== (sent pol) (protocol:decode-request (client:policy-line pol))))
+  (is (== (sent (policy:Policy Nil))
+          (protocol:decode-request (client:policy-line (policy:Policy Nil))))))
+
+;;; The client.
+
+(define-test client-passes-events-and-waits-for-the-reply ()
+  (let event = "{\"event\":\"denial\",\"pid\":1,\"comm\":\"cat\",\"hook\":\"file_open\",\"kind\":\"read\",\"reason\":\"denied by rule\",\"path\":\"/x\"}")
+  (let fake = (fake-helper (make-list event event "{\"ok\":true}") False))
+  (let events = (cell:new Nil))
+  (let c = (client:connect (.agent fake) (fn (line) (cell:push! events line) Unit)))
+  (is (== (Ok Unit) (client:send-flag c 5)))
+  (is (== (make-list event event) (cell:read events)))
+  (is (== (make-list (Ok (protocol:FlagRequest 5)))
+          (policies-of (requests-of fake c)))))
+
+(define-test client-reports-a-refusal ()
+  (let fake = (fake-helper (make-list "{\"ok\":false,\"error\":\"no map\"}") False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (is (== (Err "the helper refused: no map") (client:send-flag c 5)))
+  (requests-of fake c)
+  Unit)
+
+(define-test client-fails-when-the-helper-is-gone ()
+  (let closed = (fake-helper Nil True))
+  (let c = (client:connect (.agent closed) ignore-event))
+  (is (== (Err "the helper closed the socket") (client:send-policy c (policy:Policy Nil))))
+  (requests-of closed c)
+  (let garbled = (fake-helper (make-list "nope") False))
+  (let d = (client:connect (.agent garbled) ignore-event))
+  (is (== (Err "the helper refused: the helper sent a line that is not a JSON object")
+          (client:send-flag d 1)))
+  (requests-of garbled d)
+  Unit)
+
+;;; The ordered policy.
+
+(define-test session-starts-with-an-empty-rule-set ()
+  (let fake = (fake-helper (ok-replies 1) False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (let s = (started c "/no-such-dakusui/u/proj" "/no-such-dakusui/u"))
+  (let expected = (unwrap (policy:session-policy "/no-such-dakusui/u/proj"
+                                                 "/no-such-dakusui/u" Nil)))
+  (is (== Nil (session:set-rules s)))
+  (is (== expected (session:current-policy s)))
+  (is (== (make-list (sent expected)) (policies-of (requests-of fake c)))))
+
+(define-test session-replaces-the-policy-at-run-time ()
+  (let project = "/no-such-dakusui/u/proj")
+  (let home = "/no-such-dakusui/u")
+  (let policy-with = (fn (lines) (unwrap (policy:session-policy project home (map rule-of lines)))))
+  (let fake = (fake-helper (ok-replies 5) False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (let s0 = (started c project home))
+  (let s1 = (unwrap (session:add-rule s0 (rule-of "allow read /a"))))
+  (let s2 = (unwrap (session:add-rule s1 (rule-of "deny write name:x"))))
+  (let s3 = (unwrap (session:remove-rule s2 1)))
+  (let s4 = (unwrap (session:replace-rules s3 (make-list (rule-of "allow read /b")
+                                                         (rule-of "allow read /c")))))
+  (is (== (make-list (rule-of "deny write name:x")) (session:set-rules s3)))
+  (is (== (policy-with (make-list "allow read /b" "allow read /c")) (session:current-policy s4)))
+  (is (== (make-list (sent (policy-with Nil))
+                     (sent (policy-with (make-list "allow read /a")))
+                     (sent (policy-with (make-list "allow read /a" "deny write name:x")))
+                     (sent (policy-with (make-list "deny write name:x")))
+                     (sent (policy-with (make-list "allow read /b" "allow read /c"))))
+          (policies-of (requests-of fake c)))))
+
+(define-test session-sends-nothing-for-a-bad-change ()
+  (let fake = (fake-helper (make-list "{\"ok\":true}" "{\"ok\":false,\"error\":\"full\"}") False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (let s = (started c "/no-such-dakusui/p" "/no-such-dakusui/h"))
+  (is (== (Err "no rule 0 in the rule set") (map (fn (_) Unit) (session:remove-rule s 0))))
+  (is (== (Err "no rule 1 in the rule set") (map (fn (_) Unit) (session:remove-rule s 1))))
+  (is (== (Err "the helper refused: full")
+          (map (fn (_) Unit) (session:add-rule s (rule-of "allow read /a")))))
+  ;; The start, and the add the helper refused.
+  (is (== 2 (list:length (requests-of fake c)))))
+
+;;; Symlinks. (R13)
+
+(define-test resolve-path-keeps-what-does-not-exist ()
+  (let base = (temp-tree (make-list "data/s") (make-list "data/s/f")
+                         (make-list (Tuple "s" "data/s"))))
+  (is (== "/" (session:resolve-path "/")))
+  (is (== "/no-such-dakusui/a/b" (session:resolve-path "/no-such-dakusui/a/b")))
+  (is (== (<> base "/data/s") (session:resolve-path (<> base "/s"))))
+  (is (== (<> base "/data/s/a/b") (session:resolve-path (<> base "/s/a/b"))))
+  (is (== (<> base "/data/s/f/x") (session:resolve-path (<> base "/s/f/x"))))
+  (remove-tree base))
+
+(define-test a17-home-through-a-symlink-stays-denied ()
+  (let base = (temp-tree (make-list "real/u/.ssh" "real/u/proj")
+                         (make-list "real/u/.ssh/id_ed25519")
+                         (make-list (Tuple "link" "real"))))
+  (let key = (<> base "/real/u/.ssh/id_ed25519"))
+  (let fake = (fake-helper (ok-replies 1) False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (let s = (started c (<> base "/link/u/proj") (<> base "/link/u")))
+  (let read-only = (policy:Kinds policy:Read Nil))
+  ;; Unresolved, the deny would name the symlink, which the enforcer never sees.
+  (is (policy:allows? (unwrap (policy:default-policy (<> base "/link/u/proj") (<> base "/link/u")))
+                      read-only key))
+  (is (not (policy:allows? (session:current-policy s) read-only key)))
+  (is (policy:allows? (session:current-policy s)
+                      (policy:Kinds policy:Read (make-list policy:Write))
+                      (<> base "/real/u/proj/a.c")))
+  (is (== (make-list (sent (session:current-policy s))) (policies-of (requests-of fake c))))
+  (remove-tree base))
+
+(define-test a17-added-rule-names-the-real-path ()
+  (let base = (temp-tree (make-list "data/s") Nil (make-list (Tuple "s" "data/s"))))
+  (let fake = (fake-helper (ok-replies 3) False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (let s = (started c "/no-such-dakusui/p" "/no-such-dakusui/h"))
+  (let added = (unwrap (session:add-rule s (rule-of (<> "deny read " (<> base "/s/new"))))))
+  (is (== (make-list (rule-of (<> "deny read " (<> base "/data/s/new"))))
+          (session:set-rules added)))
+  (is (== (make-list (rule-of "deny read name:new"))
+          (session:set-rules (unwrap (session:replace-rules s (make-list (rule-of "deny read name:new")))))))
+  (requests-of fake c)
+  (remove-tree base))
+
+;;; T19: the policy as text. (R8, A14)
+
+(define-test a14-policy-text-lists-the-rules-as-enforced ()
+  (let base = (temp-tree (make-list "data/s") Nil (make-list (Tuple "s" "data/s"))))
+  (let fake = (fake-helper (ok-replies 2) False))
+  (let c = (client:connect (.agent fake) ignore-event))
+  (let s = (started c "/no-such-dakusui/u/proj" "/no-such-dakusui/u"))
+  (let changed = (unwrap (session:replace-rules
+                          s (make-list (rule-of (<> "deny read " (<> base "/s/new/")))
+                                       (rule-of "allow read /my\\ dir")))))
+  (let text = (session:policy-text changed))
+  (is (== (mconcat
+           (make-list "allow read /
+allow read,write /no-such-dakusui/u/proj
+allow write /tmp
+allow write /dev/null
+allow write /dev/tty
+deny read,write /no-such-dakusui/u/.ssh
+deny read,write /no-such-dakusui/u/.aws
+deny read,write /no-such-dakusui/u/.gnupg
+deny read,write /no-such-dakusui/u/.config/dakusui
+deny read,write name:.env
+deny read " base "/data/s/new
+allow read /my\\ dir
+deny write /no-such-dakusui/u/proj/.dakusui
+"))
+          text))
+  ;; Each line parses back to the rule in force at its place.
+  (is (== (Ok (session:current-policy changed))
+          (map policy:Policy
+               (traverse policy:parse-rule
+                         (list:filter (fn (line) (/= line "")) (string:split #\Newline text))))))
+  (requests-of fake c)
+  (remove-tree base))

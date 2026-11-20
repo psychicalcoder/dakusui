@@ -1,0 +1,39 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0004 T1: the command line. (R4, R7; spec 0005 R7; spec 0002 R11)
+
+(coalton-toplevel
+  (declare parsed (List String -> Result String options:Options))
+  (define (parsed args)
+    (options:parse-options args)))
+
+(define-test options-default-is-the-agent-role ()
+  (is (== (Ok (options:Options "agent" None False None)) (parsed Nil))))
+
+(define-test options-each-option ()
+  (is (== (Ok (options:Options "judge" None False None))
+          (parsed (make-list "--role" "judge"))))
+  (is (== (Ok (options:Options "agent" (Some "strict") False None))
+          (parsed (make-list "--rules" "strict"))))
+  (is (== (Ok (options:Options "agent" None True None))
+          (parsed (make-list "--auto"))))
+  (is (== (Ok (options:Options "agent" None False (Some "hi")))
+          (parsed (make-list "-p" "hi")))))
+
+(define-test options-all-together-in-any-order ()
+  (is (== (Ok (options:Options "cloud" (Some "strict") True (Some "hi")))
+          (parsed (make-list "-p" "hi" "--auto" "--rules" "strict" "--role" "cloud"))))
+  (is (== (Ok (options:Options "b" None False None))
+          (parsed (make-list "--role" "a" "--role" "b")))))
+
+(define-test options-a-missing-value-names-the-option ()
+  (is (== (Err (<> "--role needs a NAME; " options:usage)) (parsed (make-list "--role"))))
+  (is (== (Err (<> "--rules needs a NAME; " options:usage))
+          (parsed (make-list "--auto" "--rules"))))
+  (is (== (Err (<> "-p needs a TEXT; " options:usage)) (parsed (make-list "-p")))))
+
+(define-test options-an-unknown-option-lists-the-known-ones ()
+  (is (== (Err "unknown option --help; usage: dakusui [--role NAME] [--rules NAME] [--auto] [-p TEXT]")
+          (parsed (make-list "--help"))))
+  (is (== (Err (<> "unknown option stray; " options:usage))
+          (parsed (make-list "--auto" "stray")))))

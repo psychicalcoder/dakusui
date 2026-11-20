@@ -1,0 +1,298 @@
+(defpackage #:dakusui/pins
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:list #:coalton/list))
+  (:export #:read-text-file
+           #:unprivileged-bpf-file #:check-unprivileged-bpf
+           #:DirStatus #:read-dir-status #:check-pin-root
+           #:real-uid #:pin-root #:check-system-pins
+           #:stat-fields #:proc-stat-fields #:session-name #:parse-session-name
+           #:own-session-dir #:make-session-dir #:pin-path #:confined-pin
+           #:session-entries #:remove-session))
+(in-package #:dakusui/pins)
+
+;;; Where the enforcer's pins live, and what must hold before the helper uses
+;;; them. (R9, ADR 0008, plan part 4)
+;;;
+;;; Each user owns a bpffs at /run/dakusui/<uid>, mounted at boot. The path is
+;;; fixed: the capability-bearing binary takes no input that could name it.
+;;; The pins sit in a directory the user owns, so only the bpf() syscall keeps
+;;; a confined command from them, and only while unprivileged BPF is off.
+
+(cl:defconstant +bpf-fs-magic+ #xcafe4a11)
+
+(cl:defun dir-status (path)
+  "lstat and statfs PATH. Return (values directory-p owner mode fs-type), or a
+string that says why not."
+  (cl:handler-case
+      (cl:let* ((stat (sb-posix:lstat path))
+                (mode (sb-posix:stat-mode stat)))
+        (cl:if (cl:/= (cl:logand mode sb-posix:s-ifmt) sb-posix:s-ifdir)
+               (cl:values cl:nil (sb-posix:stat-uid stat) (cl:logand mode #o7777) 0)
+               ;; struct statfs is 120 bytes on x86-64; f_type is its first long.
+               (cffi:with-foreign-object (buffer :uint8 256)
+                 (cl:if (cl:< (cffi:foreign-funcall "statfs" :string path :pointer buffer :int) 0)
+                        (cl:format cl:nil "statfs: ~A" (sb-int:strerror (sb-alien:get-errno)))
+                        (cl:values cl:t (sb-posix:stat-uid stat) (cl:logand mode #o7777)
+                                   (cffi:mem-ref buffer :long))))))
+    (sb-posix:syscall-error (e)
+      (sb-int:strerror (sb-posix:syscall-errno e)))))
+
+(cl:defun errno-text (e)
+  (sb-int:strerror (sb-posix:syscall-errno e)))
+
+(cl:defun directory-names (path)
+  "The names in directory PATH, without . and .., or a string saying why not."
+  (cl:handler-case
+      (cl:let ((dir (sb-posix:opendir path)))
+        (cl:unwind-protect
+             (cl:loop :for entry := (sb-posix:readdir dir)
+                      :until (sb-alien:null-alien entry)
+                      :for name := (sb-posix:dirent-name entry)
+                      :unless (cl:member name '("." "..") :test #'cl:string=)
+                        :collect name)
+          (sb-posix:closedir dir)))
+    (sb-posix:syscall-error (e) (errno-text e))))
+
+(cl:defun remove-entry (call function path)
+  "Call FUNCTION on PATH. A path that is already gone is no failure, since
+another helper may be clearing the same session. Return NIL or a reason."
+  (cl:handler-case (cl:progn (cl:funcall function path) cl:nil)
+    (sb-posix:syscall-error (e)
+      (cl:if (cl:= (sb-posix:syscall-errno e) sb-posix:enoent)
+             cl:nil
+             (cl:format cl:nil "~A ~A: ~A" call path (errno-text e))))))
+
+(coalton-toplevel
+  (declare read-text-file (String -> Result String String))
+  (define (read-text-file path)
+    (lisp (-> (Result String String)) (path)
+      (cl:handler-case
+          (cl:let ((text (uiop:read-file-string path)))
+            (coalton (Ok (lisp (-> String) () text))))
+        (cl:error (e)
+          (cl:let ((why (cl:let ((cl:*print-pretty* cl:nil)) (cl:princ-to-string e))))
+            (coalton (Err (lisp (-> String) () why))))))))
+
+  (declare install-note String)
+  (define install-note "See the install steps in docs/install.md.")
+
+  (declare unprivileged-bpf-file String)
+  (define unprivileged-bpf-file "/proc/sys/kernel/unprivileged_bpf_disabled")
+
+  (declare check-unprivileged-bpf (Result String String -> Result String Unit))
+  (define (check-unprivileged-bpf read)
+    "READ is the text of unprivileged-bpf-file. With unprivileged BPF on, any
+confined command could open the pins, so refuse. (R9, ADR 0008)"
+    (match read
+      ((Err why)
+       (Err (mconcat (make-list "cannot read kernel.unprivileged_bpf_disabled: " why ". "
+                                install-note))))
+      ((Ok text)
+       (let value = (lisp (-> String) (text) (cl:string-trim '(#\Newline #\Space) text)))
+       (if (or (== value "1") (== value "2"))
+           (Ok Unit)
+           (Err (mconcat (make-list "kernel.unprivileged_bpf_disabled is " value
+                                    ", so any process could open the enforcer's pins. "
+                                    "Set it to 2 in /etc/sysctl.d. " install-note)))))))
+
+  (define-struct DirStatus
+    "What the helper needs to know about the pin root."
+    (directory? Boolean)
+    (owner UFix)
+    (mode UFix)
+    (fs-type UFix))
+
+  (declare read-dir-status (String -> Result String DirStatus))
+  (define (read-dir-status path)
+    "lstat PATH, so a symlink is not a directory, and statfs it if it is one."
+    (lisp (-> (Result String DirStatus)) (path)
+      (cl:multiple-value-bind (dir owner mode fs-type) (dir-status path)
+        (cl:if (cl:stringp dir)
+               (coalton (Err (lisp (-> String) () dir)))
+               (coalton (Ok (DirStatus (lisp (-> Boolean) () dir)
+                                       (lisp (-> UFix) () owner)
+                                       (lisp (-> UFix) () mode)
+                                       (lisp (-> UFix) () fs-type))))))))
+
+  (declare octal (UFix -> String))
+  (define (octal n)
+    (lisp (-> String) (n) (cl:format cl:nil "0~O" n)))
+
+  (declare decimal (UFix -> String))
+  (define (decimal n)
+    (lisp (-> String) (n) (cl:format cl:nil "~D" n)))
+
+  (declare mount-line (UFix -> String))
+  (define (mount-line uid)
+    "The mount entry install adds. The group is the user's own, and mode 0700
+keeps out the group anyway."
+    (mconcat (make-list "bpffs " (pin-root uid) " bpf uid=" (decimal uid) ",mode=0700")))
+
+  (declare check-pin-root (String * UFix * Result String DirStatus -> Result String Unit))
+  (define (check-pin-root path uid status)
+    "PATH, with STATUS, must be a bpffs directory that UID owns, with no group
+or other access. (R9, ADR 0008)"
+    (let fix = (mconcat (make-list " Mount it at boot with `" (mount-line uid) "`. "
+                                   install-note)))
+    (match status
+      ((Err why)
+       (Err (mconcat (make-list "cannot use " path " for the enforcer's pins: " why "." fix))))
+      ((Ok s)
+       (cond
+         ((not (.directory? s))
+          (Err (mconcat (make-list path " is not a directory." fix))))
+         ((/= (.fs-type s) (lisp (-> UFix) () +bpf-fs-magic+))
+          (Err (mconcat (make-list path " is not a bpffs." fix))))
+         ((/= (.owner s) uid)
+          (Err (mconcat (make-list path " belongs to uid " (decimal (.owner s))
+                                   ", not " (decimal uid) "." fix))))
+         ((/= 0 (let ((mode (.mode s))) (lisp (-> UFix) (mode) (cl:logand mode #o077))))
+          (Err (mconcat (make-list path " has mode " (octal (.mode s))
+                                   ", which lets the group or others in." fix))))
+         (True (Ok Unit))))))
+
+  (declare real-uid (Void -> UFix))
+  (define (real-uid)
+    "The real uid: the user who ran dakusui, whatever the file capabilities."
+    (lisp (-> UFix) () (sb-posix:getuid)))
+
+  (declare pin-root (UFix -> String))
+  (define (pin-root uid)
+    (<> "/run/dakusui/" (decimal uid)))
+
+  (declare check-system-pins (Void -> Result String Unit))
+  (define (check-system-pins)
+    "The checks of plan part 4, step 1, after the LSM list."
+    (let uid = (real-uid))
+    (let root = (pin-root uid))
+    (do
+     (check-unprivileged-bpf (read-text-file unprivileged-bpf-file))
+     (check-pin-root root uid (read-dir-status root)))))
+
+;;; Sessions. (T29, plan part 4)
+;;;
+;;; Each helper pins into <root>/<pid>-<start>, named for its pid and its
+;;; start time from /proc/<pid>/stat, so a later helper can tell whether the
+;;; session's helper is still the same process.
+
+(coalton-toplevel
+  (declare stat-fields (String -> Optional (List String)))
+  (define (stat-fields text)
+    "The fields of a /proc/<pid>/stat line after the command name, which may
+hold spaces and parentheses: index 0 is the state (field 3), and index 19 is
+the start time (field 22)."
+    (lisp (-> (Optional (List String))) (text)
+      (cl:let ((close (cl:position #\) text :from-end cl:t)))
+        (cl:if (cl:null close)
+               (coalton None)
+               (cl:let ((fields (cl:remove "" (uiop:split-string
+                                               (cl:string-trim '(#\Newline #\Space)
+                                                               (cl:subseq text (cl:1+ close)))
+                                               :separator " ")
+                                           :test #'cl:string=)))
+                 (coalton (Some (lisp (-> (List String)) () fields))))))))
+
+  (declare proc-stat-fields (String -> Result String (List String)))
+  (define (proc-stat-fields path)
+    "stat-fields of the file at PATH, such as /proc/42/stat."
+    (match (read-text-file path)
+      ((Err why) (Err why))
+      ((Ok text)
+       (match (stat-fields text)
+         ((Some fields) (Ok fields))
+         ((None) (Err (<> "cannot parse " path)))))))
+
+  (declare decimal-i32 (I32 -> String))
+  (define (decimal-i32 n)
+    (lisp (-> String) (n) (cl:format cl:nil "~D" n)))
+
+  (declare session-name (I32 * String -> String))
+  (define (session-name pid start)
+    (mconcat (make-list (decimal-i32 pid) "-" start)))
+
+  (declare parse-session-name (String -> Optional (Tuple I32 String)))
+  (define (parse-session-name name)
+    "The pid and start of a session's directory name, or None for any other
+name: digits, a dash, digits, and nothing else."
+    (lisp (-> (Optional (Tuple I32 String))) (name)
+      (cl:let ((dash (cl:position #\- name)))
+        (cl:flet ((digits-p (s)
+                    (cl:and (cl:plusp (cl:length s)) (cl:<= (cl:length s) 20)
+                            (cl:every (cl:lambda (c) (cl:char<= #\0 c #\9)) s))))
+          (cl:if (cl:and dash
+                         (digits-p (cl:subseq name 0 dash))
+                         (digits-p (cl:subseq name (cl:1+ dash))))
+                 (cl:let ((pid (cl:parse-integer name :end dash))
+                          (start (cl:subseq name (cl:1+ dash))))
+                   (cl:if (cl:<= 1 pid 2147483647)
+                          (coalton (Some (Tuple (lisp (-> I32) () pid)
+                                                (lisp (-> String) () start))))
+                          (coalton None)))
+                 (coalton None))))))
+
+  (declare own-session-dir (Void -> Result String String))
+  (define (own-session-dir)
+    "This helper's session directory. It is the same each time we ask."
+    (let pid = (lisp (-> I32) () (sb-posix:getpid)))
+    (do
+     (fields <- (proc-stat-fields "/proc/self/stat"))
+     (start <- (match (list:index 19 fields)
+                 ((Some start) (Ok start))
+                 ((None) (Err "cannot find the start time in /proc/self/stat"))))
+     (pure (mconcat (make-list (pin-root (real-uid)) "/" (session-name pid start))))))
+
+  (declare make-session-dir (Void -> Result String String))
+  (define (make-session-dir)
+    "Make this helper's session directory, mode 0700, and return its path."
+    (do
+     (dir <- (own-session-dir))
+     (lisp (-> (Result String String)) (dir)
+       (cl:handler-case
+           (cl:progn
+             (sb-posix:mkdir dir #o700)
+             (coalton (Ok (lisp (-> String) () dir))))
+         (sb-posix:syscall-error (e)
+           (cl:let ((why (cl:format cl:nil "cannot make ~A: ~A" dir (errno-text e))))
+             (coalton (Err (lisp (-> String) () why)))))))))
+
+  (declare pin-path (String * String -> String))
+  (define (pin-path dir name)
+    (mconcat (make-list dir "/" name)))
+
+  (declare confined-pin String)
+  (define confined-pin
+    "The pinned confined map, which cleanup needs to find a session's tasks."
+    "confined")
+
+  (declare session-entries (String -> Result String (List String)))
+  (define (session-entries dir)
+    "The names pinned in DIR."
+    (lisp (-> (Result String (List String))) (dir)
+      (cl:let ((names (directory-names dir)))
+        (cl:if (cl:stringp names)
+               (cl:let ((why (cl:format cl:nil "cannot list ~A: ~A" dir names)))
+                 (coalton (Err (lisp (-> String) () why))))
+               (coalton (Ok (lisp (-> (List String)) () names)))))))
+
+  (declare remove-session (String -> Result String Unit))
+  (define (remove-session dir)
+    "Unpin everything in DIR, then remove it. The links go first, which
+detaches the session's hooks, and the confined map last, so a session left
+without its map never confined anything, or was already cleared. A session
+that is already gone, in whole or in part, is no failure. Call this only once
+no task the session confines lives. (R9)"
+    (let listed = (session-entries dir))
+    (let names = (match listed ((Ok names) names) ((Err _) Nil)))
+    (let ordered = (<> (list:filter (fn (n) (/= n confined-pin)) names)
+                       (list:filter (fn (n) (== n confined-pin)) names)))
+    (let failures =
+      (lisp (-> (List String)) (dir ordered)
+        (cl:remove cl:nil
+                   (cl:append
+                    (cl:loop :for name :in ordered
+                             :collect (remove-entry "unlink" #'sb-posix:unlink
+                                                    (cl:format cl:nil "~A/~A" dir name)))
+                    (cl:list (remove-entry "rmdir" #'sb-posix:rmdir dir))))))
+    (match failures
+      ((Nil) (Ok Unit))
+      ((Cons why _) (Err why)))))

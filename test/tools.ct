@@ -1,0 +1,180 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0003 T1 and T4: the tool list, argument readers, bash, and
+;;; show_policy. (R1, R2, R3, R5, R6, R7) A live fake helper answers each
+;;; request as it comes, so commands run unconfined. Before it answers a sync,
+;;; it sends the denial events it was given, as the real helper sends what the
+;;; ring buffer holds. make attach-check runs A3, A4, and A6 confined.
+
+(cl:defun live-fake-helper (events)
+  "A socketpair whose far end answers every request line with ok, sending
+EVENTS before each answer to a sync. Return the agent end and a thread that
+returns the request lines once the agent closes its end."
+  (cffi:with-foreign-object (fds :int 2)
+    (cffi:foreign-funcall "socketpair" :int 1 :int 1 :int 0 :pointer fds :int)
+    (cl:let ((agent (cffi:mem-aref fds :int 0))
+             (helper (cffi:mem-aref fds :int 1)))
+      (cl:list
+       agent
+       (sb-thread:make-thread
+        (cl:lambda ()
+          (cl:with-open-stream (io (sb-sys:make-fd-stream helper :input cl:t :output cl:t
+                                                                 :external-format :utf-8
+                                                                 :auto-close cl:t))
+            (cl:loop :for line := (cl:ignore-errors (cl:read-line io cl:nil))
+                     :while line
+                     :collect line
+                     :do (cl:ignore-errors
+                          (cl:when (cl:search "\"sync\"" line)
+                            (cl:dolist (e events) (cl:write-line e io)))
+                          (cl:write-line "{\"ok\":true}" io)
+                          (cl:finish-output io)))))
+        :name "live fake helper")))))
+
+(coalton-toplevel
+  (repr :native sb-thread:thread)
+  (define-type LispThread)
+
+  (define-struct Rig
+    "A session on a live fake helper, in a temp tree with the project at p."
+    (client client:Client)
+    (sessions (cell:Cell session:Session))
+    (dlog denials:DenialLog)
+    (base String)
+    (thread LispThread))
+
+  (declare make-rig (List String -> Rig))
+  (define (make-rig events)
+    (let base = (temp-tree (make-list "p") Nil Nil))
+    (let pair = (lisp (-> (Tuple I32 LispThread)) (events)
+                  (cl:destructuring-bind (fd thread) (live-fake-helper events)
+                    (coalton (Tuple (lisp (-> I32) () fd) (lisp (-> LispThread) () thread))))))
+    (let dlog = (denials:open-log (<> base "/denials.log")))
+    (let c = (client:connect (fst pair) (denials:on-event dlog)))
+    (let s = (unwrap (session:start c (<> base "/p") base Nil)))
+    (Rig c (cell:new s) dlog base (snd pair)))
+
+  (declare rig-project (Rig -> String))
+  (define (rig-project r) (<> (.base r) "/p"))
+
+  (declare rig-tools (Rig -> tools:Tools))
+  (define (rig-tools r)
+    (tools:builtin-tools (.sessions r) (.dlog r)))
+
+  (declare unrig (Rig -> List String))
+  (define (unrig r)
+    "Close the client, remove the tree, and return the requests the fake got."
+    (client:disconnect (.client r))
+    (let thread = (.thread r))
+    (let lines = (lisp (-> (List String)) (thread)
+                   (cl:mapcar #'simple-string (sb-thread:join-thread thread :default cl:nil))))
+    (remove-tree (.base r))
+    lines)
+
+  (declare op-count (String * List String -> UFix))
+  (define (op-count op lines)
+    "How many of the request LINES are the op OP."
+    (list:length (list:filter (fn (line) (has? line (mconcat (make-list "\"op\":\"" op "\"")))) lines)))
+
+  (declare tool-call (Rig * String * String -> String))
+  (define (tool-call r name arguments)
+    (tools:call (rig-tools r) (chat:ToolCall "c1" name arguments)))
+
+  (declare bash (Rig * String -> String))
+  (define (bash r command)
+    (tool-call r "bash" (<> "{\"command\":" (<> (chat:quoted command) "}")))))
+
+(define-test tools-a1-list-bash-then-show-policy ()
+  (let r = (make-rig Nil))
+  (let specs = (tools:specs (rig-tools r)))
+  (is (== (make-list "bash" "show_policy") (map chat:spec-name specs)))
+  ;; sent-tools keeps only tools with an object schema.
+  (is (== (make-list "bash" "show_policy") (sent-tools (chat:request-json "m" Nil specs))))
+  (unrig r)
+  Unit)
+
+(define-test tools-a2-bash-names-the-bad-argument ()
+  (let r = (make-rig Nil))
+  (is (== "error: argument \"command\" must be a string, not an integer"
+          (tool-call r "bash" "{\"command\": 5}")))
+  (is (== "error: missing argument \"command\", a string" (tool-call r "bash" "{}")))
+  (is (== "error: argument \"timeout\" must be an integer, not a string"
+          (tool-call r "bash" "{\"command\":\"true\",\"timeout\":\"9\"}")))
+  (is (== "error: argument \"timeout\" must be from 1 to 600 seconds"
+          (tool-call r "bash" "{\"command\":\"true\",\"timeout\":601}")))
+  (is (== "error: the arguments must be a JSON object" (tool-call r "bash" "[1]")))
+  (is (has? (tool-call r "bash" "{\"command\":") "error: the arguments are not JSON"))
+  ;; Nothing ran: the helper got the session policy and no flag.
+  (let requests = (unrig r))
+  (is (== 0 (op-count "flag" requests))))
+
+(define-test tools-bash-is-gated-and-show-policy-is-not ()
+  ;; Spec 0005 R1. An unknown tool cannot run, so it needs no gate.
+  (let r = (make-rig Nil))
+  (let gated = (fn (name) (tools:gated? (rig-tools r) (chat:ToolCall "c1" name "{}"))))
+  (is (gated "bash"))
+  (is (not (gated "show_policy")))
+  (is (not (gated "nosuch")))
+  (unrig r)
+  Unit)
+
+(define-test tools-an-unknown-tool-is-an-error-result ()
+  (let r = (make-rig Nil))
+  (is (== "error: unknown tool \"nosuch\"; the tools are bash, show_policy"
+          (tool-call r "nosuch" "{}")))
+  (unrig r)
+  Unit)
+
+(define-test tools-a3-bash-gives-output-and-exit-code ()
+  (let r = (make-rig Nil))
+  (let result = (bash r "echo out; echo err >&2; exit 3"))
+  (is (== "out
+err
+exit code 3" result))
+  (is (== (rig-project r) (bash r "pwd")))
+  (is (== "(no output)" (bash r "true")))
+  (let requests = (unrig r))
+  ;; Each command was flagged, then synced.
+  (is (== 3 (op-count "flag" requests)))
+  (is (== 3 (op-count "sync" requests))))
+
+(define-test tools-a5-a-long-result-keeps-both-ends ()
+  (let r = (make-rig Nil))
+  (let result = (bash r "printf S; head -c 99998 /dev/zero | tr '\\0' x; printf E"))
+  (let xs = (fn (n) (lisp (-> String) (n) (cl:make-string n :initial-element #\x))))
+  (is (== (mconcat (make-list "S" (xs 14999) "
+[... 70000 characters cut ...]
+" (xs 14999) "E"))
+          result))
+  (unrig r)
+  Unit)
+
+(define-test tools-shorten-cuts-only-past-the-limit ()
+  (let text = (fn (n) (lisp (-> String) (n) (cl:make-string n :initial-element #\y))))
+  (is (== (text 30000) (tools:shorten (text 30000))))
+  (is (has? (tools:shorten (text 30001)) "[... 1 characters cut ...]")))
+
+(define-test tools-a6-bash-lists-the-denials-of-its-command ()
+  (let event = (event-line "cat" "file_open" "read" "/p/.env"))
+  (let r = (make-rig (make-list event)))
+  (is (== "cat: .env: No such file or directory
+exit code 1
+denials while this ran:
+  denied read of /p/.env by cat (pid 42): denied by rule"
+          (bash r "cat .env")))
+  (unrig r)
+  (let quiet = (make-rig Nil))
+  (is (not (has? (bash quiet "cat /nonexistent") "denials")))
+  (unrig quiet)
+  Unit)
+
+(define-test tools-a7-show-policy-returns-the-policy-in-force ()
+  (let r = (make-rig Nil))
+  (let s = (cell:read (.sessions r)))
+  (is (== (session:policy-text s) (tool-call r "show_policy" "{}")))
+  (is (== (session:policy-text s) (tool-call r "show_policy" "")))
+  (let changed = (unwrap (session:add-rule s (rule-of "deny read /p/x"))))
+  (cell:write! (.sessions r) changed)
+  (is (has? (tool-call r "show_policy" "{}") "deny read /p/x"))
+  (unrig r)
+  Unit)

@@ -1,0 +1,127 @@
+(defpackage #:dakusui/spawn
+  (:use #:coalton #:coalton-prelude)
+  (:export #:Agent #:agent-pid #:agent-socket
+           #:start-agent #:wait-agent #:agent-path))
+(in-package #:dakusui/spawn)
+
+;;; Start the agent without the helper's capabilities. (R11, ADR 0005)
+;;;
+;;; The child runs Lisp between fork and exec. That is safe because the helper
+;;; has one thread then, and sb-posix:fork refuses to fork with more.
+
+(cl:defun child-fail (what)
+  "Report WHAT and end the child at once, without Lisp's exit handlers."
+  (cl:let ((errno (sb-alien:get-errno)))
+    (cl:format cl:*error-output* "dakusui: cannot start the agent: ~A: ~A~%"
+               what (sb-int:strerror errno))
+    (cl:finish-output cl:*error-output*)
+    (cffi:foreign-funcall "_exit" :int 127 :void)))
+
+(cl:defun must (what result)
+  (cl:when (cl:< result 0)
+    (child-fail what))
+  result)
+
+(cl:defun prctl (option argument)
+  (cffi:foreign-funcall "prctl" :int option :unsigned-long argument
+                        :unsigned-long 0 :unsigned-long 0 :unsigned-long 0 :int))
+
+(cl:defun become-agent (path arguments socket)
+  "In the child: drop everything the agent must not have, then exec PATH."
+  ;; The socket goes on fd 3. dup2 clears close-on-exec on the copy, but when
+  ;; SOCKET is already 3 it does nothing, so clear the flag in any case.
+  (must "dup2" (cffi:foreign-funcall "dup2" :int socket :int 3 :int))
+  (must "fcntl F_SETFD" (cffi:foreign-funcall "fcntl" :int 3 :int 2 :int 0 :int))
+  ;; close_range (436) with CLOSE_RANGE_CLOEXEC (4): every fd from 4 up,
+  ;; including the BPF maps and programs, closes on exec.
+  (must "close_range" (cffi:foreign-funcall "syscall" :long 436 :uint 4
+                                            :uint #xffffffff :uint 4 :int))
+  ;; PR_SET_NO_NEW_PRIVS (38): no exec from here on can gain a capability.
+  (must "PR_SET_NO_NEW_PRIVS" (prctl 38 1))
+  ;; PR_CAP_AMBIENT (47), PR_CAP_AMBIENT_CLEAR_ALL (4).
+  (must "PR_CAP_AMBIENT_CLEAR_ALL"
+        (cffi:foreign-funcall "prctl" :int 47 :unsigned-long 4
+                              :unsigned-long 0 :unsigned-long 0 :unsigned-long 0 :int))
+  ;; capset (126) with _LINUX_CAPABILITY_VERSION_3: two zeroed sets of
+  ;; effective, permitted, and inheritable.
+  (cffi:with-foreign-objects ((header :uint32 2) (data :uint32 6))
+    (cl:setf (cffi:mem-aref header :uint32 0) #x20080522
+             (cffi:mem-aref header :uint32 1) 0)
+    (cl:dotimes (i 6)
+      (cl:setf (cffi:mem-aref data :uint32 i) 0))
+    (must "capset" (cffi:foreign-funcall "syscall" :long 126
+                                         :pointer header :pointer data :int)))
+  (cl:let* ((strings (cl:cons path arguments))
+            (count (cl:length strings)))
+    (cffi:with-foreign-object (argv :pointer (cl:1+ count))
+      (cl:loop :for s :in strings
+               :for i :from 0
+               :do (cl:setf (cffi:mem-aref argv :pointer i)
+                            (cffi:foreign-string-alloc s)))
+      (cl:setf (cffi:mem-aref argv :pointer count) (cffi:null-pointer))
+      (cffi:foreign-funcall "execv" :string path :pointer argv :int)
+      (child-fail (cl:format cl:nil "execv ~A" path)))))
+
+(coalton-toplevel
+  (define-struct Agent
+    "The agent process, and the helper's end of the socketpair."
+    (pid I32)
+    (socket I32))
+
+  (declare agent-pid (Agent -> I32))
+  (define (agent-pid a) (.pid a))
+
+  (declare agent-socket (Agent -> I32))
+  (define (agent-socket a) (.socket a))
+
+  (declare agent-path (Void -> String))
+  (define (agent-path)
+    "dakusui-agent, next to the running binary."
+    (lisp (-> String) ()
+      (cl:namestring
+       (cl:merge-pathnames "dakusui-agent" sb-ext:*runtime-pathname*))))
+
+  (declare start-agent (String * List String -> Result String Agent))
+  (define (start-agent path arguments)
+    "Fork, and exec PATH with ARGUMENTS in the child, which holds the other end
+of a socketpair on fd 3. A failure in the child ends it with code 127."
+    (lisp (-> (Result String Agent)) (path arguments)
+      (cl:flet ((refuse (what)
+                  (cl:let ((why (cl:format cl:nil "cannot start the agent: ~A: ~A"
+                                           what (sb-int:strerror (sb-alien:get-errno)))))
+                    (coalton (Err (lisp (-> String) () why))))))
+        (cffi:with-foreign-object (pair :int 2)
+          ;; AF_UNIX (1), SOCK_STREAM (1) | SOCK_CLOEXEC (#o2000000).
+          (cl:if (cl:< (cffi:foreign-funcall "socketpair" :int 1 :int (cl:logior 1 #o2000000)
+                                             :int 0 :pointer pair :int)
+                       0)
+                 (refuse "socketpair")
+                 (cl:let ((ours (cffi:mem-aref pair :int 0))
+                          (theirs (cffi:mem-aref pair :int 1)))
+                   (cl:let ((pid (cl:handler-case (sb-posix:fork)
+                                   (cl:error (e) (cl:princ-to-string e)))))
+                     (cl:cond
+                       ((cl:stringp pid)
+                        (cffi:foreign-funcall "close" :int ours :int)
+                        (cffi:foreign-funcall "close" :int theirs :int)
+                        (cl:let ((why (cl:format cl:nil "cannot start the agent: fork: ~A" pid)))
+                          (coalton (Err (lisp (-> String) () why)))))
+                       ((cl:zerop pid)
+                        (become-agent path arguments theirs))
+                       (cl:t
+                        (cffi:foreign-funcall "close" :int theirs :int)
+                        (coalton (Ok (Agent (lisp (-> I32) () pid)
+                                            (lisp (-> I32) () ours)))))))))))))
+
+  (declare wait-agent (Agent -> I32))
+  (define (wait-agent a)
+    "Wait for the agent to end. Return its exit code, or 128 plus the signal
+that killed it."
+    (let pid = (.pid a))
+    (lisp (-> I32) (pid)
+      (cl:multiple-value-bind (ended status) (sb-posix:waitpid pid 0)
+        (cl:declare (cl:ignore ended))
+        (cl:cond
+          ((sb-posix:wifexited status) (sb-posix:wexitstatus status))
+          ((sb-posix:wifsignaled status) (cl:+ 128 (sb-posix:wtermsig status)))
+          (cl:t 1))))))

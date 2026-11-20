@@ -28,3 +28,9 @@ replies, and the child runs `exec`. The flag is keyed by pidfd.
 Confinement does not depend on the policy being right. Killing a whole command
 tree needs extra work. The spike confirmed that `touch`, `awk`, and other
 descendants inherit the flag (`bpfstudy/`).
+
+The sequence changed in T17: forking SBCL is unsafe, so the agent spawns a
+launcher with `posix_spawn`, asks the helper to flag it, and then releases it
+to exec the command. ADR 0008 uses the flag map to find and end a dead
+session's commands, which is the extra work named above. (Added 2026-11-08,
+T17, ADR 0008.)

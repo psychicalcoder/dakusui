@@ -1,0 +1,149 @@
+(in-package #:dakusui/test)
+
+;;; T6: the default policy. (R3)
+
+(coalton-toplevel
+  (declare standard-default (Void -> policy:Policy))
+  (define (standard-default)
+    (unwrap (policy:default-policy "/home/u/proj" "/home/u")))
+
+  (declare default-error-names? (String * String * String -> Boolean))
+  (define (default-error-names? project home text)
+    (match (policy:default-policy project home)
+      ((Ok _) False)
+      ((Err message) (coalton/string:substring? text message)))))
+
+;; The list of R3, word for word, with P and ~ filled in.
+(define-test default-is-r3-in-order ()
+  (is (== (standard-default)
+          (policy-of
+           (make-list
+            "allow read        /"
+            "allow read,write  /home/u/proj"
+            "allow write       /tmp"
+            "allow write       /dev/null"
+            "allow write       /dev/tty"
+            "deny  read,write  /home/u/.ssh"
+            "deny  read,write  /home/u/.aws"
+            "deny  read,write  /home/u/.gnupg"
+            "deny  read,write  /home/u/.config/dakusui"
+            "deny  read,write  name:.env")))))
+
+(define-test default-a1 ()
+  (let p = (standard-default))
+  (is (not (policy:allows? p read-only "/home/u/proj/.env")))
+  (is (policy:allows? p read-only "/home/u/proj/src/a.c")))
+
+(define-test default-a11 ()
+  (let p = (standard-default))
+  (is (policy:allows? p read-only "/etc/hostname"))
+  (is (not (policy:allows? p read-only "/home/u/.ssh/id_ed25519")))
+  (is (not (policy:allows? p write-only "/etc/hostname"))))
+
+(define-test default-writes-only-where-r3-says ()
+  (let p = (standard-default))
+  (is (policy:allows? p write-only "/home/u/proj/src/a.c"))
+  (is (policy:allows? p write-only "/tmp/x"))
+  (is (policy:allows? p write-only "/dev/null"))
+  (is (policy:allows? p write-only "/dev/tty"))
+  (is (not (policy:allows? p write-only "/home/u/proj2/a.c")))
+  (is (not (policy:allows? p write-only "/home/u/a.c")))
+  (is (not (policy:allows? p write-only "/dev/sda"))))
+
+(define-test default-denies-secrets-in-both-kinds ()
+  (let p = (standard-default))
+  (let check =
+    (fn (path)
+      (and (not (policy:allows? p read-only path))
+           (not (policy:allows? p write-only path)))))
+  (is (check "/home/u/.ssh/id_ed25519"))
+  (is (check "/home/u/.aws/credentials"))
+  (is (check "/home/u/.gnupg/secring.gpg"))
+  (is (check "/home/u/.config/dakusui/keys"))
+  (is (check "/tmp/.env"))
+  (is (check "/home/u/proj/sub/.env")))
+
+;; A project inside a denied directory stays denied, because the deny comes later.
+(define-test default-secrets-beat-the-project ()
+  (let p = (unwrap (policy:default-policy "/home/u/.ssh/proj" "/home/u")))
+  (is (not (policy:allows? p read-only "/home/u/.ssh/proj/a.c"))))
+
+;; Q10: such a directory cannot be written bare in rule text, but needs no escape here.
+(define-test default-takes-any-characters-in-directories ()
+  (let p = (unwrap (policy:default-policy "/home/u/my proj [1]*?" "/home/my u")))
+  (is (policy:allows? p write-only "/home/u/my proj [1]*?/a.c"))
+  (is (not (policy:allows? p read-only "/home/my u/.ssh/key"))))
+
+(define-test default-ignores-a-trailing-slash ()
+  (is (== (standard-default)
+          (unwrap (policy:default-policy "/home/u/proj/" "/home/u/")))))
+
+(define-test default-handles-root-as-home ()
+  (let p = (unwrap (policy:default-policy "/srv/proj" "/")))
+  (is (not (policy:allows? p read-only "/.ssh/key")))
+  (is (policy:allows? p read-only "/etc/hostname")))
+
+;;; T25: a session's policy. (R14)
+
+(coalton-toplevel
+  (declare rules-of (List String -> List policy:Rule))
+  (define (rules-of lines)
+    (map (fn (line) (unwrap (policy:parse-rule line))) lines))
+
+  (declare session-with (List String -> policy:Policy))
+  (define (session-with lines)
+    (unwrap (policy:session-policy "/home/u/proj" "/home/u" (rules-of lines)))))
+
+(define-test session-is-default-then-set-then-fixed-deny ()
+  (is (== (session-with (make-list "allow read /a" "deny read /a/b"))
+          (policy-of
+           (make-list
+            "allow read        /"
+            "allow read,write  /home/u/proj"
+            "allow write       /tmp"
+            "allow write       /dev/null"
+            "allow write       /dev/tty"
+            "deny  read,write  /home/u/.ssh"
+            "deny  read,write  /home/u/.aws"
+            "deny  read,write  /home/u/.gnupg"
+            "deny  read,write  /home/u/.config/dakusui"
+            "deny  read,write  name:.env"
+            "allow read /a"
+            "deny read /a/b"
+            "deny write /home/u/proj/.dakusui")))))
+
+(define-test session-a18 ()
+  (let p = (session-with (make-list "allow read,write /home/u/proj"
+                                    "allow read /home/u/.ssh")))
+  (is (policy:allows? p read-only "/home/u/.ssh/id_ed25519"))
+  (is (not (policy:allows? p write-only "/home/u/proj/.dakusui/rules/x")))
+  (is (policy:allows? p read-only "/home/u/proj/.dakusui/rules/x")))
+
+(define-test session-protects-dakusui-without-a-set ()
+  (let p = (session-with Nil))
+  (is (not (policy:allows? p write-only "/home/u/proj/.dakusui")))
+  (is (not (policy:allows? p write-only "/home/u/proj/.dakusui/rules/x")))
+  (is (policy:allows? p write-only "/home/u/proj/.dakusuix"))
+  (is (policy:allows? p write-only "/home/u/proj/a.c")))
+
+(define-test session-set-cannot-reopen-dakusui ()
+  (let p = (session-with (make-list "allow write /"
+                                    "allow write /home/u/proj/.dakusui/rules")))
+  (is (not (policy:allows? p write-only "/home/u/proj/.dakusui/rules/x"))))
+
+(define-test session-handles-root-as-project ()
+  (let p = (unwrap (policy:session-policy "/" "/home/u" Nil)))
+  (is (not (policy:allows? p write-only "/.dakusui/rules/x")))
+  (is (policy:allows? p write-only "/a")))
+
+(define-test session-rejects-bad-directories ()
+  (matches (Err _) (policy:session-policy "proj" "/home/u" Nil))
+  (matches (Err _) (policy:session-policy "/home/u/proj" "" Nil)))
+
+(define-test default-rejects-bad-directories ()
+  (is (default-error-names? "proj" "/home/u" "project directory"))
+  (is (default-error-names? "" "/home/u" "project directory"))
+  (is (default-error-names? "/a/../b" "/home/u" "project directory"))
+  (is (default-error-names? "/home/u/proj" "u" "home directory"))
+  (is (default-error-names? "/home/u/proj" "" "home directory"))
+  (is (default-error-names? "/home/u/proj" "/a/../b" "home directory")))

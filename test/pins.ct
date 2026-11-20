@@ -1,0 +1,132 @@
+(in-package #:dakusui/test)
+
+;;; T26: the helper refuses to start unless unprivileged BPF is off and the
+;;; pin root is a bpffs that only the user can enter. (R9, ADR 0008) main runs
+;;; these checks before it loads anything or starts the agent.
+
+(coalton-toplevel
+  (declare bpffs UFix)
+  (define bpffs #xcafe4a11)
+
+  (declare pin-root-ok (UFix * UFix * UFix -> Result String Unit))
+  (define (pin-root-ok owner mode fs-type)
+    (pins:check-pin-root "/run/dakusui/1000" 1000
+                         (Ok (pins:DirStatus True owner mode fs-type))))
+
+  (declare names? (String * Result String Unit -> Boolean))
+  (define (names? text outcome)
+    (match outcome
+      ((Ok _) False)
+      ((Err why) (string:substring? text why)))))
+
+(define-test unprivileged-bpf-must-be-disabled ()
+  (is (== (Ok Unit) (pins:check-unprivileged-bpf (Ok (<> "1" (into #\Newline))))))
+  (is (== (Ok Unit) (pins:check-unprivileged-bpf (Ok "2"))))
+  (is (names? "kernel.unprivileged_bpf_disabled is 0"
+              (pins:check-unprivileged-bpf (Ok (<> "0" (into #\Newline))))))
+  (is (names? "docs/install.md" (pins:check-unprivileged-bpf (Ok "0"))))
+  (is (names? "cannot read kernel.unprivileged_bpf_disabled"
+              (pins:check-unprivileged-bpf (Err "no such file")))))
+
+(define-test pin-root-must-be-a-private-bpffs ()
+  (is (== (Ok Unit) (pin-root-ok 1000 #o700 bpffs)))
+  (is (names? "/run/dakusui/1000 is not a bpffs" (pin-root-ok 1000 #o700 #x01021994)))
+  (is (names? "belongs to uid 0, not 1000" (pin-root-ok 0 #o700 bpffs)))
+  (is (names? "has mode 0750" (pin-root-ok 1000 #o750 bpffs)))
+  (is (names? "has mode 0701" (pin-root-ok 1000 #o701 bpffs)))
+  (is (names? "/run/dakusui/1000 is not a directory"
+              (pins:check-pin-root "/run/dakusui/1000" 1000
+                                   (Ok (pins:DirStatus False 1000 #o700 bpffs)))))
+  (is (names? "bpffs /run/dakusui/1000 bpf uid=1000,mode=0700"
+              (pins:check-pin-root "/run/dakusui/1000" 1000 (Err "No such file or directory")))))
+
+(define-test read-dir-status-sees-the-real-directory ()
+  (let base = (temp-tree (make-list "d") Nil (make-list (Tuple "s" "d"))))
+  (let uid = (pins:real-uid))
+  (is (names? "is not a bpffs"
+              (pins:check-pin-root base uid (pins:read-dir-status (<> base "/d")))))
+  (is (names? "is not a directory"
+              (pins:check-pin-root base uid (pins:read-dir-status (<> base "/s")))))
+  (is (names? "No such file"
+              (pins:check-pin-root base uid (pins:read-dir-status (<> base "/none")))))
+  (remove-tree base))
+
+;;; T29: session directories. (R9)
+
+(define-test stat-fields-skip-a-tricky-command-name ()
+  (let line = "42 (a) b (c) R 1 42 42 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 98765 1 2")
+  (is (== (Some "R") (>>= (pins:stat-fields line) (fn (fields) (list:index 0 fields)))))
+  (is (== (Some "98765") (>>= (pins:stat-fields line) (fn (fields) (list:index 19 fields)))))
+  (is (== None (pins:stat-fields "no parenthesis"))))
+
+(define-test session-names-round-trip ()
+  (is (== "42-98765" (pins:session-name 42 "98765")))
+  (is (== (Some (Tuple 42 "98765")) (pins:parse-session-name "42-98765")))
+  (is (== None (pins:parse-session-name "42-")))
+  (is (== None (pins:parse-session-name "-1")))
+  (is (== None (pins:parse-session-name "0-5")))
+  (is (== None (pins:parse-session-name "42-98765-1")))
+  (is (== None (pins:parse-session-name "x42-1")))
+  (is (== None (pins:parse-session-name "99999999999-1"))))
+
+(define-test own-session-dir-names-this-process ()
+  (let pid = (lisp (-> I32) () (sb-posix:getpid)))
+  (is (== True
+          (match (pins:own-session-dir)
+            ((Ok dir)
+             (and (string:substring? (<> (pins:pin-root (pins:real-uid)) "/") dir)
+                  (match (pins:parse-session-name
+                          (with-default "" (list:last (string:split #\/ dir))))
+                    ((Some (Tuple p _)) (== p pid))
+                    ((None) False))))
+            ((Err _) False))))
+  (is (== (pins:own-session-dir) (pins:own-session-dir))))
+
+(define-test remove-session-unpins-and-tolerates-what-is-gone ()
+  (let base = (temp-tree (make-list "s") (make-list "s/confined" "s/e_file_open") Nil))
+  (is (== (Ok (make-list "confined" "e_file_open"))
+          (map (fn (names) (list:sort names)) (pins:session-entries (<> base "/s")))))
+  (is (== (Ok Unit) (pins:remove-session (<> base "/s"))))
+  (is (== (Ok Unit) (pins:remove-session (<> base "/s"))))
+  (is (names? "cannot list" (map (const Unit) (pins:session-entries (<> base "/s")))))
+  (remove-tree base))
+
+;;; T30: clearing stale sessions, on the paths that need no kernel. make
+;;; attach-check covers zombies, forking, and two helpers at once. (R9)
+
+(coalton-toplevel
+  (declare own-pid (Void -> I32))
+  (define (own-pid)
+    (lisp (-> I32) () (sb-posix:getpid)))
+
+  (declare own-start (Void -> String))
+  (define (own-start)
+    (match (pins:proc-stat-fields "/proc/self/stat")
+      ((Ok fields) (with-default "" (list:index 19 fields)))
+      ((Err _) ""))))
+
+(define-test session-live-only-for-the-same-process ()
+  (is (== True (cleanup:session-live? (own-pid) (own-start))))
+  (is (== False (cleanup:session-live? (own-pid) "0")))
+  (is (== False (cleanup:session-live? 2147483647 (own-start)))))
+
+(define-test clear-session-unpins-a-session-without-its-map ()
+  (let base = (temp-tree (make-list "s") (make-list "s/e_file_open") Nil))
+  (is (== (Ok Unit) (cleanup:clear-session (<> base "/s"))))
+  (is (names? "cannot list" (map (const Unit) (pins:session-entries (<> base "/s")))))
+  (remove-tree base))
+
+(define-test clear-session-keeps-a-map-it-cannot-open ()
+  (let base = (temp-tree (make-list "s") (make-list "s/confined" "s/e_file_open") Nil))
+  (is (names? "bpf_obj_get" (cleanup:clear-session (<> base "/s"))))
+  (is (== (Ok 2) (map list:length (pins:session-entries (<> base "/s")))))
+  (remove-tree base))
+
+(define-test clear-stale-sessions-leaves-live-and-foreign-names ()
+  (let live = (pins:session-name (own-pid) (own-start)))
+  (let stale = (pins:session-name (own-pid) "0"))
+  (let base = (temp-tree (make-list live stale "notes") (make-list (<> stale "/e_file_open")) Nil))
+  (cleanup:clear-stale-sessions base)
+  (is (== (Ok (list:sort (make-list live "notes")))
+          (map list:sort (pins:session-entries base))))
+  (remove-tree base))

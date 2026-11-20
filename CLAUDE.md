@@ -19,4 +19,5 @@ then `docs/README.md` for the workflow and `docs/constitution.md` for the rules.
 - Language: Coalton (on Common Lisp, SBCL).
 - Provider: OpenAI-compatible chat completions.
 - Enforcement: BPF LSM, policy map owned by a privileged helper.
-- Build and test commands: add here once chosen.
+- Build: `make build` writes `build/dakusui` and `build/dakusui-agent`.
+- Test: `make test` (Fiasco through `coalton/testing`).

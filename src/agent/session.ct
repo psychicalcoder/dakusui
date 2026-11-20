@@ -1,0 +1,133 @@
+(defpackage #:dakusui/session
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:policy #:dakusui/policy)
+                    (#:client #:dakusui/client)
+                    (#:list #:coalton/list)
+                    (#:string #:coalton/string))
+  (:export #:Session #:start #:session-helper #:session-project
+           #:current-policy #:policy-text #:set-rules
+           #:replace-rules #:add-rule #:remove-rule
+           #:resolve-path))
+(in-package #:dakusui/session)
+
+;;; The agent owns the ordered policy and keeps the helper in step. (R4, R13,
+;;; R14) A change is recorded only after the helper accepts it, so the policy
+;;; the agent shows is the one the kernel enforces.
+
+(coalton-toplevel
+  (declare real-path (String -> Optional String))
+  (define (real-path path)
+    "realpath(3) of PATH, or None if any part of it is missing or unreadable."
+    (lisp (-> (Optional String)) (path)
+      (cl:let ((p (cffi:foreign-funcall "realpath" :string path
+                                        :pointer (cffi:null-pointer) :pointer)))
+        (cl:if (cffi:null-pointer-p p)
+               (coalton None)
+               (cl:let ((real (cl:unwind-protect (cffi:foreign-string-to-lisp p)
+                                (cffi:foreign-free p))))
+                 (coalton (Some (lisp (-> String) () real))))))))
+
+  (declare resolve-path (String -> String))
+  (define (resolve-path path)
+    "PATH with its symlinks resolved. For a path that does not exist yet,
+resolve the longest part that exists and keep the rest. (R13) PATH is
+absolute, with no trailing slash and no . or .. component."
+    (match (real-path path)
+      ((Some real) real)
+      ((None)
+       (match (string:split #\/ path)
+         ((Nil) path)
+         (parts
+          (let last = (with-default "" (list:last parts)))
+          (let parent = (string:substring path 0 (- (string:length path)
+                                                    (+ 1 (string:length last)))))
+          (if (== parent "")
+              path
+              (let ((base (resolve-path parent)))
+                (if (== base "/")
+                    (<> "/" last)
+                    (mconcat (make-list base "/" last))))))))))
+
+  (define-struct Session
+    "What the agent knows about the policy in force."
+    (helper client:Client)
+    (project String)
+    (home String)
+    (rules (List policy:Rule))
+    (policy policy:Policy))
+
+  (declare session-helper (Session -> client:Client))
+  (define (session-helper s) (.helper s))
+
+  (declare session-project (Session -> String))
+  (define (session-project s)
+    "The project directory, resolved. Commands start there."
+    (.project s))
+
+  (declare current-policy (Session -> policy:Policy))
+  (define (current-policy s)
+    "The whole policy the helper enforces, in order. (R8)"
+    (.policy s))
+
+  (declare policy-text (Session -> String))
+  (define (policy-text s)
+    "The policy in force as text, one rule per line, in order, as recorded and
+enforced: paths resolved, with no trailing slash. For the policy tool and the
+judge. (R8, A14)"
+    (policy:policy-text (.policy s)))
+
+  (declare set-rules (Session -> List policy:Rule))
+  (define (set-rules s)
+    "The rules between the default and the fixed deny. (R14)"
+    (.rules s))
+
+  (declare install (client:Client * String * String * List policy:Rule
+                    -> Result String Session))
+  (define (install helper project home rules)
+    "Build the session policy from resolved parts, and send it."
+    (do
+     (pol <- (policy:session-policy project home rules))
+     (client:send-policy helper pol)
+     (pure (Session helper project home rules pol))))
+
+  (declare resolve-all (List policy:Rule -> Result String (List policy:Rule)))
+  (define (resolve-all rules)
+    (traverse (fn (r) (policy:resolve-rule resolve-path r)) rules))
+
+  (declare start (client:Client * String * String * List policy:Rule
+                  -> Result String Session))
+  (define (start helper project home rules)
+    "Resolve PROJECT, HOME, and the path of each of RULES, and send the
+session policy with RULES as its rule set. (R3, R13, R14; spec 0004 R7)"
+    ;; A relative directory stays as it is, so the default policy rejects it
+    ;; with a message that names it.
+    (let resolve-dir = (fn (dir)
+                         (match (string:strip-prefix "/" dir)
+                           ((Some _) (resolve-path dir))
+                           ((None) dir))))
+    (>>= (resolve-all rules)
+         (fn (resolved) (install helper (resolve-dir project) (resolve-dir home) resolved))))
+
+  (declare replace-rules (Session * List policy:Rule -> Result String Session))
+  (define (replace-rules s rules)
+    "Make RULES the rule set, resolving each path first. On failure, S still
+names the policy in force."
+    (>>= (resolve-all rules)
+         (fn (resolved) (install (.helper s) (.project s) (.home s) resolved))))
+
+  (declare add-rule (Session * policy:Rule -> Result String Session))
+  (define (add-rule s rule)
+    "Add RULE after the set's rules, so it wins over them. (R4, R13)"
+    (do
+     (resolved <- (policy:resolve-rule resolve-path rule))
+     (install (.helper s) (.project s) (.home s) (<> (.rules s) (make-list resolved)))))
+
+  (declare remove-rule (Session * UFix -> Result String Session))
+  (define (remove-rule s position)
+    "Remove the set's rule at POSITION, counting from 1. (R4)"
+    (let rules = (.rules s))
+    (if (or (== position 0) (> position (list:length rules)))
+        (Err (lisp (-> String) (position)
+               (cl:format cl:nil "no rule ~D in the rule set" position)))
+        (install (.helper s) (.project s) (.home s)
+                 (<> (list:take (- position 1) rules) (list:drop position rules))))))

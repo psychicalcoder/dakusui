@@ -1,0 +1,390 @@
+(defpackage #:dakusui/libbpf
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:list #:coalton/list))
+  (:export
+   #:Octets
+   #:BpfObject
+   #:open-object
+   #:load-object
+   #:program-names
+   #:attach-all
+   #:BpfMap
+   #:find-map
+   #:map-fd
+   #:obj-pin
+   #:obj-get
+   #:obj-get-if-pinned
+   #:map-capacity
+   #:create-hash-map-like
+   #:map-update
+   #:map-lookup
+   #:map-set-inner
+   #:close-map
+   #:fd-bytes
+   #:pidfd-open
+   #:close-fd
+   #:RingBuffer
+   #:ring-buffer-new
+   #:ring-buffer-poll
+   #:ring-buffer-fd))
+(in-package #:dakusui/libbpf)
+
+;;; The libbpf calls the helper uses, and the descriptor calls around them.
+;;; Spec 0001, plan part 4.
+;;;
+;;; Every failure is an Err that names the call and the reason. libbpf also
+;;; logs details, such as the verifier's output, to stderr.
+
+;;; A bare soname, so the dynamic linker resolves it. Under file capabilities
+;;; the linker ignores LD_LIBRARY_PATH, so a caller cannot substitute a library.
+(cffi:define-foreign-library libbpf
+  (cl:t "libbpf.so.1"))
+
+(cffi:use-foreign-library libbpf)
+
+(cffi:defcfun ("bpf_object__open_mem" %open-mem) :pointer
+  (buffer :pointer) (size :size) (opts :pointer))
+(cffi:defcfun ("libbpf_strerror" %strerror) :int
+  (err :int) (buffer :pointer) (size :size))
+(cffi:defcfun ("bpf_object__load" %load) :int
+  (obj :pointer))
+(cffi:defcfun ("bpf_object__next_program" %next-program) :pointer
+  (obj :pointer) (prev :pointer))
+(cffi:defcfun ("bpf_program__name" %program-name) :string
+  (prog :pointer))
+(cffi:defcfun ("bpf_program__attach" %attach) :pointer
+  (prog :pointer))
+(cffi:defcfun ("bpf_link__fd" %link-fd) :int
+  (link :pointer))
+(cffi:defcfun ("bpf_obj_pin" %obj-pin) :int
+  (fd :int) (path :string))
+(cffi:defcfun ("bpf_obj_get" %obj-get) :int
+  (path :string))
+(cffi:defcfun ("bpf_object__find_map_by_name" %find-map) :pointer
+  (obj :pointer) (name :string))
+(cffi:defcfun ("bpf_map__fd" %map-fd) :int
+  (map :pointer))
+(cffi:defcfun ("bpf_map__key_size" %key-size) :uint32
+  (map :pointer))
+(cffi:defcfun ("bpf_map__value_size" %value-size) :uint32
+  (map :pointer))
+(cffi:defcfun ("bpf_map__max_entries" %max-entries) :uint32
+  (map :pointer))
+(cffi:defcfun ("bpf_map_create" %map-create) :int
+  (type :int) (name :pointer) (key-size :uint32) (value-size :uint32)
+  (max-entries :uint32) (opts :pointer))
+(cffi:defcfun ("bpf_map_update_elem" %map-update) :int
+  (fd :int) (key :pointer) (value :pointer) (flags :uint64))
+(cffi:defcfun ("bpf_map_lookup_elem" %map-lookup) :int
+  (fd :int) (key :pointer) (value :pointer))
+(cffi:defcfun ("ring_buffer__new" %ring-buffer-new) :pointer
+  (fd :int) (callback :pointer) (ctx :pointer) (opts :pointer))
+(cffi:defcfun ("ring_buffer__epoll_fd" %ring-buffer-epoll-fd) :int
+  (rb :pointer))
+(cffi:defcfun ("ring_buffer__poll" %ring-buffer-poll) :int
+  (rb :pointer) (timeout-ms :int))
+(cffi:defcfun ("close" %close) :int
+  (fd :int))
+
+(cl:defun call-with-bytes (bytes function)
+  "Call FUNCTION with a foreign copy of the octet list BYTES."
+  (cl:let ((size (cl:length bytes)))
+    (cffi:with-foreign-object (pointer :uint8 size)
+      (cl:loop :for byte :in bytes
+               :for i :from 0
+               :do (cl:setf (cffi:mem-aref pointer :uint8 i) byte))
+      (cl:funcall function pointer))))
+
+(cl:defun error-text (errno)
+  "libbpf's text for ERRNO, which may be one of libbpf's own codes."
+  (cffi:with-foreign-object (buffer :char 128)
+    (%strerror errno buffer 128)
+    (cffi:foreign-string-to-lisp buffer)))
+
+(cl:defun permanent-copy (octets)
+  "Copy OCTETS to foreign memory that is never freed. libbpf documents no
+lifetime for an open_mem buffer, and the object lives as long as the process."
+  (cl:let ((pointer (cffi:foreign-alloc :uint8 :count (cl:max 1 (cl:length octets)))))
+    (cl:loop :for byte :across octets
+             :for i :from 0
+             :do (cl:setf (cffi:mem-aref pointer :uint8 i) byte))
+    pointer))
+
+(cl:defvar *record-handler* cl:nil
+  "The Coalton function that receives each ring buffer record.")
+
+;;; An error in the handler unwinds through libbpf and ends the process, since
+;;; the binaries run with the debugger disabled. That fails closed.
+(cffi:defcallback on-record :int ((ctx :pointer) (data :pointer) (size :size))
+  (cl:declare (cl:ignore ctx))
+  (call-coalton-function
+   *record-handler*
+   (cl:loop :for i :from 0 :below size
+            :collect (cffi:mem-aref data :uint8 i)))
+  0)
+
+(coalton-toplevel
+  (repr :native cffi:foreign-pointer)
+  (define-type Pointer)
+
+  (repr :native (cl:simple-array (cl:unsigned-byte 8) (cl:*)))
+  (define-type Octets
+    "The bytes of a file.")
+
+  (repr :transparent)
+  (define-type BpfObject
+    "An open BPF object file."
+    (BpfObject Pointer))
+
+  (define-struct BpfMap
+    "A map descriptor and the sizes the kernel will read from each update."
+    (fd I32)
+    (key-size UFix)
+    (value-size UFix)
+    (max-entries UFix))
+
+  (repr :transparent)
+  (define-type RingBuffer
+    (RingBuffer Pointer))
+
+  (declare failure (String * I32 -> Result String :a))
+  (define (failure call errno)
+    (Err (lisp (-> String) (call errno)
+           (cl:format cl:nil "~A: ~A" call (error-text errno)))))
+
+  (declare check-pointer (String * Pointer -> Result String Pointer))
+  (define (check-pointer call pointer)
+    "For calls that return NULL and set errno. Call this right after the call."
+    (if (lisp (-> Boolean) (pointer) (cffi:null-pointer-p pointer))
+        (failure call (lisp (-> I32) () (sb-alien:get-errno)))
+        (Ok pointer)))
+
+  (declare check-status (String * I32 -> Result String I32))
+  (define (check-status call status)
+    "For calls that return a negative errno."
+    (if (< status 0)
+        (failure call (negate status))
+        (Ok status)))
+
+  (declare open-object (Octets -> Result String BpfObject))
+  (define (open-object octets)
+    "Parse an object file held in memory. This needs no capabilities. There is
+no open from a path, so the helper reads no object from disk. (R11)"
+    (let opened =
+      (lisp (-> Pointer) (octets)
+        (%open-mem (permanent-copy octets) (cl:length octets) (cffi:null-pointer))))
+    (map BpfObject (check-pointer "bpf_object__open_mem" opened)))
+
+  (declare load-object (BpfObject -> Result String Unit))
+  (define (load-object (BpfObject obj))
+    "Create the maps and load the programs into the kernel."
+    (map (const Unit)
+         (check-status "bpf_object__load" (lisp (-> I32) (obj) (%load obj)))))
+
+  (declare programs (BpfObject -> List Pointer))
+  (define (programs (BpfObject obj))
+    (lisp (-> (List Pointer)) (obj)
+      (cl:loop :for prog := (%next-program obj (cffi:null-pointer))
+                 :then (%next-program obj prog)
+               :until (cffi:null-pointer-p prog)
+               :collect prog)))
+
+  (declare program-name (Pointer -> String))
+  (define (program-name prog)
+    (lisp (-> String) (prog) (%program-name prog)))
+
+  (declare program-names (BpfObject -> List String))
+  (define (program-names obj)
+    (map program-name (programs obj)))
+
+  (declare attach-program (Pointer -> Result String (Tuple String I32)))
+  (define (attach-program prog)
+    (let name = (program-name prog))
+    (let call = (<> "bpf_program__attach " name))
+    (let attached = (lisp (-> Pointer) (prog) (%attach prog)))
+    (do
+     (link <- (check-pointer call attached))
+     (fd <- (check-status (<> "bpf_link__fd " name) (lisp (-> I32) (link) (%link-fd link))))
+     (pure (Tuple name fd))))
+
+  (declare attach-all (BpfObject -> Result String (List (Tuple String I32))))
+  (define (attach-all obj)
+    "Attach every program and return each name with its link descriptor. A
+program stays attached while its link is open or pinned."
+    (traverse attach-program (programs obj)))
+
+  (declare obj-pin (I32 * String -> Result String Unit))
+  (define (obj-pin fd path)
+    "Pin the map or link FD at PATH in a bpffs, so it outlives every descriptor."
+    (map (const Unit)
+         (check-status (<> "bpf_obj_pin " path)
+                       (lisp (-> I32) (fd path) (%obj-pin fd path)))))
+
+  (declare obj-get (String -> Result String I32))
+  (define (obj-get path)
+    "A new descriptor for the object pinned at PATH. This needs CAP_BPF while
+kernel.unprivileged_bpf_disabled is set."
+    (check-status (<> "bpf_obj_get " path)
+                  (lisp (-> I32) (path) (%obj-get path))))
+
+  (declare find-map (BpfObject * String -> Result String BpfMap))
+  (define (find-map (BpfObject obj) name)
+    (let found = (lisp (-> Pointer) (obj name) (%find-map obj name)))
+    (do
+     (m <- (check-pointer (<> "bpf_object__find_map_by_name " name) found))
+     (fd <- (check-status (<> "bpf_map__fd " name)
+                          (lisp (-> I32) (m) (%map-fd m))))
+     (pure (BpfMap fd
+                   (lisp (-> UFix) (m) (%key-size m))
+                   (lisp (-> UFix) (m) (%value-size m))
+                   (lisp (-> UFix) (m) (%max-entries m))))))
+
+  (declare obj-get-if-pinned (String -> Result String (Optional I32)))
+  (define (obj-get-if-pinned path)
+    "obj-get, or None if nothing is pinned at PATH."
+    (let enoent = 2)
+    (let status = (lisp (-> I32) (path) (%obj-get path)))
+    (cond
+      ((== status (negate enoent)) (Ok None))
+      ((< status 0) (failure (<> "bpf_obj_get " path) (negate status)))
+      (True (Ok (Some status)))))
+
+  (declare map-fd (BpfMap -> I32))
+  (define (map-fd m)
+    (.fd m))
+
+  (declare map-capacity (BpfMap -> UFix))
+  (define (map-capacity m)
+    "The most elements the map holds."
+    (.max-entries m))
+
+  (declare create-hash-map-like (BpfMap -> Result String BpfMap))
+  (define (create-hash-map-like template)
+    "A new, empty hash map with the shape of TEMPLATE, as an inner map of an
+array of maps must have. BPF_MAP_TYPE_HASH is 1 in linux/bpf.h."
+    (let key-size = (.key-size template))
+    (let value-size = (.value-size template))
+    (let max-entries = (.max-entries template))
+    (map (fn (fd) (BpfMap fd key-size value-size max-entries))
+         (check-status
+          "bpf_map_create"
+          (lisp (-> I32) (key-size value-size max-entries)
+            (%map-create 1 (cffi:null-pointer) key-size value-size max-entries
+                         (cffi:null-pointer))))))
+
+  (declare map-update (BpfMap * List U8 * List U8 -> Result String Unit))
+  (define (map-update m key value)
+    "Set one element. The kernel reads the map's sizes from our pointers, so a
+list of any other length is an error, not an out-of-bounds read."
+    (let fd = (.fd m))
+    (cond
+      ((/= (list:length key) (.key-size m))
+       (Err "bpf_map_update_elem: wrong key size"))
+      ((/= (list:length value) (.value-size m))
+       (Err "bpf_map_update_elem: wrong value size"))
+      (True
+       (map (const Unit)
+            (check-status
+             "bpf_map_update_elem"
+             (lisp (-> I32) (fd key value)
+               (call-with-bytes
+                key
+                (cl:lambda (key-pointer)
+                  (call-with-bytes
+                   value
+                   (cl:lambda (value-pointer)
+                     ;; 0 is BPF_ANY: create the element or replace it.
+                     (%map-update fd key-pointer value-pointer 0)))))))))))
+
+  (declare map-lookup (BpfMap * List U8 -> Result String (Optional (List U8))))
+  (define (map-lookup m key)
+    "The value for KEY, or None if the map holds none."
+    (let fd = (.fd m))
+    (let value-size = (.value-size m))
+    (let enoent = 2)
+    (if (/= (list:length key) (.key-size m))
+        (Err "bpf_map_lookup_elem: wrong key size")
+        (let ((found
+                (lisp (-> (Tuple I32 (List U8))) (fd key value-size)
+                  (call-with-bytes
+                   key
+                   (cl:lambda (key-pointer)
+                     (cffi:with-foreign-object (value-pointer :uint8 (cl:max 1 value-size))
+                       (cl:let ((status (%map-lookup fd key-pointer value-pointer)))
+                         (Tuple status
+                                (cl:if (cl:< status 0)
+                                       cl:nil
+                                       (cl:loop :for i :from 0 :below value-size
+                                                :collect (cffi:mem-aref value-pointer :uint8 i)))))))))))
+          (match found
+            ((Tuple status bytes)
+             (cond
+               ((== status (negate enoent)) (Ok None))
+               ((< status 0) (failure "bpf_map_lookup_elem" (negate status)))
+               (True (Ok (Some bytes)))))))))
+
+  (declare fd-bytes (I32 -> List U8))
+  (define (fd-bytes fd)
+    "A descriptor as a map key or value: a 32-bit int, little-endian."
+    (lisp (-> (List U8)) (fd)
+      (cl:loop :for shift :from 0 :below 32 :by 8
+               :collect (cl:ldb (cl:byte 8 shift) fd))))
+
+  (declare map-set-inner (BpfMap * BpfMap -> Result String Unit))
+  (define (map-set-inner outer inner)
+    "Put INNER in slot 0 of the array of maps OUTER. The swap is atomic."
+    (map-update outer (make-list 0 0 0 0) (fd-bytes (.fd inner))))
+
+  (declare pidfd-open (I32 -> Result String I32))
+  (define (pidfd-open pid)
+    "A descriptor for process PID. 434 is pidfd_open on x86-64."
+    (let fd =
+      (lisp (-> I32) (pid)
+        (cffi:foreign-funcall "syscall" :long 434 :int pid :uint 0 :int)))
+    (if (< fd 0)
+        (failure (lisp (-> String) (pid) (cl:format cl:nil "pidfd_open ~D" pid))
+                 (lisp (-> I32) () (sb-alien:get-errno)))
+        (Ok fd)))
+
+  (declare close-fd (I32 -> Unit))
+  (define (close-fd fd)
+    (lisp (-> Unit) (fd)
+      (%close fd)
+      Unit))
+
+  (declare close-map (BpfMap -> Unit))
+  (define (close-map m)
+    "Close our descriptor. A map stays alive while an outer map holds it."
+    (close-fd (.fd m)))
+
+  (declare ring-buffer-new (BpfMap * (List U8 -> Unit) -> Result String RingBuffer))
+  (define (ring-buffer-new m handler)
+    "Deliver the records of map M to HANDLER, during calls to ring-buffer-poll.
+A process has one handler, so the latest call replaces it."
+    (let fd = (.fd m))
+    (let made =
+      (lisp (-> Pointer) (fd)
+        (%ring-buffer-new fd (cffi:callback on-record)
+                          (cffi:null-pointer) (cffi:null-pointer))))
+    (do
+     (pointer <- (check-pointer "ring_buffer__new" made))
+     (let _ = (lisp (-> Unit) (handler)
+                (cl:setf *record-handler* handler)
+                Unit))
+     (pure (RingBuffer pointer))))
+
+  (declare ring-buffer-poll (RingBuffer * I32 -> Result String UFix))
+  (define (ring-buffer-poll (RingBuffer rb) timeout-ms)
+    "Wait up to TIMEOUT-MS for records and return how many were handled. A signal
+can end the wait early, which SBCL's own signals do. That counts as no records."
+    (let eintr = 4)
+    (let status = (lisp (-> I32) (rb timeout-ms) (%ring-buffer-poll rb timeout-ms)))
+    (if (== status (negate eintr))
+        (Ok 0)
+        (map (fn (count) (lisp (-> UFix) (count) count))
+             (check-status "ring_buffer__poll" status))))
+
+  (declare ring-buffer-fd (RingBuffer -> I32))
+  (define (ring-buffer-fd (RingBuffer rb))
+    "A descriptor that polls readable when records wait."
+    (lisp (-> I32) (rb) (%ring-buffer-epoll-fd rb))))

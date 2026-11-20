@@ -1,0 +1,203 @@
+(defpackage #:dakusui/chat
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:list #:coalton/list))
+  (:export #:Message #:System #:User #:Assistant #:ToolResult
+           #:ToolCall #:call-id #:call-name #:call-arguments
+           #:ToolSpec #:spec-name #:spec-description #:spec-parameters
+           #:Reply #:reply-text #:reply-calls
+           #:quoted #:request-json #:decode-reply #:max-depth))
+(in-package #:dakusui/chat)
+
+;;; The chat completions types, and their JSON. (Spec 0002 R2, R3)
+;;;
+;;; A request is built as text from typed values. A reply is parsed at the
+;;; edge into a typed Reply, or into an error that names the problem.
+
+(coalton-toplevel
+  (derive Eq)
+  (define-struct ToolCall
+    "One tool call the model asks for. ARGUMENTS is the raw JSON text, which
+the tool decodes. (Spec 0003 R2)"
+    (id String)
+    (name String)
+    (arguments String))
+
+  (declare call-id (ToolCall -> String))
+  (define (call-id c) (.id c))
+
+  (declare call-name (ToolCall -> String))
+  (define (call-name c) (.name c))
+
+  (declare call-arguments (ToolCall -> String))
+  (define (call-arguments c) (.arguments c))
+
+  (derive Eq)
+  (define-type Message
+    "One message of the conversation."
+    (System String)
+    (User String)
+    (Assistant (Optional String) (List ToolCall))
+    (ToolResult String String))
+
+  (define-struct ToolSpec
+    "A tool as the model sees it. PARAMETERS is a JSON schema, as text."
+    (name String)
+    (description String)
+    (parameters String))
+
+  (declare spec-name (ToolSpec -> String))
+  (define (spec-name s) (.name s))
+
+  (declare spec-description (ToolSpec -> String))
+  (define (spec-description s) (.description s))
+
+  (declare spec-parameters (ToolSpec -> String))
+  (define (spec-parameters s) (.parameters s))
+
+  (derive Eq)
+  (define-struct Reply
+    "What the model answered: any text, and the tools it asks for."
+    (text (Optional String))
+    (calls (List ToolCall)))
+
+  (declare reply-text (Reply -> Optional String))
+  (define (reply-text r) (.text r))
+
+  (declare reply-calls (Reply -> List ToolCall))
+  (define (reply-calls r) (.calls r))
+
+  (declare max-depth UFix)
+  (define max-depth
+    "jzon's nesting limit. Tool schemas nest deeper than the helper's 8."
+    128)
+
+  (declare quoted (String -> String))
+  (define (quoted text)
+    "TEXT as a JSON string."
+    (lisp (-> String) (text) (com.inuoe.jzon:stringify text)))
+
+  (declare joined (List String -> String))
+  (define (joined items)
+    (match items
+      ((Nil) "")
+      ((Cons first rest) (mconcat (Cons first (map (fn (s) (<> "," s)) rest))))))
+
+  (declare object (List (Tuple String String) -> String))
+  (define (object fields)
+    "A JSON object from names and values that are JSON already."
+    (mconcat (make-list "{"
+                        (joined (map (fn ((Tuple name value)) (<> (quoted name) (<> ":" value)))
+                                     fields))
+                        "}")))
+
+  (declare call-json (ToolCall -> String))
+  (define (call-json c)
+    (object (make-list (Tuple "id" (quoted (.id c)))
+                       (Tuple "type" (quoted "function"))
+                       (Tuple "function"
+                              (object (make-list (Tuple "name" (quoted (.name c)))
+                                                 (Tuple "arguments" (quoted (.arguments c)))))))))
+
+  (declare message-json (Message -> String))
+  (define (message-json m)
+    (match m
+      ((System text)
+       (object (make-list (Tuple "role" (quoted "system")) (Tuple "content" (quoted text)))))
+      ((User text)
+       (object (make-list (Tuple "role" (quoted "user")) (Tuple "content" (quoted text)))))
+      ((Assistant text calls)
+       (object (<> (make-list (Tuple "role" (quoted "assistant"))
+                              (Tuple "content" (match text
+                                                 ((Some t) (quoted t))
+                                                 ((None) "null"))))
+                   (if (list:null? calls)
+                       Nil
+                       (make-list (Tuple "tool_calls"
+                                         (<> "[" (<> (joined (map call-json calls)) "]"))))))))
+      ((ToolResult id text)
+       (object (make-list (Tuple "role" (quoted "tool"))
+                          (Tuple "tool_call_id" (quoted id))
+                          (Tuple "content" (quoted text)))))))
+
+  (declare spec-json (ToolSpec -> String))
+  (define (spec-json s)
+    (object (make-list (Tuple "type" (quoted "function"))
+                       (Tuple "function"
+                              (object (make-list (Tuple "name" (quoted (.name s)))
+                                                 (Tuple "description" (quoted (.description s)))
+                                                 (Tuple "parameters" (.parameters s))))))))
+
+  (declare request-json (String * List Message * List ToolSpec -> String))
+  (define (request-json model messages tools)
+    "The body of a chat completions request. (R2) An empty tool list is left
+out, since some servers refuse one."
+    (object (<> (make-list (Tuple "model" (quoted model))
+                           (Tuple "messages" (<> "[" (<> (joined (map message-json messages)) "]"))))
+                (if (list:null? tools)
+                    Nil
+                    (make-list (Tuple "tools" (<> "[" (<> (joined (map spec-json tools)) "]"))))))))
+
+  (declare decode-reply (String -> Result String Reply))
+  (define (decode-reply body)
+    "The first choice of a chat completions response, or why it has none."
+    (lisp (-> (Result String Reply)) (body max-depth)
+      (cl:let ((r (reply-of body max-depth)))
+        (cl:if (cl:stringp r)
+               (coalton (Err (lisp (-> String) () r)))
+               (cl:destructuring-bind (text calls) r
+                 (cl:let ((typed (cl:mapcar (cl:lambda (c)
+                                              (cl:destructuring-bind (ident name arguments) c
+                                                (coalton (ToolCall (lisp (-> String) () ident)
+                                                                   (lisp (-> String) () name)
+                                                                   (lisp (-> String) () arguments)))))
+                                            calls)))
+                   (coalton
+                    (Ok (Reply (lisp (-> (Optional String)) ()
+                                 (cl:if text
+                                        (coalton (Some (lisp (-> String) () text)))
+                                        (coalton None)))
+                               (lisp (-> (List ToolCall)) () typed)))))))))))
+
+(cl:defun simple (s)
+  (cl:coerce s '(cl:simple-array cl:character (cl:*))))
+
+(cl:defun reply-of (body depth)
+  "Parse BODY into (text-or-nil ((id name arguments) ...)), or a string that
+names the problem."
+  (cl:let ((value (cl:handler-case (com.inuoe.jzon:parse body :max-depth depth)
+                    (cl:error (e)
+                      (cl:return-from reply-of
+                        (cl:let ((cl:*print-pretty* cl:nil))
+                          (cl:format cl:nil "the reply is not JSON: ~A" e)))))))
+    (cl:flet ((get (object key)
+                (cl:and (cl:hash-table-p object) (cl:gethash key object))))
+      (cl:let* ((choices (get value "choices"))
+                (message (cl:and (cl:vectorp choices) (cl:plusp (cl:length choices))
+                                 (get (cl:aref choices 0) "message")))
+                (content (get message "content"))
+                (calls (get message "tool_calls")))
+        (cl:cond
+          ((cl:not (cl:and (cl:vectorp choices) (cl:plusp (cl:length choices))))
+           "the reply has no choices")
+          ((cl:not (cl:hash-table-p message)) "the reply's first choice has no message")
+          ((cl:not (cl:or (cl:stringp content) (cl:eq content 'cl:null) (cl:null content)))
+           "the reply's content is not text")
+          ((cl:not (cl:or (cl:null calls) (cl:eq calls 'cl:null) (cl:vectorp calls)))
+           "the reply's tool_calls is not a list")
+          (cl:t
+           (cl:let ((decoded
+                      (cl:loop :for call :across (cl:if (cl:vectorp calls) calls #())
+                               :for f := (get call "function")
+                               :for ident := (get call "id")
+                               :for name := (get f "name")
+                               :for arguments := (get f "arguments")
+                               :unless (cl:and (cl:stringp ident) (cl:stringp name))
+                                 :do (cl:return-from reply-of
+                                       "a tool call in the reply lacks an id or a name")
+                               :collect (cl:list (simple ident) (simple name)
+                                                 ;; A server that sends the arguments as
+                                                 ;; an object still sends JSON.
+                                                 (cl:if (cl:stringp arguments)
+                                                        (simple arguments)
+                                                        (com.inuoe.jzon:stringify arguments))))))
+             (cl:list (cl:and (cl:stringp content) (simple content)) decoded))))))))

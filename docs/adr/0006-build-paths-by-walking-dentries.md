@@ -32,3 +32,7 @@ The first walk, unrolled, exceeded the verifier's limit. The `bpf_loop` version
 keeps only integers in its context and builds the path in per-task scratch
 space. If profiling shows the walk is slow at `file_open`, add `bpf_d_path`
 there as an optimization.
+
+A rename that races the walk can join names that were never one path (T23).
+The walk now checks each dentry's `d_seq` and walks again when one changed,
+then denies after four tries (spec 0001 Q20, T33). (Added 2026-11-19.)

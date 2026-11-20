@@ -1,0 +1,105 @@
+(in-package #:dakusui/test)
+
+;;; T3: the types. (R10, R2)
+
+(coalton-toplevel
+  (define deny-env
+    (policy:Rule policy:Deny
+                 (policy:Kinds policy:Read (make-list policy:Write))
+                 (policy::FileName ".env")))
+
+  (define allow-usr
+    (policy:Rule policy:Allow
+                 (policy:Kinds policy:Read Nil)
+                 (policy::PathPrefix "/usr"))))
+
+(define-test rule-equality-sees-every-field ()
+  (is (== deny-env deny-env))
+  (is (/= deny-env allow-usr))
+  (is (/= (policy::FileName "/usr") (policy::PathPrefix "/usr"))))
+
+(define-test kinds-keep-the-written-order ()
+  (is (/= (policy:Kinds policy:Read (make-list policy:Write))
+          (policy:Kinds policy:Write (make-list policy:Read)))))
+
+(define-test policy-order-matters ()
+  (is (/= (policy:Policy (make-list deny-env allow-usr))
+          (policy:Policy (make-list allow-usr deny-env)))))
+
+;;; The compiler rejects ill-typed rules. The first test is the control: the
+;;; forms below differ from it in one part, so they fail on that part alone.
+
+(define-test well-typed-rule-compiles ()
+  (is (lisp (-> Boolean) ()
+        (well-typed-p
+         '(policy:Rule policy:Deny
+           (policy:Kinds policy:Read Nil)
+           (policy::FileName ".env")))))
+  (is (lisp (-> Boolean) ()
+        (well-typed-p
+         '(policy:Policy
+           (make-list
+            (policy:Rule policy:Deny
+             (policy:Kinds policy:Read Nil)
+             (policy::FileName ".env"))))))))
+
+(define-test rule-rejects-a-wrong-effect ()
+  (is (lisp (-> Boolean) ()
+        (mismatch-p
+         '(policy:Rule policy:Read
+           (policy:Kinds policy:Read Nil)
+           (policy::FileName ".env")))))
+  (is (lisp (-> Boolean) ()
+        (mismatch-p
+         '(policy:Rule "deny"
+           (policy:Kinds policy:Read Nil)
+           (policy::FileName ".env"))))))
+
+(define-test rule-rejects-wrong-kinds ()
+  (is (lisp (-> Boolean) ()
+        (mismatch-p
+         '(policy:Rule policy:Deny
+           policy:Read
+           (policy::FileName ".env")))))
+  (is (lisp (-> Boolean) ()
+        (mismatch-p
+         '(policy:Rule policy:Deny
+           (make-list policy:Read)
+           (policy::FileName ".env"))))))
+
+(define-test kinds-cannot-be-empty ()
+  (is (lisp (-> Boolean) ()
+        (mismatch-p
+         '(policy:Rule policy:Deny
+           (policy:Kinds Nil Nil)
+           (policy::FileName ".env")))))
+  (is (lisp (-> Boolean) ()
+        (mismatch-p
+         '(policy:Rule policy:Deny
+           Nil
+           (policy::FileName ".env"))))))
+
+(define-test rule-rejects-a-bare-string-pattern ()
+  (is (lisp (-> Boolean) ()
+        (mismatch-p
+         '(policy:Rule policy:Deny
+           (policy:Kinds policy:Read Nil)
+           ".env")))))
+
+(define-test policy-rejects-a-bare-rule ()
+  (is (lisp (-> Boolean) ()
+        (mismatch-p
+         '(policy:Policy
+           (policy:Rule policy:Deny
+            (policy:Kinds policy:Read Nil)
+            (policy::FileName ".env"))))))
+  (is (lisp (-> Boolean) ()
+        (mismatch-p
+         '(policy:Policy (make-list "deny read .env"))))))
+
+(define-test pattern-constructors-are-private ()
+  (is (lisp (-> Boolean) ()
+        (cl:loop :for name :in '("PATHPREFIX" "FILENAME")
+                 :always (cl:eq :internal
+                                (cl:nth-value
+                                 1 (cl:find-symbol name '#:dakusui/policy)))))))

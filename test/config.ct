@@ -1,0 +1,137 @@
+(in-package #:dakusui/test)
+
+;;; Spec 0004 T2: the configuration and its roles. (R1-R5, R12)
+
+(coalton-toplevel
+  (declare env-of (List (Tuple String String) -> String -> Optional String))
+  (define (env-of pairs)
+    "An environment that holds only PAIRS."
+    (fn (name) (map snd (list:find (fn ((Tuple key _)) (== key name)) pairs))))
+
+  (declare config-example String)
+  (define config-example
+    "The example of spec 0004."
+    "{
+  \"roles\": {
+    \"agent\": {\"model\": \"qwen3-coder\", \"base_url\": \"http://localhost:8080/v1\"},
+    \"judge\": {\"model\": \"qwen3-small\"},
+    \"cloud\": {\"model\": \"gpt-5\", \"base_url\": \"https://api.openai.com/v1\",
+              \"api_key_env\": \"OPENAI_API_KEY\", \"rules\": \"strict\"}
+  },
+  \"mcp\": {
+    \"docs\": {\"command\": \"docs-mcp --stdio\", \"env\": {\"DOCS_TOKEN\": \"...\"}}
+  }
+}")
+
+  (declare role-of (String * List (Tuple String String) * String
+                    -> Result String (Tuple4 String String (Optional String) (Optional String))))
+  (define (role-of text env name)
+    "The role NAME of TEXT under ENV, as model, base URL, key, and set."
+    (do
+     (c <- (config:parse-config text (env-of env)))
+     (r <- (config:role c name))
+     (pure (Tuple4 (config:role-model r) (config:role-base-url r)
+                   (config:role-api-key r) (config:role-rules r)))))
+
+  (declare config-error (String -> String))
+  (define (config-error text)
+    (match (config:parse-config text (env-of Nil))
+      ((Ok _) "no error")
+      ((Err why) why))))
+
+(define-test config-a1-no-file-takes-the-environment ()
+  ;; A missing file is read as an empty object (R1); main does the reading.
+  (let ((env (make-list (Tuple "OPENAI_MODEL" "m"))))
+    (is (== (Ok (Tuple4 "m" config:default-base-url None None)) (role-of "{}" env "agent")))
+    (is (== (Ok (Tuple4 "m" config:default-base-url None None)) (role-of "{}" env "judge")))))
+
+(define-test config-agent-takes-each-variable ()
+  (let ((env (make-list (Tuple "OPENAI_MODEL" "m") (Tuple "OPENAI_BASE_URL" "http://h/v1")
+                        (Tuple "OPENAI_API_KEY" "k"))))
+    (is (== (Ok (Tuple4 "m" "http://h/v1" (Some "k") None)) (role-of "{}" env "agent")))
+    (is (== (Ok (Tuple4 "m" "http://h/v1" (Some "k") None))
+            (role-of "{\"roles\": {}}" env "judge")))))
+
+(define-test config-a2-roles-fill-from-agent ()
+  (let ((env (make-list (Tuple "OPENAI_API_KEY" "k"))))
+    (is (== (Ok (Tuple4 "qwen3-small" "http://localhost:8080/v1" (Some "k") None))
+            (role-of config-example env "judge")))
+    (is (== (Ok (Tuple4 "gpt-5" "https://api.openai.com/v1" (Some "k") (Some "strict")))
+            (role-of config-example env "cloud")))
+    (is (== (Ok (Tuple4 "qwen3-coder" "http://localhost:8080/v1" (Some "k") None))
+            (role-of config-example env "agent")))
+    ;; Its own server, so not the agent's key (R3).
+    (let ((other "{\"roles\": {\"agent\": {\"model\": \"m\", \"api_key\": \"a\"},
+                              \"other\": {\"base_url\": \"http://other/v1\"},
+                              \"same\": {\"model\": \"n\"}}}"))
+      (is (== (Ok (Tuple4 "m" "http://other/v1" None None)) (role-of other env "other")))
+      (is (== (Ok (Tuple4 "n" config:default-base-url (Some "a") None))
+              (role-of other env "same"))))))
+
+(define-test config-file-key-beats-the-environment ()
+  (let ((env (make-list (Tuple "OPENAI_API_KEY" "k"))))
+    (is (== (Ok (Tuple4 "m" config:default-base-url (Some "f") None))
+            (role-of "{\"roles\": {\"agent\": {\"model\": \"m\", \"api_key\": \"f\"}}}" env "agent")))
+    ;; A role that names an unset variable has no key; it does not take the agent's.
+    (is (== (Ok (Tuple4 "m" config:default-base-url None None))
+            (role-of "{\"roles\": {\"x\": {\"model\": \"m\", \"api_key_env\": \"UNSET\"}}}" env "x")))))
+
+(define-test config-a3-bad-keys-are-named ()
+  (is (== "roles.cloud has both api_key and api_key_env; keep one"
+          (config-error "{\"roles\": {\"cloud\": {\"api_key\": \"k\", \"api_key_env\": \"V\"}}}")))
+  (is (== "unknown key roles.judge.modle"
+          (config-error "{\"roles\": {\"judge\": {\"modle\": \"m\"}}}")))
+  (is (== "roles.judge.model must be a string"
+          (config-error "{\"roles\": {\"judge\": {\"model\": 5}}}")))
+  (is (== "unknown key role" (config-error "{\"role\": {}}")))
+  (is (== "roles must be an object" (config-error "{\"roles\": []}")))
+  (is (== "roles.judge must be an object" (config-error "{\"roles\": {\"judge\": \"m\"}}")))
+  (is (== "the configuration must be an object" (config-error "[]")))
+  (is (string:substring? "the configuration is not JSON" (config-error "{\"roles\":"))))
+
+(define-test config-a4-no-role-to-talk-to ()
+  (is (== (Err "no role \"nosuch\"; define it under \"roles\" in ~/.config/dakusui/config.json")
+          (role-of config-example Nil "nosuch")))
+  (is (== (Err "the role \"agent\" has no model; set \"model\" for it in ~/.config/dakusui/config.json, or set OPENAI_MODEL")
+          (role-of "{}" Nil "agent")))
+  (is (== (Err "the role \"judge\" has no model; set \"model\" for it in ~/.config/dakusui/config.json, or set OPENAI_MODEL")
+          (role-of "{}" Nil "judge"))))
+
+(define-test config-a12-mcp-servers ()
+  (is (== (Ok (make-list (Tuple3 "docs" "docs-mcp --stdio" (make-list (Tuple "DOCS_TOKEN" "...")))))
+          (map (fn (c)
+                 (map (fn (s) (Tuple3 (config:server-name s) (config:server-command s)
+                                      (config:server-env s)))
+                      (config:config-servers c)))
+               (config:parse-config config-example (env-of Nil)))))
+  (is (== "bad MCP server name \"Bad Name\" under mcp; use lowercase letters, digits, -, or _"
+          (config-error "{\"mcp\": {\"Bad Name\": {\"command\": \"x\"}}}")))
+  (is (== "mcp.docs needs a command" (config-error "{\"mcp\": {\"docs\": {}}}")))
+  (is (== "unknown key mcp.docs.args" (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"args\": []}}}")))
+  (is (== "mcp.docs.env.T must be a string"
+          (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"T\": 1}}}}")))
+  ;; Loader variables would run code before the server is confined.
+  (is (== "mcp.docs.env.LD_PRELOAD is not allowed: a loader variable would run code before the server is confined"
+          (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"LD_PRELOAD\": \"/x.so\"}}}}")))
+  (is (string:substring? "mcp.docs.env.ENV is not allowed"
+                         (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"ENV\": \"/x\"}}}}")))
+  (is (string:substring? "mcp.docs.env.BASH_ENV is not allowed"
+                         (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"BASH_ENV\": \"/x\"}}}}")))
+  ;; Only those names: LD alone, and a name that merely holds ENV, pass.
+  (is (== "no error"
+          (config-error "{\"mcp\": {\"docs\": {\"command\": \"x\", \"env\": {\"LD\": \"1\", \"MY_ENV\": \"1\"}}}}"))))
+
+(define-test config-a-role-prints-without-its-key ()
+  ;; Spec 0002 R10: no message can show the key.
+  (let ((text "{\"roles\": {\"agent\": {\"model\": \"m\", \"api_key\": \"sekret\"}}}"))
+    (match (config:parse-config text (env-of Nil))
+      ((Err why) (is (== "a config" why)))
+      ((Ok c)
+       (is (not (string:substring? "sekret"
+                                   (lisp (-> String) (c) (cl:prin1-to-string c)))))
+       (match (config:role c "agent")
+         ((Err why) (is (== "a role" why)))
+         ((Ok r)
+          (is (== (Some "sekret") (config:role-api-key r)))
+          (is (not (string:substring? "sekret"
+                                      (lisp (-> String) (r) (cl:format cl:nil "~A ~S" r r)))))))))))

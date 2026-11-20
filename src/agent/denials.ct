@@ -1,0 +1,133 @@
+(defpackage #:dakusui/denials
+  (:use #:coalton #:coalton-prelude)
+  (:export #:denial-text #:log-path
+           #:DenialLog #:open-log #:on-event #:mark #:marked))
+(in-package #:dakusui/denials)
+
+;;; Log each denial. (R7, A13)
+;;;
+;;; One line per denial, naming the process, the path, and the access kind,
+;;; on stderr as it happens and appended to a log file with the time. A
+;;; confined command picks its own name and some of its paths, so control
+;;; characters print as \xNN and cannot forge a second line.
+;;;
+;;; Between a mark and a take, the log also keeps each denial's text, so the
+;;; bash tool can list the denials of the command it ran. (Spec 0003 R6)
+
+(cl:defun clean (text)
+  (cl:with-output-to-string (out)
+    (cl:loop :for ch :across text
+             :do (cl:if (cl:or (cl:< (cl:char-code ch) 32) (cl:= (cl:char-code ch) 127))
+                        (cl:format out "\\x~2,'0X" (cl:char-code ch))
+                        (cl:write-char ch out)))))
+
+(cl:defun event-text (line)
+  "The log text for one event line, or NIL if it is no denial event."
+  (cl:let ((value (cl:ignore-errors (com.inuoe.jzon:parse line :max-depth 8))))
+    (cl:flet ((field (key)
+                (cl:let ((v (cl:and (cl:hash-table-p value) (cl:gethash key value))))
+                  (cl:if (cl:stringp v) (clean v) cl:nil))))
+      (cl:let ((pid (cl:and (cl:hash-table-p value) (cl:gethash "pid" value)))
+               (comm (field "comm")) (hook (field "hook")) (kind (field "kind"))
+               (reason (field "reason")) (path (field "path")))
+        (cl:when (cl:and (cl:equal (field "event") "denial") (cl:integerp pid)
+                         comm hook kind reason path)
+          (cl:format cl:nil "denied ~A~:[ of ~A~;~*~] by ~A (pid ~D): ~A"
+                     (cl:if (cl:equal kind "none") hook kind)
+                     (cl:string= path "") path comm pid reason))))))
+
+(cl:defun timestamp ()
+  (cl:multiple-value-bind (s m h day month year) (cl:decode-universal-time (cl:get-universal-time) 0)
+    (cl:format cl:nil "~4,'0D-~2,'0D-~2,'0DT~2,'0D:~2,'0D:~2,'0DZ" year month day h m s)))
+
+(cl:defun open-log-file (path)
+  "Append to PATH, or report why not and return NIL. Logging is not
+enforcement, so a missing file costs the record, not the session."
+  (cl:handler-case
+      (cl:progn
+        (cl:ensure-directories-exist path)
+        (cl:open path :direction :output :if-exists :append :if-does-not-exist :create
+                      :external-format :utf-8))
+    (cl:error (e)
+      (dakusui/terminal:write-line-locked
+       :err (cl:format cl:nil "dakusui: cannot open the denial log ~A: ~A" path e))
+      cl:nil)))
+
+(cl:defstruct (denial-log (:constructor make-denial-log (file)))
+  file
+  (lock (sb-thread:make-mutex :name "denial marks"))
+  (kept cl:nil)
+  (keeping cl:nil))
+
+(cl:defun log-event (dlog line)
+  "Log LINE, and keep its text if a mark is set."
+  (write-entry (denial-log-file dlog) line)
+  (cl:let ((text (event-text line)))
+    (cl:when text
+      (sb-thread:with-mutex ((denial-log-lock dlog))
+        (cl:when (denial-log-keeping dlog)
+          (cl:push text (denial-log-kept dlog)))))))
+
+(cl:defun write-entry (file line)
+  (cl:let ((text (event-text line)))
+    (dakusui/terminal:write-line-locked
+     :err (cl:format cl:nil "dakusui: ~A"
+                     (cl:or text (cl:format cl:nil "unknown event from the helper: ~A" (clean line)))))
+    (cl:when (cl:and file text)
+      (cl:ignore-errors
+       (cl:format file "~A ~A~%" (timestamp) text)
+       (cl:finish-output file)))))
+
+(coalton-toplevel
+  (declare denial-text (String -> Optional String))
+  (define (denial-text line)
+    "The log text for the event LINE, or None if it is no denial event."
+    (lisp (-> (Optional String)) (line)
+      (cl:let ((text (event-text line)))
+        (cl:if text
+               (coalton (Some (lisp (-> String) () text)))
+               (coalton None)))))
+
+  (declare log-path (Void -> String))
+  (define (log-path)
+    "$XDG_STATE_HOME/dakusui/denials.log, or ~/.local/state/dakusui/denials.log.
+The default policy lets no command write there."
+    (lisp (-> String) ()
+      (cl:let ((state (sb-ext:posix-getenv "XDG_STATE_HOME"))
+               (home (cl:or (sb-ext:posix-getenv "HOME") "")))
+        (cl:if (cl:and state (cl:plusp (cl:length state)) (cl:char= (cl:char state 0) #\/))
+               (cl:format cl:nil "~A/dakusui/denials.log" state)
+               (cl:format cl:nil "~A/.local/state/dakusui/denials.log" home)))))
+
+  (repr :native denial-log)
+  (define-type DenialLog
+    "The denial log file, and the denials kept since a mark.")
+
+  (declare open-log (String -> DenialLog))
+  (define (open-log path)
+    "A log that writes each denial to stderr and appends it to PATH."
+    (lisp (-> DenialLog) (path) (make-denial-log (open-log-file path))))
+
+  (declare on-event (DenialLog -> String -> Unit))
+  (define (on-event dlog)
+    "The client's event handler: log each event line. The client calls it on
+its reader thread only."
+    (fn (line) (lisp (-> Unit) (dlog line) (log-event dlog line) Unit)))
+
+  (declare mark (DenialLog -> Unit))
+  (define (mark dlog)
+    "Start keeping denials, and forget any kept before."
+    (lisp (-> Unit) (dlog)
+      (sb-thread:with-mutex ((denial-log-lock dlog))
+        (cl:setf (denial-log-kept dlog) cl:nil
+                 (denial-log-keeping dlog) cl:t))
+      Unit))
+
+  (declare marked (DenialLog -> List String))
+  (define (marked dlog)
+    "The text of each denial since the mark, in order. Stop keeping them."
+    (lisp (-> (List String)) (dlog)
+      (sb-thread:with-mutex ((denial-log-lock dlog))
+        (cl:prog1 (cl:reverse (denial-log-kept dlog))
+          (cl:setf (denial-log-kept dlog) cl:nil
+                   (denial-log-keeping dlog) cl:nil))))))

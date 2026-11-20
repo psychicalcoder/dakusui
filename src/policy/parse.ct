@@ -1,0 +1,194 @@
+(in-package #:dakusui/policy)
+
+;;; The text form of a rule, such as `deny read,write name:.env`. (R10)
+;;;
+;;; The enforcer compares exact path strings, so a pattern that could never
+;;; match must not get through as written. Otherwise a deny would silently do
+;;; nothing. Error messages quote the pattern as the user wrote it.
+
+(coalton-toplevel
+  (declare quoted (String -> String))
+  (define (quoted text)
+    (string:concat "\"" (string:concat text "\"")))
+
+  (declare complain (String * String * String -> Result String :a))
+  (define (complain problem word advice)
+    "An error that names the PROBLEM and the WORD that caused it."
+    (Err (mconcat (make-list problem " " (quoted word) ": " advice))))
+
+  (declare parse-effect (String -> Result String Effect))
+  (define (parse-effect word)
+    (match word
+      ("allow" (Ok Allow))
+      ("deny" (Ok Deny))
+      (_ (complain "unknown effect" word "expected allow or deny"))))
+
+  (declare parse-kind (String -> Result String Kind))
+  (define (parse-kind word)
+    (match word
+      ("read" (Ok Read))
+      ("write" (Ok Write))
+      (_ (complain "unknown access kind" word "expected read or write"))))
+
+  (declare parse-kinds (String -> Result String Kinds))
+  (define (parse-kinds word)
+    (do
+     (parsed <- (traverse parse-kind (string:split #\, word)))
+     (match parsed
+       ((Cons first rest) (Ok (Kinds first rest)))
+       ((Nil) (complain "no access kinds in" word "expected read or write")))))
+
+  (declare whitespace? (Char -> Boolean))
+  (define (whitespace? c)
+    (list:member c (make-list #\Space #\Tab #\Newline #\Return)))
+
+  (declare glob-char? (Char -> Boolean))
+  (define (glob-char? c)
+    (list:member c (make-list #\* #\? #\[)))
+
+  (declare escapable? (Char -> Boolean))
+  (define (escapable? c)
+    (or (whitespace? c) (glob-char? c) (== c #\\)))
+
+  (declare unescape-chars (String * List Char * List Char -> Result String String))
+  (define (unescape-chars word chars done)
+    (match chars
+      ((Nil) (Ok (into (list:reverse done))))
+      ((Cons #\\ (Cons c rest))
+       (if (escapable? c)
+           (unescape-chars word rest (Cons c done))
+           (complain "bad escape in" word
+                     "use \\ only before whitespace, *, ?, [ or \\")))
+      ((Cons #\\ (Nil))
+       (complain "bad escape in" word "a pattern cannot end in a lone \\"))
+      ((Cons c rest)
+       (if (glob-char? c)
+           (complain "glob not supported" word
+                     "patterns match literally, so write \\ before the character")
+           (unescape-chars word rest (Cons c done))))))
+
+  (declare unescape (String * String -> Result String String))
+  (define (unescape word text)
+    "Decode TEXT, a part of WORD, into the literal string it names."
+    (unescape-chars word (into text) Nil))
+
+  (declare parse-name (String * String -> Result String Pattern))
+  (define (parse-name word name)
+    (cond
+      ((== name "")
+       (complain "empty name in" word "expected name:X"))
+      ((or (== name ".") (== name "..") (string:substring? "/" name))
+       (complain "bad name" name "a name is one path component"))
+      (True (Ok (FileName name)))))
+
+  (declare plain-component? (String -> Boolean))
+  (define (plain-component? part)
+    (not (list:member part (make-list "" "."))))
+
+  (declare trim-slash (String -> String))
+  (define (trim-slash path)
+    "PATH without one trailing slash. strip-suffix fails on an empty string."
+    (if (== path "")
+        ""
+        (with-default path (string:strip-suffix "/" path))))
+
+  (declare parse-path (String * String -> Result String Pattern))
+  (define (parse-path word path)
+    (let trimmed = (trim-slash path))
+    (match (string:split #\/ trimmed)
+      ((Cons "" parts)
+       (cond
+         ((list:member ".." parts)
+          (complain "path contains \"..\" in" word "write the path without it"))
+         ((list:all plain-component? parts) (Ok (PathPrefix trimmed)))
+         (True
+          (complain "path not in plain form" word
+                    "remove any empty component or ."))))
+      (_ (if (== path "/")
+             (Ok (PathPrefix "/"))
+             (complain "relative path" word "a path must be absolute")))))
+
+  (declare parse-pattern (String -> Result String Pattern))
+  (define (parse-pattern word)
+    (match (string:strip-prefix "name:" word)
+      ((Some name) (>>= (unescape word name) (fn (text) (parse-name word text))))
+      ((None) (>>= (unescape word word) (fn (text) (parse-path word text))))))
+
+  (declare flush-word (List Char * List String -> List String))
+  (define (flush-word word done)
+    (match word
+      ((Nil) done)
+      (_ (Cons (into (list:reverse word)) done))))
+
+  (declare scan-words (List Char * List Char * List String -> List String))
+  (define (scan-words chars word done)
+    "Split on whitespace, except after a backslash. Keep the backslashes."
+    (match chars
+      ((Nil) (list:reverse (flush-word word done)))
+      ((Cons #\\ (Cons c rest))
+       (scan-words rest (Cons c (Cons #\\ word)) done))
+      ((Cons c rest)
+       (if (whitespace? c)
+           (scan-words rest Nil (flush-word word done))
+           (scan-words rest (Cons c word) done)))))
+
+  (declare parse-rule (String -> Result String Rule))
+  (define (parse-rule line)
+    "Parse one rule. The error message names the problem."
+    (match (scan-words (into line) Nil Nil)
+      ((Cons effect (Cons kinds (Cons pattern (Nil))))
+       (do
+        (e <- (parse-effect effect))
+        (k <- (parse-kinds kinds))
+        (p <- (parse-pattern pattern))
+        (pure (Rule e k p))))
+      (_ (complain "bad rule" line
+                   "expected three fields: effect, kinds, pattern")))))
+
+;;; The text form of a pattern, the inverse of parse-pattern. The agent sends
+;;; patterns to the helper this way. (R10)
+
+(coalton-toplevel
+  (declare escape (String -> String))
+  (define (escape text)
+    (into (list:concatmap (fn (c) (if (escapable? c) (make-list #\\ c) (make-list c)))
+                          (the (List Char) (into text)))))
+
+  (declare pattern-text (Pattern -> String))
+  (define (pattern-text pat)
+    "PAT as rule text: parse-pattern gives PAT back."
+    (match pat
+      ((PathPrefix path) (escape path))
+      ((FileName name) (string:concat "name:" (escape name))))))
+
+;;; The text form of a rule and a policy, for the agent and the judge. (R8)
+;;; Each line parses back to the rule it shows.
+
+(coalton-toplevel
+  (declare kind-word (Kind -> String))
+  (define (kind-word kind)
+    (match kind
+      ((Read) "read")
+      ((Write) "write")))
+
+  (declare rule-text (Rule -> String))
+  (define (rule-text r)
+    "R as rule text: parse-rule gives R back."
+    (match r
+      ((Rule effect (Kinds first rest) pat)
+       (mconcat
+        (make-list (match effect
+                     ((Allow) "allow")
+                     ((Deny) "deny"))
+                   " "
+                   (kind-word first)
+                   (mconcat (map (fn (k) (string:concat "," (kind-word k))) rest))
+                   " "
+                   (pattern-text pat))))))
+
+  (declare policy-text (Policy -> String))
+  (define (policy-text pol)
+    "POL's rules in order, one per line, each ending in a newline."
+    (match pol
+      ((Policy rules)
+       (mconcat (map (fn (r) (string:concat (rule-text r) (into #\Newline))) rules))))))

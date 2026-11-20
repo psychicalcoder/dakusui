@@ -1,0 +1,57 @@
+(defpackage #:dakusui/terminal
+  (:use #:coalton #:coalton-prelude)
+  (:export #:Terminal #:say #:warn #:ask #:ask-with
+           #:write-line-locked))
+(in-package #:dakusui/terminal)
+
+;;; All terminal output passes through here. (Spec 0002 R8) One lock guards
+;;; every write to stdout and stderr, so a denial line from the reader thread
+;;; never lands inside another line.
+
+(cl:defvar *lock* (sb-thread:make-mutex :name "terminal"))
+
+(cl:defvar *streams* cl:nil
+  "NIL, or a list of the streams for stdout and stderr, which tests set.")
+
+(cl:defun write-line-locked (which text)
+  "Write TEXT and a newline to stdout (:out) or stderr (:err), whole."
+  (sb-thread:with-mutex (*lock*)
+    (cl:let ((stream (cl:if *streams*
+                            (cl:if (cl:eq which :out) (cl:first *streams*) (cl:second *streams*))
+                            (cl:if (cl:eq which :out) cl:*standard-output* cl:*error-output*))))
+      (cl:write-line text stream)
+      (cl:finish-output stream))))
+
+(coalton-toplevel
+  (define-type-alias Terminal (String -> Unit)
+    "Where the loop prints. The real one is `say`; tests capture the lines.")
+
+  (declare say (String -> Unit))
+  (define (say text)
+    "Print TEXT as a line on stdout."
+    (lisp (-> Unit) (text) (write-line-locked :out text) Unit))
+
+  (declare warn (String -> Unit))
+  (define (warn text)
+    "Print TEXT as a line on stderr."
+    (lisp (-> Unit) (text) (write-line-locked :err text) Unit))
+
+  (declare ask (Void -> Optional String))
+  (define (ask)
+    "Print the prompt and read one line, or None at the end of input."
+    (ask-with "> "))
+
+  (declare ask-with (String -> Optional String))
+  (define (ask-with question)
+    "Print QUESTION, without a newline, and read one line, or None at the end
+of input."
+    (lisp (-> (Optional String)) (question)
+      (sb-thread:with-mutex (*lock*)
+        (cl:write-string question cl:*standard-output*)
+        (cl:finish-output cl:*standard-output*))
+      (cl:let ((line (cl:handler-case (cl:read-line cl:*standard-input* cl:nil)
+                       (cl:error () cl:nil))))
+        (cl:if line
+               (cl:let ((line (cl:coerce line '(cl:simple-array cl:character (cl:*)))))
+                 (coalton (Some (lisp (-> String) () line))))
+               (coalton None))))))

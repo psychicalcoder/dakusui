@@ -1,0 +1,353 @@
+(defpackage #:dakusui/mcp
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:chat #:dakusui/chat)
+                    (#:client #:dakusui/client)
+                    (#:launch #:dakusui/launch)
+                    (#:tools #:dakusui/tools)
+                    (#:cell #:coalton/cell)
+                    (#:list #:coalton/list))
+  (:export #:Server #:server-name #:server-pid #:ended? #:server-skipped
+           #:start-limit #:call-limit #:max-pages #:tool-name?
+           #:start #:start-limited #:server-tools #:call-tool #:stop))
+(in-package #:dakusui/mcp)
+
+;;; Spec 0003 part 4: the MCP client. (R9, R11, R12)
+;;;
+;;; JSON-RPC 2.0, one message per line, over the server's stdin and stdout.
+;;; At start: initialize, the notifications/initialized notice, then
+;;; tools/list, page by page. A request reads lines until the answer with its
+;;; id, skipping notices and unrelated lines, until its limit. A closed pipe
+;;; marks the server ended, and every later call to it is an error result.
+;;;
+;;; Two guards keep a server from spoiling the tool list: a tool whose full
+;;; name OpenAI-compatible servers would refuse is skipped, and a server that
+;;; lists more than max-pages pages fails to start.
+;;;
+;;; The server starts through the launcher, so it runs confined. (R10)
+
+(cl:defconstant +max-depth+ 128)
+
+(cl:defun simple (s)
+  (cl:coerce s '(cl:simple-array cl:character (cl:*))))
+
+(cl:defun json-object (cl:&rest pairs)
+  "A jzon object of the keys and values in PAIRS."
+  (cl:let ((m (cl:make-hash-table :test 'cl:equal)))
+    (cl:loop :for (k v) :on pairs :by #'cl:cddr
+             :do (cl:setf (cl:gethash k m) v))
+    m))
+
+(cl:defun message-line (number method params)
+  "A JSON-RPC request numbered NUMBER as one line, or a notice when NUMBER is NIL."
+  (com.inuoe.jzon:stringify
+   (cl:if number
+          (json-object "jsonrpc" "2.0" "id" number "method" method "params" params)
+          (json-object "jsonrpc" "2.0" "method" method))))
+
+(cl:defun field (object key)
+  "KEY of OBJECT when OBJECT is a jzon object, else NIL."
+  (cl:and (cl:hash-table-p object) (cl:values (cl:gethash key object))))
+
+(cl:defun string-field (object key default)
+  (cl:let ((v (field object key)))
+    (simple (cl:if (cl:stringp v) v default))))
+
+(cl:defun answer-to (number line)
+  "What LINE says to the request NUMBER: NIL if it is something else, else
+(:result value) or (:error message)."
+  (cl:let ((m (cl:ignore-errors (com.inuoe.jzon:parse line :max-depth +max-depth+))))
+    (cl:when (cl:and (cl:hash-table-p m)
+                     (cl:not (cl:nth-value 1 (cl:gethash "method" m)))
+                     (cl:eql number (field m "id")))
+      (cl:if (cl:nth-value 1 (cl:gethash "error" m))
+             (cl:list :error (string-field (field m "error") "message" "an error without a message"))
+             (cl:list :result (field m "result"))))))
+
+(cl:defun page-tools (result)
+  "The tools in a tools/list result, each as (name description schema). The
+schema is re-encoded as JSON text. A tool without a name is left out."
+  (cl:let ((listed (field result "tools")))
+    (cl:loop :for tool :across (cl:if (cl:vectorp listed) listed #())
+             :for name := (field tool "name")
+             :when (cl:stringp name)
+               :collect (cl:list (simple name)
+                                 (string-field tool "description" "")
+                                 (cl:let ((schema (field tool "inputSchema")))
+                                   (simple (cl:if (cl:hash-table-p schema)
+                                                  (com.inuoe.jzon:stringify schema)
+                                                  "{\"type\":\"object\",\"properties\":{}}")))))))
+
+(cl:defun call-text (result)
+  "The text items of a tools/call result's content, joined by newlines. If
+the server marks it an error, it starts with \"error: \"."
+  (cl:let* ((content (field result "content"))
+            (texts (cl:loop :for item :across (cl:if (cl:vectorp content) content #())
+                            :when (cl:and (cl:equal "text" (field item "type"))
+                                          (cl:stringp (field item "text")))
+                              :collect (field item "text")))
+            (text (cl:format cl:nil "~{~A~^~%~}" texts)))
+    (simple (cl:if (cl:eq cl:t (field result "isError"))
+                   (cl:concatenate 'cl:string "error: " text)
+                   text))))
+
+(coalton-toplevel
+  (repr :native cl:t)
+  (define-type Json
+    "A parsed JSON value.")
+
+  (define-type Answer
+    "What came back for a request: its result, an error response with its
+message, nothing in time, or the end of the server."
+    (Answered Json)
+    (Refused String)
+    NoAnswer
+    Ended)
+
+  (define-struct Link
+    "A running server: its name, its process, the limit on each request in
+seconds (the start limit until it has started, then the call limit), the
+next request number, and whether it has ended."
+    (server String)
+    (process launch:Process)
+    (limit (cell:Cell UFix))
+    (next-id (cell:Cell Integer))
+    (ended (cell:Cell Boolean)))
+
+  (define-struct Listed
+    "A tool as the server lists it. SCHEMA is its inputSchema as JSON text."
+    (tool String)
+    (description String)
+    (schema String))
+
+  (define-struct Server
+    "A started MCP server, the tools it listed, and the full names of those
+it listed that were skipped for a bad name."
+    (link Link)
+    (listed (List Listed))
+    (skipped (List String)))
+
+  (declare start-limit UFix)
+  (define start-limit
+    "Seconds each request at start waits, so a server that hangs does not
+hold up the session for long. (R12)"
+    30)
+
+  (declare call-limit UFix)
+  (define call-limit
+    "Seconds a call waits for its answer. (R11)"
+    120)
+
+  (declare max-pages UFix)
+  (define max-pages
+    "Pages of tools/list a server may send before its start fails."
+    100)
+
+  (declare server-skipped (Server -> List String))
+  (define (server-skipped s) (.skipped s))
+
+  (declare tool-name? (String -> Boolean))
+  (define (tool-name? name)
+    "True if NAME matches ^[A-Za-z0-9_-]{1,64}$, as OpenAI-compatible servers
+require of a tool name."
+    (lisp (-> Boolean) (name)
+      (cl:and (cl:<= 1 (cl:length name) 64)
+              (cl:every (cl:lambda (c)
+                          (cl:or (cl:char<= #\a c #\z) (cl:char<= #\A c #\Z)
+                                 (cl:char<= #\0 c #\9) (cl:char= c #\_) (cl:char= c #\-)))
+                        name))))
+
+  (declare full-name (String * String -> String))
+  (define (full-name server tool)
+    (mconcat (make-list server "__" tool)))
+
+  (declare server-name (Server -> String))
+  (define (server-name s) (.server (.link s)))
+
+  (declare server-pid (Server -> I32))
+  (define (server-pid s) (launch:process-pid (.process (.link s))))
+
+  (declare ended? (Server -> Boolean))
+  (define (ended? s) (cell:read (.ended (.link s))))
+
+  (declare now-ms (Void -> Integer))
+  (define (now-ms)
+    (lisp (-> Integer) ()
+      (cl:floor (cl:* 1000 (cl:get-internal-real-time)) cl:internal-time-units-per-second)))
+
+  (declare seconds (UFix -> String))
+  (define (seconds n)
+    (lisp (-> String) (n) (cl:format cl:nil "~D second~:P" n)))
+
+  (declare named (Link -> String))
+  (define (named link)
+    (<> "the MCP server " (chat:quoted (.server link))))
+
+  (declare end (Link -> Unit))
+  (define (end link)
+    "Mark the server ended, and stop its process. Again does nothing."
+    (cell:write! (.ended link) True)
+    (launch:stop (.process link)))
+
+  (declare answer-of (Integer * String -> Optional Answer))
+  (define (answer-of number line)
+    (lisp (-> (Optional Answer)) (number line)
+      (cl:let ((a (answer-to number line)))
+        (cl:case (cl:first a)
+          (:result (cl:let ((v (cl:second a)))
+                     (coalton (Some (Answered (lisp (-> Json) () v))))))
+          (:error (cl:let ((why (cl:second a)))
+                    (coalton (Some (Refused (lisp (-> String) () why))))))
+          (cl:t (coalton None))))))
+
+  (declare await (Link * Integer * Integer -> Answer))
+  (define (await link number deadline)
+    "Read lines until the answer to NUMBER, or until DEADLINE in milliseconds."
+    (let left = (- deadline (now-ms)))
+    (if (<= left 0)
+        NoAnswer
+        (match (launch:receive-line (.process link)
+                                    (lisp (-> UFix) (left) (cl:ceiling left 1000)))
+          ((launch:Line line)
+           (match (answer-of number line)
+             ((Some answer) answer)
+             ((None) (await link number deadline))))
+          ((launch:TimedOut) NoAnswer)
+          ((launch:Closed)
+           (end link)
+           Ended))))
+
+  (declare request (Link * String * Json -> Answer))
+  (define (request link method params)
+    "Send METHOD with PARAMS, and wait for its answer."
+    (if (cell:read (.ended link))
+        Ended
+        (progn
+          (let number = (cell:read (.next-id link)))
+          (cell:write! (.next-id link) (+ number 1))
+          (let line = (lisp (-> String) (number method params) (message-line number method params)))
+          (match (launch:send-line (.process link) line)
+            ((Err _)
+             (end link)
+             Ended)
+            ((Ok _)
+             (await link number (+ (now-ms) (* 1000 (into (cell:read (.limit link)))))))))))
+
+  (declare failure (Link * String * Answer -> String))
+  (define (failure link what answer)
+    "Why the server gave no result to WHAT, for start."
+    (match answer
+      ((Answered _) "")
+      ((Refused why) (mconcat (make-list (named link) " refused " what ": " why)))
+      ((NoAnswer) (mconcat (make-list (named link) " did not answer " what " in "
+                                      (seconds (cell:read (.limit link))))))
+      ((Ended) (mconcat (make-list (named link) " ended before it answered " what)))))
+
+  (declare initialize-params Json)
+  (define initialize-params
+    (lisp (-> Json) ()
+      (json-object "protocolVersion" "2025-06-18"
+                   "capabilities" (json-object)
+                   "clientInfo" (json-object "name" "dakusui" "version" "0"))))
+
+  (declare initialize (Link -> Result String Unit))
+  (define (initialize link)
+    "Send initialize, and once it is answered, the initialized notice. A
+notice that cannot be sent shows at the next request."
+    (match (request link "initialize" initialize-params)
+      ((Answered _)
+       (let line = (lisp (-> String) () (message-line cl:nil "notifications/initialized" cl:nil)))
+       (let _ = (launch:send-line (.process link) line))
+       (Ok Unit))
+      (other (Err (failure link "initialize" other)))))
+
+  (declare list-tools (Link * Optional String * UFix * List Listed -> Result String (List Listed)))
+  (define (list-tools link cursor pages found)
+    "FOUND, then the tools of each page from CURSOR on, which is page PAGES.
+A server that sends more than max-pages pages fails to start."
+    (let params = (match cursor
+                    ((Some c) (lisp (-> Json) (c) (json-object "cursor" c)))
+                    ((None) (lisp (-> Json) () (json-object)))))
+    (match (request link "tools/list" params)
+      ((Answered result)
+       (let page = (map (fn (entry)
+                          (match entry
+                            ((Cons tool (Cons description (Cons schema _)))
+                             (Listed tool description schema))
+                            (_ (Listed "" "" ""))))
+                        (lisp (-> (List (List String))) (result) (page-tools result))))
+       (let next = (lisp (-> (Optional String)) (result)
+                     (cl:let ((c (field result "nextCursor")))
+                       (cl:if (cl:stringp c)
+                              (cl:let ((c (simple c))) (coalton (Some (lisp (-> String) () c))))
+                              (coalton None)))))
+       (match next
+         ((Some c)
+          (if (>= pages max-pages)
+              (Err (<> (named link) " listed more than 100 pages of tools"))
+              (list-tools link (Some c) (+ pages 1) (<> found page))))
+         ((None) (Ok (<> found page)))))
+      (other (Err (failure link "tools/list" other)))))
+
+  (declare start-limited (client:Client * String * String * String * List (Tuple String String)
+                          * UFix * UFix -> Result String Server))
+  (define (start-limited helper directory name command extra start-in call-in)
+    "Start the server NAME: run COMMAND confined in DIRECTORY with the
+variables in EXTRA, then initialize it and list its tools, giving each of
+these requests START-IN seconds, and each later call CALL-IN. A tool whose
+full name fails tool-name? is skipped. An error names the server, and the
+process is stopped. (R9, R12)"
+    (match (launch:start-process helper directory command extra)
+      ((Err why)
+       (Err (mconcat (make-list "the MCP server " (chat:quoted name) " did not start: " why))))
+      ((Ok process)
+       (let link = (Link name process (cell:new start-in) (cell:new 1) (cell:new False)))
+       (let good? = (fn (listed) (tool-name? (full-name name (.tool listed)))))
+       (let started = (>>= (initialize link)
+                           (fn (_) (map (fn (listed)
+                                          (Server link (list:filter good? listed)
+                                                  (map (fn (l) (full-name name (.tool l)))
+                                                       (list:filter (fn (l) (not (good? l))) listed))))
+                                        (list-tools link None 1 Nil)))))
+       (match started
+         ((Err _) (end link))
+         ((Ok _) (cell:write! (.limit link) call-in) Unit))
+       started)))
+
+  (declare start (client:Client * String * String * String * List (Tuple String String)
+                  -> Result String Server))
+  (define (start helper directory name command extra)
+    "start-limited with the start limit, and the call limit of R11."
+    (start-limited helper directory name command extra start-limit call-limit))
+
+  (declare call-tool (Server * String * String -> String))
+  (define (call-tool server tool arguments)
+    "Call TOOL on SERVER with the model's ARGUMENTS text. Return the text of
+the result, or an error result. (R11, R12)"
+    (let link = (.link server))
+    (match (tools:parse-arguments (if (== "" arguments) "{}" arguments))
+      ((Err why) (<> "error: " why))
+      ((Ok args)
+       (let params = (lisp (-> Json) (tool args) (json-object "name" tool "arguments" args)))
+       (match (request link "tools/call" params)
+         ((Answered result) (lisp (-> String) (result) (call-text result)))
+         ((Refused why) (mconcat (make-list "error: " (named link) " returned an error: " why)))
+         ((NoAnswer) (mconcat (make-list "error: " (named link) " did not answer in "
+                                         (seconds (cell:read (.limit link))))))
+         ((Ended) (mconcat (make-list "error: " (named link) " has ended")))))))
+
+  (declare server-tools (Server -> tools:Tools))
+  (define (server-tools server)
+    "The server's tools as SERVER__TOOL, with its descriptions and schemas.
+Each needs a go-ahead. (R9, spec 0005 R1)"
+    (map (fn (listed)
+           (tools:Tool (chat:ToolSpec (full-name (server-name server) (.tool listed))
+                                      (.description listed)
+                                      (.schema listed))
+                       True
+                       (fn (arguments) (call-tool server (.tool listed) arguments))))
+         (.listed server)))
+
+  (declare stop (Server -> Unit))
+  (define (stop server)
+    "Stop the server's process. Its tools then return errors."
+    (end (.link server))))

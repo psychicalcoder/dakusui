@@ -1,0 +1,157 @@
+(in-package #:dakusui/test)
+
+;;; T14: the helper's protocol. Malformed input gets an error reply and never
+;;; ends the helper. (R7)
+
+(coalton-toplevel
+  (declare decoded (String -> Result String protocol:Request))
+  (define (decoded line)
+    (protocol:decode-request line))
+
+  (declare error-of (String -> String))
+  (define (error-of line)
+    (match (decoded line)
+      ((Ok _) "")
+      ((Err why) why)))
+
+  (declare policy-request (List String -> protocol:Request))
+  (define (policy-request lines)
+    (protocol:PolicyRequest (policy-of lines)))
+
+  (declare record-bytes (UFix * UFix * UFix * UFix * String * String -> List U8))
+  (define (record-bytes pid hook need status comm path)
+    "A struct denial as the ring buffer gives it."
+    (lisp (-> (List U8)) (pid hook need status comm path)
+      (cl:flet ((u32 (n) (cl:loop :for s :from 0 :below 32 :by 8
+                                  :collect (cl:ldb (cl:byte 8 s) n)))
+                (padded (text size)
+                  (cl:let ((b (cl:coerce (sb-ext:string-to-octets text :external-format :utf-8)
+                                         'cl:list)))
+                    (cl:append b (cl:make-list (cl:- size (cl:length b)) :initial-element 0)))))
+        (cl:append (u32 pid) (u32 hook) (u32 need) (u32 status)
+                   (padded comm 16) (padded path 256)))))
+
+  (declare echo-handler (String -> String))
+  (define (echo-handler line)
+    "Reply as the helper would, without touching the kernel."
+    (match (protocol:decode-request line)
+      ((Ok _) protocol:reply-ok)
+      ((Err why) (protocol:reply-error why))))
+
+  (declare served-replies (List U8 * UFix -> List String))
+  (define (served-replies input limit)
+    "Send INPUT to serve-lines over a socketpair, and return its replies."
+    (let pair = (lisp (-> (List I32)) ()
+                  (cffi:with-foreign-object (fds :int 2)
+                    (cffi:foreign-funcall "socketpair" :int 1 :int 1 :int 0 :pointer fds :int)
+                    (cl:list (cffi:mem-aref fds :int 0) (cffi:mem-aref fds :int 1)))))
+    (let ours = (with-default -1 (list:index 0 pair)))
+    (let theirs = (with-default -1 (list:index 1 pair)))
+    (lisp (-> Unit) (ours input)
+      (cl:let ((octets (cl:coerce input '(cl:simple-array (cl:unsigned-byte 8) (cl:*)))))
+        (cffi:with-pointer-to-vector-data (p octets)
+          (cffi:foreign-funcall "write" :int ours :pointer p :size (cl:length octets) :long)))
+      ;; SHUT_WR: the server sees the end of input, and we can still read.
+      (cffi:foreign-funcall "shutdown" :int ours :int 1 :int)
+      Unit)
+    (serve:serve-lines theirs limit echo-handler)
+    (libbpf:close-fd theirs)
+    (string:split #\Newline (read-socket ours))))
+
+(define-test decode-takes-a-policy ()
+  (is (== (Ok (policy-request (make-list "allow read /usr" "deny read,write name:.env")))
+          (decoded "{\"op\":\"policy\",\"rules\":[{\"effect\":\"allow\",\"kinds\":[\"read\"],\"pattern\":\"/usr\"},{\"effect\":\"deny\",\"kinds\":[\"read\",\"write\"],\"pattern\":\"name:.env\"}]}"))))
+
+(define-test decode-takes-an-empty-policy ()
+  (is (== (Ok (protocol:PolicyRequest (policy:Policy Nil)))
+          (decoded "{\"op\":\"policy\",\"rules\":[]}"))))
+
+(define-test decode-takes-escapes-in-patterns ()
+  (is (== (Ok (policy-request (make-list "allow read /my\\ dir")))
+          (decoded "{\"op\":\"policy\",\"rules\":[{\"effect\":\"allow\",\"kinds\":[\"read\"],\"pattern\":\"/my\\\\ dir\"}]}"))))
+
+(define-test decode-takes-a-flag ()
+  (is (== (Ok (protocol:FlagRequest 1234))
+          (decoded "{\"op\":\"flag\",\"pid\":1234}"))))
+
+(define-test decode-names-each-problem ()
+  (is (string:substring? "not JSON" (error-of "not json")))
+  (is (string:substring? "not JSON" (error-of "{\"op\":\"flag\",\"pid\":1} trailing")))
+  (is (string:substring? "not JSON" (error-of "[[[[[[[[[[1]]]]]]]]]]")))
+  (is (== "expected an object" (error-of "[1,2]")))
+  (is (== "missing field \"op\"" (error-of "{}")))
+  (is (== "\"op\" must be a string" (error-of "{\"op\":7}")))
+  (is (== "unknown op \"run\"" (error-of "{\"op\":\"run\"}")))
+  (is (== "unknown field \"extra\"" (error-of "{\"op\":\"flag\",\"pid\":1,\"extra\":true}")))
+  (is (== "missing field \"pid\"" (error-of "{\"op\":\"flag\"}")))
+  (is (== "\"pid\" must be an integer" (error-of "{\"op\":\"flag\",\"pid\":\"1\"}")))
+  (is (== "\"pid\" must be an integer" (error-of "{\"op\":\"flag\",\"pid\":1.5}")))
+  (is (== "\"pid\" must be from 1 to 2147483647" (error-of "{\"op\":\"flag\",\"pid\":0}")))
+  (is (== "\"pid\" must be from 1 to 2147483647" (error-of "{\"op\":\"flag\",\"pid\":2147483648}")))
+  (is (== "\"rules\" must be a list" (error-of "{\"op\":\"policy\",\"rules\":{}}")))
+  (is (== "rule 1: expected an object" (error-of "{\"op\":\"policy\",\"rules\":[null]}"))))
+
+(define-test decode-names-the-rule-at-fault ()
+  (let rule = (fn (body) (error-of (<> "{\"op\":\"policy\",\"rules\":[{\"effect\":\"allow\",\"kinds\":[\"read\"],\"pattern\":\"/\"}," (<> body "]}")))))
+  (is (== "rule 2: \"kinds\" must not be empty"
+          (rule "{\"effect\":\"allow\",\"kinds\":[],\"pattern\":\"/\"}")))
+  (is (== "rule 2: each kind must be a string"
+          (rule "{\"effect\":\"allow\",\"kinds\":[1],\"pattern\":\"/\"}")))
+  (is (== "rule 2: missing field \"effect\""
+          (rule "{\"kinds\":[\"read\"],\"pattern\":\"/\"}")))
+  (is (== "rule 2: unknown field \"why\""
+          (rule "{\"effect\":\"allow\",\"kinds\":[\"read\"],\"pattern\":\"/\",\"why\":\"x\"}")))
+  (is (string:substring? "rule 2: unknown effect"
+                         (rule "{\"effect\":\"maybe\",\"kinds\":[\"read\"],\"pattern\":\"/\"}")))
+  (is (string:substring? "rule 2: unknown access kind"
+                         (rule "{\"effect\":\"allow\",\"kinds\":[\"exec\"],\"pattern\":\"/\"}")))
+  (is (string:substring? "rule 2: relative path"
+                         (rule "{\"effect\":\"allow\",\"kinds\":[\"read\"],\"pattern\":\"etc\"}"))))
+
+(define-test replies-are-json-lines ()
+  (is (== "{\"ok\":true}" protocol:reply-ok))
+  (is (== "{\"ok\":false,\"error\":\"say \\\"no\\\"\"}" (protocol:reply-error "say \"no\""))))
+
+(define-test denial-event-names-process-path-and-kind ()
+  (is (== (Some "{\"event\":\"denial\",\"pid\":42,\"comm\":\"cat\",\"hook\":\"file_open\",\"kind\":\"read\",\"reason\":\"denied by rule\",\"path\":\"/etc/hostname\"}")
+          (protocol:denial-event (record-bytes 42 0 1 7 "cat" "/etc/hostname"))))
+  (is (== (Some "{\"event\":\"denial\",\"pid\":7,\"comm\":\"ln\",\"hook\":\"path_link\",\"kind\":\"none\",\"reason\":\"always denied\",\"path\":\"\"}")
+          (protocol:denial-event (record-bytes 7 10 0 8 "ln" ""))))
+  (is (== (Some "{\"event\":\"denial\",\"pid\":9,\"comm\":\"cat\",\"hook\":\"file_open\",\"kind\":\"read\",\"reason\":\"helper gone\",\"path\":\"\"}")
+          (protocol:denial-event (record-bytes 9 0 1 9 "cat" ""))))
+  (is (== (Some "{\"event\":\"denial\",\"pid\":9,\"comm\":\"cat\",\"hook\":\"file_open\",\"kind\":\"read\",\"reason\":\"path changed\",\"path\":\"\"}")
+          (protocol:denial-event (record-bytes 9 0 1 10 "cat" ""))))
+  (is (== (Some "{\"event\":\"denial\",\"pid\":9,\"comm\":\"mv\",\"hook\":\"path_rename\",\"kind\":\"write\",\"reason\":\"holds a denied path\",\"path\":\"/p/anc\"}")
+          (protocol:denial-event (record-bytes 9 8 2 11 "mv" "/p/anc"))))
+  (is (== None (protocol:denial-event (make-list 1 2 3)))))
+
+(define-test serve-answers-every-line-and-survives-garbage ()
+  (let line = (fn (text) (lisp (-> (List U8)) (text)
+                           (cl:coerce (sb-ext:string-to-octets
+                                       (cl:format cl:nil "~A~%" text) :external-format :utf-8)
+                                      'cl:list))))
+  (let input = (mconcat (make-list (line "garbage")
+                                   (line "{\"op\":\"flag\",\"pid\":5}")
+                                   (line (lisp (-> String) () (cl:make-string 100 :initial-element #\a)))
+                                   (make-list 255 254 10)
+                                   (make-list 0 10)
+                                   (line "{\"op\":\"flag\",\"pid\":6}"))))
+  (let replies = (served-replies input 64))
+  (is (== 7 (list:length replies)))
+  (is (string:substring? "not JSON" (with-default "" (list:index 0 replies))))
+  (is (== (Some "{\"ok\":true}") (list:index 1 replies)))
+  (is (== (Some "{\"ok\":false,\"error\":\"the line is longer than 64 bytes\"}")
+          (list:index 2 replies)))
+  (is (== (Some "{\"ok\":false,\"error\":\"the line is not UTF-8\"}")
+          (list:index 3 replies)))
+  (is (string:substring? "not JSON" (with-default "" (list:index 4 replies))))
+  (is (== (Some "{\"ok\":true}") (list:index 5 replies)))
+  ;; The last element is the empty text after the final newline.
+  (is (== (Some "") (list:index 6 replies))))
+
+;;; Spec 0003 T3: sync, which the helper answers after it drains the denial
+;;; ring buffer. (Spec 0003 R6)
+
+(define-test decode-takes-a-sync ()
+  (is (== (Ok protocol:SyncRequest) (decoded "{\"op\":\"sync\"}")))
+  (is (== "unknown field \"pid\"" (error-of "{\"op\":\"sync\",\"pid\":1}"))))

@@ -1,0 +1,216 @@
+(defpackage #:dakusui/commands
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:policy #:dakusui/policy)
+                    (#:session #:dakusui/session)
+                    (#:rulesets #:dakusui/rulesets)
+                    (#:provider #:dakusui/provider)
+                    (#:tools #:dakusui/tools)
+                    (#:terminal #:dakusui/terminal)
+                    (#:turn #:dakusui/loop)
+                    (#:gate #:dakusui/gate)
+                    (#:cell #:coalton/cell)
+                    (#:list #:coalton/list)
+                    (#:string #:coalton/string))
+  (:export #:Command #:ShowPolicy #:AddRule #:RemoveRule #:Clear #:Help #:Quit #:Auto
+           #:parse-command #:policy-listing #:set-listing #:help-text #:mode-text
+           #:prompt-loop))
+(in-package #:dakusui/commands)
+
+;;; The commands the user types at the prompt, and the prompt loop. (Spec 0002
+;;; R1, R9) A line that starts with / never reaches the model. A change to the
+;;; rule set is saved to the set's file once the helper accepts it. (Spec 0004
+;;; R10) /auto shows or switches auto mode. (Spec 0005 R7)
+
+(cl:defun split-word (text)
+  "TEXT's first word and the rest, trimmed, as a list of two strings."
+  (cl:let* ((blank '(#\Space #\Tab))
+            (text (cl:string-trim blank text))
+            (end (cl:or (cl:position-if (cl:lambda (c) (cl:member c blank)) text)
+                        (cl:length text))))
+    (cl:list (cl:subseq text 0 end)
+             (cl:string-trim blank (cl:subseq text end)))))
+
+(coalton-toplevel
+  (derive Eq)
+  (define-type Command
+    ShowPolicy
+    (AddRule policy:Rule)
+    (RemoveRule UFix)
+    Clear
+    Help
+    Quit
+    (Auto (Optional Boolean)))
+
+  (declare help-text String)
+  (define help-text
+    "/policy            show the policy in force
+/allow KINDS PATH  add an allow rule to the session's rule set
+/deny KINDS PATH   add a deny rule
+/remove N          remove rule N of the set, as /policy numbers it
+/auto [on|off]     show auto mode, or turn it on or off
+/clear             forget the conversation
+/help              list these commands
+/quit              leave; so does the end of input")
+
+  (declare parse-command (String -> Result String Command))
+  (define (parse-command line)
+    "Parse LINE, which starts with /. A rule is the rule text of spec 0001 R10
+with the slash before it. (R9)"
+    (let body = (with-default line (string:strip-prefix "/" line)))
+    (let parts = (lisp (-> (Tuple String String)) (body)
+                   (cl:destructuring-bind (word rest) (split-word body)
+                     (coalton (Tuple (lisp (-> String) () word) (lisp (-> String) () rest))))))
+    (let word = (fst parts))
+    (let rest = (snd parts))
+    (let alone = (fn (command)
+                   (if (== rest "")
+                       (Ok command)
+                       (Err (mconcat (make-list "/" word " takes nothing after it"))))))
+    (match word
+      ("policy" (alone ShowPolicy))
+      ("allow" (map AddRule (policy:parse-rule body)))
+      ("deny" (map AddRule (policy:parse-rule body)))
+      ("remove"
+       (match (string:parse-int rest)
+         ((Some n)
+          (if (>= n 1)
+              (Ok (RemoveRule (lisp (-> UFix) (n) n)))
+              (Err "/remove takes a rule number, as /policy shows it")))
+         ((None) (Err "/remove takes a rule number, as /policy shows it"))))
+      ("auto"
+       (match rest
+         ("" (Ok (Auto None)))
+         ("on" (Ok (Auto (Some True))))
+         ("off" (Ok (Auto (Some False))))
+         (_ (Err "/auto takes on, off, or nothing"))))
+      ("clear" (alone Clear))
+      ("help" (alone Help))
+      ("quit" (alone Quit))
+      (_ (Err (mconcat (make-list "unknown command /" word "; /help lists the commands"))))))
+
+  (declare lines (List String -> String))
+  (define (lines items)
+    "ITEMS as lines, without a final newline."
+    (match items
+      ((Nil) "")
+      ((Cons first rest) (mconcat (Cons first (map (fn (s) (<> (into #\Newline) s)) rest))))))
+
+  (declare show-n (UFix -> String))
+  (define (show-n n)
+    (lisp (-> String) (n) (cl:format cl:nil "~D" n)))
+
+  (declare numbered (UFix * List policy:Rule -> List String))
+  (define (numbered n rules)
+    (match rules
+      ((Nil) Nil)
+      ((Cons r rest)
+       (Cons (mconcat (make-list "  " (show-n n) " " (policy:rule-text r)))
+             (numbered (+ n 1) rest)))))
+
+  (declare policy-listing (session:Session -> String))
+  (define (policy-listing s)
+    "The policy in force for /policy: the default rules, the set's rules with
+their numbers, and the fixed last rule. (R9)"
+    (let all = (match (session:current-policy s) ((policy:Policy rules) rules)))
+    (let set = (session:set-rules s))
+    (let defaults = (list:take (- (list:length all) (+ 1 (list:length set))) all))
+    (let fixed = (list:drop (+ (list:length defaults) (list:length set)) all))
+    (let plain = (fn (rules) (map (fn (r) (<> "  " (policy:rule-text r))) rules)))
+    (lines
+     (mconcat
+      (make-list (make-list "The default rules:")
+                 (plain defaults)
+                 (make-list "The session's rule set; later rules win:")
+                 (if (list:null? set) (make-list "  (none)") (numbered 1 set))
+                 (make-list "The fixed last rule:")
+                 (plain fixed)))))
+
+  (declare set-listing (String * session:Session -> String))
+  (define (set-listing name s)
+    "The start-up listing: the set's NAME and its rules as the session
+enforces them, symlinks resolved. (Spec 0004 R9)"
+    (let set = (session:set-rules s))
+    (lines
+     (Cons (mconcat (make-list "The rule set \"" name "\":"))
+           (if (list:null? set) (make-list "  (none)") (numbered 1 set)))))
+
+  (declare mode-text (gate:Mode -> String))
+  (define (mode-text mode)
+    "What /auto shows. (Spec 0005 R7)"
+    (if (gate:auto? mode)
+        "Auto mode is on: the judge decides which commands run."
+        "Auto mode is off: you decide which commands run."))
+
+  (declare run-command (cell:Cell session:Session * String * gate:Mode * terminal:Terminal * Command
+                        -> Unit))
+  (define (run-command sessions set-file mode say command)
+    "Run a command that changes or shows the policy or the mode. A change is
+recorded only once the helper has accepted it, and then saved to SET-FILE. A
+failed save leaves the change in force. (Spec 0004 R10) Auto mode stays off
+when there is no judge. (Spec 0005 R7)"
+    (let change =
+      (fn (changed what save)
+        (match changed
+          ((Ok s)
+           (cell:write! sessions s)
+           (say what)
+           (match (save Unit)
+             ((Ok _) Unit)
+             ((Err why) (say (<> "dakusui: the change holds for this session but is not saved; " why)))))
+          ((Err why) (say (<> "dakusui: " why))))))
+    (let s = (cell:read sessions))
+    (match command
+      ((ShowPolicy) (say (policy-listing s)))
+      ((AddRule r)
+       (change (session:add-rule s r)
+               (mconcat (make-list "added rule " (show-n (+ 1 (list:length (session:set-rules s))))
+                                   ": " (policy:rule-text r)))
+               ;; Save the rule as the session recorded it, symlinks resolved.
+               (fn (_)
+                 (match (list:last (session:set-rules (cell:read sessions)))
+                   ((Some added) (rulesets:add-line set-file added))
+                   ((None) (Ok Unit))))))
+      ((RemoveRule n)
+       (change (session:remove-rule s n)
+               (<> "removed rule " (show-n n))
+               (fn (_)
+                 (match (list:index (- n 1) (session:set-rules s))
+                   ((Some removed) (rulesets:drop-line set-file removed))
+                   ((None) (Ok Unit))))))
+      ((Help) (say help-text))
+      ((Auto (None)) (say (mode-text mode)))
+      ((Auto (Some auto))
+       (match (gate:set-auto! mode auto)
+         ((Ok _) (say (mode-text mode)))
+         ((Err why) (say (<> "dakusui: auto mode stays off; " why)))))
+      (_ Unit)))
+
+  (declare prompt-loop (provider:Provider * tools:Tools * gate:Mode * cell:Cell session:Session * String
+                        * terminal:Terminal * (Void -> Optional String) * turn:Conversation
+                        -> Unit))
+  (define (prompt-loop ask tools mode sessions set-file say read-line conversation)
+    "Read a line, and run it as a command or a turn, until /quit or the end of
+input. Changes to the rule set are saved to SET-FILE. MODE picks who says yes
+to each gated call. (R1, R9; spec 0004 R10; spec 0005 R7)"
+    (match (read-line)
+      ((None) Unit)
+      ((Some line)
+       (match (string:strip-prefix "/" line)
+         ((Some _)
+          (match (parse-command line)
+            ((Err why)
+             (say (<> "dakusui: " why))
+             (prompt-loop ask tools mode sessions set-file say read-line conversation))
+            ((Ok (Quit)) Unit)
+            ((Ok (Clear))
+             (say "The conversation is cleared.")
+             (prompt-loop ask tools mode sessions set-file say read-line
+                          (turn:new-conversation (session:session-project (cell:read sessions)))))
+            ((Ok command)
+             (run-command sessions set-file mode say command)
+             (prompt-loop ask tools mode sessions set-file say read-line conversation))))
+         ((None)
+          (if (== "" line)
+              (prompt-loop ask tools mode sessions set-file say read-line conversation)
+              (prompt-loop ask tools mode sessions set-file say read-line
+                           (fst (turn:run-turn ask tools (gate:mode-gate mode) say conversation line))))))))))

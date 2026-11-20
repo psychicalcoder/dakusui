@@ -1,0 +1,199 @@
+(defpackage #:dakusui/enforcer
+  (:use #:coalton #:coalton-prelude)
+  (:local-nicknames (#:libbpf #:dakusui/libbpf)
+                    (#:pins #:dakusui/pins)
+                    (#:policy #:dakusui/policy)
+                    (#:list #:coalton/list)
+                    (#:string #:coalton/string))
+  (:export #:open-enforcer #:read-lsm-list #:check-lsm #:start
+           #:check-capacity #:install-policy #:flag-process
+           #:helper-bytes #:helper-start #:register-helper #:pin-session))
+(in-package #:dakusui/enforcer)
+
+;;; The enforcer, embedded in the image. (R11)
+;;;
+;;; Loading this file reads build/enforce.bpf.o, so the bytes are in the image
+;;; that `make build` saves. The binary that holds the capabilities never reads
+;;; an object from disk, so no one can swap the object.
+
+(cl:defparameter *enforcer-octets*
+  (cl:let ((path (asdf:system-relative-pathname "dakusui" "build/enforce.bpf.o")))
+    (cl:unless (cl:probe-file path)
+      (cl:error "~A is missing. Run `make bpf` first." path))
+    (cl:with-open-file (in path :element-type '(cl:unsigned-byte 8))
+      (cl:let ((octets (cl:make-array (cl:file-length in)
+                                      :element-type '(cl:unsigned-byte 8))))
+        (cl:read-sequence octets in)
+        octets))))
+
+(coalton-toplevel
+  (declare open-enforcer (Void -> Result String libbpf:BpfObject))
+  (define (open-enforcer)
+    "Open the embedded enforcer, ready to load."
+    (libbpf:open-object (lisp (-> libbpf:Octets) () *enforcer-octets*)))
+
+  (declare lsm-file String)
+  (define lsm-file "/sys/kernel/security/lsm")
+
+  (declare read-lsm-list (Void -> Result String String))
+  (define (read-lsm-list)
+    "The kernel's active LSMs, as the comma-separated text of lsm-file."
+    (lisp (-> (Result String String)) (lsm-file)
+      (cl:handler-case
+          (cl:let ((text (uiop:read-file-string lsm-file)))
+            (coalton (Ok (lisp (-> String) () text))))
+        (cl:error (e)
+          (cl:let ((why (cl:princ-to-string e)))
+            (coalton (Err (lisp (-> String) () why))))))))
+
+  (declare check-lsm (String -> Result String Unit))
+  (define (check-lsm lsm-list)
+    "LSM-LIST, the text of lsm-file, must name bpf. (R9)"
+    (let active =
+      (lisp (-> String) (lsm-list)
+        (cl:string-trim '(#\Newline #\Space) lsm-list)))
+    (if (list:member "bpf" (string:split #\, active))
+        (Ok Unit)
+        (Err (mconcat (make-list "bpf is not an active LSM, so nothing can be enforced. "
+                                 "Active: " active ". "
+                                 "Add bpf to the lsm= boot parameter.")))))
+
+  (declare helper-bytes (I32 * U64 -> List U8))
+  (define (helper-bytes pid start)
+    "struct helper_info: pid, pad, start, little-endian."
+    (lisp (-> (List U8)) (pid start)
+      (cl:append (cl:loop :for shift :from 0 :below 32 :by 8
+                          :collect (cl:ldb (cl:byte 8 shift) pid))
+                 (cl:list 0 0 0 0)
+                 (cl:loop :for shift :from 0 :below 64 :by 8
+                          :collect (cl:ldb (cl:byte 8 shift) start)))))
+
+  (declare helper-start (List U8 -> U64))
+  (define (helper-start bytes)
+    "The start field of struct helper_info, or 0 if BYTES is too short."
+    (lisp (-> U64) (bytes)
+      (cl:if (cl:< (cl:length bytes) 16)
+             0
+             (cl:loop :for i :from 0 :below 8
+                      :sum (cl:ash (cl:nth (cl:+ 8 i) bytes) (cl:* 8 i))))))
+
+  (declare register-helper (libbpf:BpfObject -> Result String Unit))
+  (define (register-helper obj)
+    "Write our pid to the helper map, and open a file, so the enforcer records
+our start time. Until then, every hook denies every confined task, and so it
+does again once we are gone. (R9, ADR 0008)"
+    (let pid = (lisp (-> I32) () (sb-posix:getpid)))
+    (let zero = (make-list 0 0 0 0))
+    (do
+     (helper <- (libbpf:find-map obj "helper"))
+     (libbpf:map-update helper zero (helper-bytes pid 0))
+     (let _ = (lisp (-> Unit) ()
+                ;; O_RDONLY. Any open by one of our threads will do.
+                (cffi:foreign-funcall "close"
+                                      :int (cffi:foreign-funcall "open" :string "/" :int 0 :int)
+                                      :int)
+                Unit))
+     (found <- (libbpf:map-lookup helper zero))
+     (if (== 0 (helper-start (with-default Nil found)))
+         (Err "the enforcer did not record the helper's start time")
+         (Ok Unit))))
+
+  (declare pin-session (libbpf:BpfObject * List (Tuple String I32) -> Result String Unit))
+  (define (pin-session obj links)
+    "Pin the confined map, then each of LINKS by its program's name, in a new
+session directory, so the hooks stay attached when we are gone. The map goes
+first: a session with a link pinned always has its map. If any pin fails,
+unpin the rest. (R9, ADR 0008)"
+    (do
+     (dir <- (pins:make-session-dir))
+     (let pinned =
+       (do
+        (confined <- (find-confined obj))
+        (libbpf:obj-pin (libbpf:map-fd confined) (pins:pin-path dir pins:confined-pin))
+        (traverse (fn ((Tuple name fd)) (libbpf:obj-pin fd (pins:pin-path dir name)))
+                  links)))
+     (match pinned
+       ((Ok _) (Ok Unit))
+       ((Err why)
+        (let _ = (pins:remove-session dir))
+        (Err why)))))
+
+  (declare find-confined (libbpf:BpfObject -> Result String libbpf:BpfMap))
+  (define (find-confined obj)
+    (libbpf:find-map obj "confined"))
+
+  (declare start (String -> Result String libbpf:BpfObject))
+  (define (start lsm-list)
+    "Check LSM-LIST, then load the enforcer, attach every program, register as
+the live helper, and pin the session. Each failure is an Err that says which
+step failed. (R9)"
+    (do
+     (check-lsm lsm-list)
+     (match (do
+             (obj <- (open-enforcer))
+             (libbpf:load-object obj)
+             (links <- (libbpf:attach-all obj))
+             (register-helper obj)
+             (pin-session obj links)
+             (pure obj))
+       ((Ok obj) (Ok obj))
+       ((Err why) (Err (<> "cannot start the enforcer: " why))))))
+
+  (declare check-capacity (UFix * UFix -> Result String Unit))
+  (define (check-capacity patterns limit)
+    (if (> patterns limit)
+        (Err (lisp (-> String) (patterns limit)
+               (cl:format cl:nil "the policy has ~D patterns, but the rule map holds ~D"
+                          patterns limit)))
+        (Ok Unit)))
+
+  (declare fill-map (libbpf:BpfMap * List policy:Entry -> Result String Unit))
+  (define (fill-map inner entries)
+    (map (const Unit)
+         (traverse (fn (entry)
+                     (libbpf:map-update inner
+                                        (policy:entry-key-bytes entry)
+                                        (policy:entry-value-bytes entry)))
+                   entries)))
+
+  (declare install-policy (libbpf:BpfObject * policy:Policy -> Result String Unit))
+  (define (install-policy obj pol)
+    "Compile POL into a new inner map and swap it into the rule map's one slot.
+The swap is atomic, so no command sees half a policy, and the next open uses
+the new one. On any failure the old policy stays in force. (R4)"
+    (match (do
+            (entries <- (policy:compile-policy pol))
+            ;; inner_template fixes the shape that the kernel accepts in the slot.
+            (template <- (libbpf:find-map obj "inner_template"))
+            (check-capacity (list:length entries) (libbpf:map-capacity template))
+            (outer <- (libbpf:find-map obj "rules"))
+            (inner <- (libbpf:create-hash-map-like template))
+            (let swapped = (do
+                            (fill-map inner entries)
+                            (libbpf:map-set-inner outer inner)))
+            ;; The slot holds its own reference to the inner map.
+            (let _ = (libbpf:close-map inner))
+            swapped)
+      ((Ok _) (Ok Unit))
+      ((Err why) (Err (<> "cannot install the policy: " why)))))
+
+  (declare flag-process (libbpf:BpfObject * I32 -> Result String Unit))
+  (define (flag-process obj pid)
+    "Confine process PID and every child it creates from now on. (R1)
+
+The confined map is keyed by a pidfd, which names the task itself. A pid names
+whatever holds it now, so the caller must flag a child it has not reaped yet:
+until then, no other process can take its pid."
+    (match (do
+            (confined <- (libbpf:find-map obj "confined"))
+            (pidfd <- (libbpf:pidfd-open pid))
+            (let flagged = (libbpf:map-update confined
+                                              (libbpf:fd-bytes pidfd)
+                                              (make-list 1 0 0 0)))
+            ;; The flag lives in the task's storage, not in the descriptor.
+            (let _ = (libbpf:close-fd pidfd))
+            flagged)
+      ((Ok _) (Ok Unit))
+      ((Err why)
+       (Err (<> (lisp (-> String) (pid) (cl:format cl:nil "cannot flag process ~D: " pid))
+                why))))))

@@ -1,0 +1,261 @@
+(in-package #:dakusui/test)
+
+;;; T7: compile a policy into map entries. (R2, R10)
+
+(coalton-toplevel
+  (declare compiled (List String -> List policy:Entry))
+  (define (compiled lines)
+    (unwrap (policy:compile-policy (policy-of lines))))
+
+  (declare allow-at (UFix -> Optional policy:Decision))
+  (define (allow-at seq)
+    (Some (policy:Decision seq policy:Allow)))
+
+  (declare deny-at (UFix -> Optional policy:Decision))
+  (define (deny-at seq)
+    (Some (policy:Decision seq policy:Deny)))
+
+  (declare path-entry (String * Optional policy:Decision * Optional policy:Decision -> policy:Entry))
+  (define (path-entry path on-read on-write)
+    (policy:Entry (policy::PathPrefix path) on-read on-write False))
+
+  (declare held-entry (String * Optional policy:Decision * Optional policy:Decision -> policy:Entry))
+  (define (held-entry path on-read on-write)
+    "A path entry that a confined rename may not touch. (R6)"
+    (policy:Entry (policy::PathPrefix path) on-read on-write True))
+
+  (declare held-only (String -> policy:Entry))
+  (define (held-only path)
+    "An entry that no rule names: an ancestor of a deny rule's path."
+    (held-entry path None None))
+
+  (declare name-entry (String * Optional policy:Decision * Optional policy:Decision -> policy:Entry))
+  (define (name-entry name on-read on-write)
+    (policy:Entry (policy::FileName name) on-read on-write False))
+
+  (declare letters (UFix -> String))
+  (define (letters n)
+    (lisp (-> String) (n)
+      (cl:make-string n :initial-element #\a)))
+
+  (declare repeated (UFix * String -> String))
+  (define (repeated n text)
+    (lisp (-> String) (n text)
+      (cl:apply #'cl:concatenate 'cl:string
+                (cl:make-list n :initial-element text))))
+
+  (declare accepted? (String -> Boolean))
+  (define (accepted? pattern)
+    "True if the rule `deny read PATTERN` compiles."
+    (match (policy:compile-policy
+            (policy:Policy (make-list (policy:Rule policy:Deny read-only (policy::PathPrefix pattern)))))
+      ((Ok _) True)
+      ((Err _) False)))
+
+  (declare name-accepted? (String -> Boolean))
+  (define (name-accepted? name)
+    (match (policy:compile-policy
+            (policy:Policy (make-list (policy:Rule policy:Deny read-only (policy::FileName name)))))
+      ((Ok _) True)
+      ((Err _) False)))
+
+  (declare compile-error-names? (policy:Pattern * String * String -> Boolean))
+  (define (compile-error-names? pattern problem word)
+    (match (policy:compile-policy
+            (policy:Policy (make-list (policy:Rule policy:Deny read-only pattern))))
+      ((Ok _) False)
+      ((Err message) (and (coalton/string:substring? problem message)
+                          (coalton/string:substring? word message)))))
+
+  (declare header-defines? (String * UFix -> Boolean))
+  (define (header-defines? name value)
+    (lisp (-> Boolean) (name value)
+      (cl:and
+       (cl:search
+        (cl:format cl:nil "#define ~A ~D" name value)
+        (uiop:read-file-string
+         (asdf:system-relative-pathname "dakusui" "bpf/enforce.h")))
+       cl:t))))
+
+(define-test compile-keeps-one-entry-per-rule-on-new-patterns ()
+  (is (== (compiled (make-list "allow read /a" "allow write /b" "allow read,write name:.env"))
+          (make-list (path-entry "/a" (allow-at 1) None)
+                     (path-entry "/b" None (allow-at 2))
+                     (name-entry ".env" (allow-at 3) (allow-at 3))))))
+
+;; The done condition of T7.
+(define-test compile-merges-duplicates-kind-by-kind ()
+  ;; A later rule on the same kind replaces the earlier one.
+  (is (== (compiled (make-list "allow read /a" "allow write /a" "allow read /a"))
+          (make-list (path-entry "/a" (allow-at 3) (allow-at 2)))))
+  (is (== (compiled (make-list "allow read /a" "deny read /a"))
+          (make-list (held-entry "/a" (deny-at 2) None) (held-only "/"))))
+  ;; A rule on the other kind leaves the first untouched.
+  (is (== (compiled (make-list "allow read /a" "deny write /a"))
+          (make-list (held-entry "/a" (allow-at 1) (deny-at 2)) (held-only "/"))))
+  ;; A partial override keeps the other kind's older number.
+  (is (== (compiled (make-list "allow read,write /a" "deny write /a"))
+          (make-list (held-entry "/a" (allow-at 1) (deny-at 2)) (held-only "/"))))
+  ;; A later rule on both kinds replaces both.
+  (is (== (compiled (make-list "allow read /a" "deny write /a" "allow read,write /a"))
+          (make-list (held-entry "/a" (allow-at 3) (allow-at 3)) (held-only "/"))))
+  ;; A trailing slash names the same pattern.
+  (is (== (compiled (make-list "allow read /a/" "allow write /a"))
+          (make-list (path-entry "/a" (allow-at 1) (allow-at 2))))))
+
+(define-test compile-numbers-rules-by-place-in-the-policy ()
+  (is (== (compiled (make-list "allow read /a" "allow read /b" "deny read /a"))
+          (make-list (held-entry "/a" (deny-at 3) None)
+                     (path-entry "/b" (allow-at 2) None)
+                     (held-only "/")))))
+
+(define-test compile-keeps-names-and-paths-apart ()
+  (is (== (compiled (make-list "allow read /a" "deny read name:a"))
+          (make-list (path-entry "/a" (allow-at 1) None)
+                     (name-entry "a" (deny-at 2) None)))))
+
+;;; T34: the held marks. (R6)
+
+(define-test compile-marks-a-deny-path-and-its-ancestors ()
+  (is (== (compiled (make-list "allow read,write /p" "deny read /p/anc/sub"))
+          (make-list (held-entry "/p" (allow-at 1) (allow-at 1))
+                     (held-entry "/p/anc/sub" (deny-at 2) None)
+                     (held-only "/")
+                     (held-only "/p/anc")))))
+
+(define-test compile-marks-each-path-once ()
+  (is (== (compiled (make-list "deny read /a/b" "deny write /a/c" "deny read /a/b"))
+          (make-list (held-entry "/a/b" (deny-at 3) None)
+                     (held-entry "/a/c" None (deny-at 2))
+                     (held-only "/")
+                     (held-only "/a")))))
+
+(define-test compile-marks-the-root-for-a-deny-on-it ()
+  (is (== (compiled (make-list "deny write /"))
+          (make-list (held-entry "/" None (deny-at 1))))))
+
+(define-test compile-marks-nothing-for-allows-or-names ()
+  (is (== (compiled (make-list "allow read,write /a/b" "deny read,write name:.env"))
+          (make-list (path-entry "/a/b" (allow-at 1) (allow-at 1))
+                     (name-entry ".env" (deny-at 2) (deny-at 2))))))
+
+;; A later allow does not unmark: the deny rule is still in the policy.
+(define-test compile-keeps-the-mark-under-a-later-allow ()
+  (is (== (compiled (make-list "deny read /a" "allow read /a"))
+          (make-list (held-entry "/a" (allow-at 2) None) (held-only "/")))))
+
+;; The marks come from the rules in force, so removing the rule clears them.
+(define-test compile-marks-follow-the-rules-in-force ()
+  (is (== (compiled (make-list "allow read,write /p"))
+          (make-list (path-entry "/p" (allow-at 1) (allow-at 1))))))
+
+(define-test compile-marks-agree-with-the-evaluator ()
+  (let p = (policy-of (make-list "allow read /" "allow read,write /p" "deny read /p/anc/sub"
+                                 "deny write /q" "deny read,write name:.env")))
+  (let marked = (list:filter (fn (path) (policy:held? p path))
+                             (make-list "/" "/p" "/p/anc" "/p/anc/sub" "/p/anc/sub/x"
+                                        "/p/other" "/q" "/q/x" "/.env" "/p/.env")))
+  (is (== marked (make-list "/" "/p" "/p/anc" "/p/anc/sub" "/q")))
+  (is (== (unwrap (policy:compile-policy p))
+          (make-list (held-entry "/" (allow-at 1) None)
+                     (held-entry "/p" (allow-at 2) (allow-at 2))
+                     (held-entry "/p/anc/sub" (deny-at 3) None)
+                     (held-entry "/q" None (deny-at 4))
+                     (name-entry ".env" (deny-at 5) (deny-at 5))
+                     (held-only "/p/anc"))))
+  (is (== (policy:held-paths p) (make-list "/" "/p" "/p/anc" "/p/anc/sub" "/q"))))
+
+(define-test compile-empty-policy-has-no-entries ()
+  (is (== (compiled Nil) Nil)))
+
+(define-test compile-takes-the-whole-default-policy ()
+  (matches (Ok _)
+      (>>= (policy:session-policy "/home/u/proj" "/home/u" Nil) policy:compile-policy)))
+
+(define-test compile-key-layout ()
+  (let path-key = (policy:entry-key-bytes (path-entry "/a" None None)))
+  (is (== (list:length path-key) 260))
+  (is (== (list:take 7 path-key) (make-list 0 0 0 0 47 97 0)))
+  (is (list:all (fn (b) (== b 0)) (list:drop 6 path-key)))
+  (let name-key = (policy:entry-key-bytes (name-entry "b" None None)))
+  (is (== (list:length name-key) 260))
+  (is (== (list:take 6 name-key) (make-list 1 0 0 0 98 0))))
+
+(define-test compile-key-holds-utf-8-bytes ()
+  (is (== (list:take 7 (policy:entry-key-bytes (name-entry "é" None None)))
+          (make-list 1 0 0 0 195 169 0))))
+
+(define-test compile-value-layout ()
+  (is (== (policy:entry-value-bytes (path-entry "/a" (allow-at 1) (deny-at 258)))
+          (make-list 1 0 0 0  2 1 0 0  1 0  0 0)))
+  (is (== (policy:entry-value-bytes (path-entry "/a" None (allow-at 2)))
+          (make-list 0 0 0 0  2 0 0 0  0 1  0 0)))
+  (is (== (policy:entry-value-bytes (path-entry "/a" (deny-at 3) None))
+          (make-list 3 0 0 0  0 0 0 0  0 0  0 0)))
+  ;; held is the byte after the effects. (R6)
+  (is (== (policy:entry-value-bytes (held-entry "/a" (deny-at 3) None))
+          (make-list 3 0 0 0  0 0 0 0  0 0  1 0)))
+  (is (== (policy:entry-value-bytes (held-only "/"))
+          (make-list 0 0 0 0  0 0 0 0  0 0  1 0))))
+
+(define-test compile-name-limit-is-63-bytes ()
+  (is (name-accepted? (letters 63)))
+  (is (not (name-accepted? (letters 64))))
+  (is (compile-error-names? (policy::FileName (letters 64)) "name too long" (letters 64))))
+
+;; 32 two-byte letters are 64 bytes, though only 32 characters.
+(define-test compile-limits-count-bytes-not-characters ()
+  (is (not (name-accepted? (repeated 32 "é"))))
+  (is (name-accepted? (repeated 31 "é")))
+  (is (not (accepted? (string:concat "/" (repeated 32 "é")))))
+  (is (accepted? (string:concat "/" (repeated 31 "é")))))
+
+(define-test compile-component-limit-is-63-bytes ()
+  (is (accepted? (string:concat "/" (letters 63))))
+  (is (compile-error-names? (policy::PathPrefix (string:concat "/" (letters 64)))
+                            "component too long" (letters 64))))
+
+(define-test compile-path-limit-is-32-components ()
+  (is (accepted? (repeated 32 "/a")))
+  (is (not (accepted? (repeated 33 "/a"))))
+  (is (compile-error-names? (policy::PathPrefix (repeated 33 "/a"))
+                            "too many components" "/a/a")))
+
+;; Two components of 63 bytes make a prefix of 128. Add a third to reach the
+;; limit of 190 before the last component, which may then be 63 bytes.
+(define-test compile-path-limit-is-190-bytes-before-the-last-component ()
+  (let two = (repeated 2 (string:concat "/" (letters 63))))
+  (let at-limit = (string:concat two (string:concat "/" (letters 61))))
+  (let over-limit = (string:concat two (string:concat "/" (letters 62))))
+  (is (== (coalton/string:length at-limit) 190))
+  (is (accepted? (string:concat at-limit (string:concat "/" (letters 63)))))
+  (is (not (accepted? (string:concat over-limit "/a"))))
+  (is (compile-error-names? (policy::PathPrefix (string:concat over-limit "/a"))
+                            "path too long" "/aaa"))
+  ;; A long path whose parent is short enough is fine.
+  (is (accepted? over-limit)))
+
+(define-test compile-root-compiles ()
+  (is (accepted? "/")))
+
+(define-test compile-rejects-nul ()
+  (let nul = (lisp (-> String) () (cl:string (cl:code-char 0))))
+  (is (not (accepted? (string:concat "/a" nul))))
+  (is (not (name-accepted? (string:concat "a" nul)))))
+
+;; A bad rule must reject the policy, not silently vanish from it.
+(define-test compile-rejects-the-whole-policy-for-one-bad-rule ()
+  (matches (Err _)
+      (policy:compile-policy
+       (policy:Policy
+        (make-list (policy:Rule policy:Allow read-only (policy::PathPrefix "/a"))
+                   (policy:Rule policy:Deny read-only (policy::FileName (letters 64))))))))
+
+(define-test compile-limits-match-the-enforcer-header ()
+  (is (header-defines? "KEY_LEN" policy::key-length))
+  (is (header-defines? "COMP_LEN" policy::component-length))
+  (is (header-defines? "MAX_COMP" policy::max-components)))
+
+(define-test compile-limits-are-the-documented-numbers ()
+  (is (== policy::max-component-bytes 63))
+  (is (== policy::max-parent-bytes 190)))
